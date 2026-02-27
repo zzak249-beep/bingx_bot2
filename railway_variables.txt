@@ -1,0 +1,110 @@
+# ═══════════════════════════════════════════════════════════════
+# VARIABLES RAILWAY - COPIAR Y PEGAR
+# ═══════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 1: VARIABLES OBLIGATORIAS (Rellena con tus datos)      │
+# └─────────────────────────────────────────────────────────────┘
+
+BINGX_API_KEY=COLOCA_TU_API_KEY_AQUI
+BINGX_API_SECRET=COLOCA_TU_API_SECRET_AQUI
+TELEGRAM_BOT_TOKEN=123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+TELEGRAM_CHAT_ID=-1001234567890
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 2: VARIABLES OPCIONALES (Configuración Capital Medio)  │
+# │ Estas son opcionales - solo descomenta si quieres cambiar   │
+# └─────────────────────────────────────────────────────────────┘
+
+# ── Capital y Trades ──
+FIXED_USDT=8
+MAX_OPEN_TRADES=12
+
+# ── Filtros de Entrada ──
+MIN_SCORE=4
+MIN_VOLUME_USDT=100000
+TOP_N_SYMBOLS=300
+MAX_SPREAD_PCT=1.0
+
+# ── Protecciones ──
+MAX_DRAWDOWN=15
+DAILY_LOSS_LIMIT=8
+COOLDOWN_MIN=20
+
+# ── Timeframes ──
+TIMEFRAME=5m
+HTF1=15m
+HTF2=1h
+POLL_SECONDS=60
+
+# ── Filtros Macro ──
+BTC_FILTER=true
+
+# ── Blacklist (opcional) ──
+# BLACKLIST=BTC/USDT:USDT,ETH/USDT:USDT
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURACIONES ALTERNATIVAS POR CAPITAL
+# ═══════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN A: CAPITAL PEQUEÑO ($50-$200) - Conservador          │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=5
+# MAX_OPEN_TRADES=8
+# MIN_SCORE=5
+# MAX_DRAWDOWN=12
+# DAILY_LOSS_LIMIT=6
+# MIN_VOLUME_USDT=500000
+# TOP_N_SYMBOLS=100
+# MAX_SPREAD_PCT=0.5
+# BTC_FILTER=true
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN B: CAPITAL MEDIO ($200-$1000) - Balanceado           │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=10
+# MAX_OPEN_TRADES=12
+# MIN_SCORE=4
+# MAX_DRAWDOWN=15
+# DAILY_LOSS_LIMIT=8
+# MIN_VOLUME_USDT=100000
+# TOP_N_SYMBOLS=300
+# MAX_SPREAD_PCT=1.0
+# BTC_FILTER=true
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN C: CAPITAL GRANDE ($1000+) - Agresivo                │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=25
+# MAX_OPEN_TRADES=15
+# MIN_SCORE=4
+# MAX_DRAWDOWN=15
+# DAILY_LOSS_LIMIT=10
+# MIN_VOLUME_USDT=100000
+# TOP_N_SYMBOLS=300
+# MAX_SPREAD_PCT=1.0
+# BTC_FILTER=false
+
+
+# ═══════════════════════════════════════════════════════════════
+# INSTRUCCIONES RÁPIDAS
+# ═══════════════════════════════════════════════════════════════
+
+# 1. Rellena las 4 variables OBLIGATORIAS del PASO 1
+# 2. Copia TODAS las líneas (excepto las comentadas con #)
+# 3. En Railway → Tu proyecto → Variables → RAW Editor
+# 4. Pega todo el contenido
+# 5. Click en "Update Variables"
+# 6. Railway redesplegará automáticamente
+
+# ═══════════════════════════════════════════════════════════════
+# IMPORTANTE
+# ═══════════════════════════════════════════════════════════════
+# ⚠️ NO compartas este archivo con tus claves API rellenadas
+# ⚠️ El repo de GitHub debe ser PRIVADO
+# ⚠️ Si expones las claves, revócalas en BingX inmediatamente
