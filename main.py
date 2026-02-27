@@ -6,13 +6,17 @@ import asyncio
 import logging
 import signal
 import sys
+import os
+
+# Fix para Railway/Docker — asegura que Python encuentre el modulo 'core'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.bot import TradingBot
 from config   import Config
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("main")
