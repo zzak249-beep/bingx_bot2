@@ -113,15 +113,15 @@ BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 # ── Capital ──
 FIXED_USDT       = 8.0  # Fijo: 8 USDT por trade con 12× apalancamiento
 LEVERAGE         = 12   # Apalancamiento fijo 12×
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "12"))
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "8"))  # Solo señales 8/20 o superior (score máx: 20)
-CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
-DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "8.0"))
-COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "20"))
-MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "1.0"))
-MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "100000"))
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "6"))    # Máx 6 con capital pequeño
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "9"))    # 9/20 — agresivo pero selectivo
+CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "12.0")) # Circuit breaker 12% — protege capital pequeño
+DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "6.0"))  # Límite diario 6% — para antes de sangrar
+COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "10"))   # 10 min cooldown — más oportunidades
+MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "0.8"))  # Spread más estricto — evita slippage
+MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "500000")) # 500K vol mínimo — liquidez real
 TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "300"))
-BTC_FILTER       = os.environ.get("BTC_FILTER", "true").lower() == "true"
+BTC_FILTER       = os.environ.get("BTC_FILTER", "false").lower() == "true"  # OFF — captura long y short libremente
 
 # ── SMI ──
 SMI_K_LEN   = int(os.environ.get("SMI_K_LEN",   "10"))
@@ -147,9 +147,9 @@ BB_STD     = float(os.environ.get("BB_STD",  "2.0"))
 BB_RSI_OB  = float(os.environ.get("BB_RSI_OB", "65.0"))
 
 # ── Bj Bot Risk Management ──
-RNR              = float(os.environ.get("RNR",               "2.0"))
-RISK_MULT        = float(os.environ.get("RISK_MULT",         "1.0"))
-RR_EXIT          = float(os.environ.get("RR_EXIT",           "0.5"))
+RNR              = float(os.environ.get("RNR",               "2.5"))  # TP2 = 2.5× el riesgo — más ganancia por winner
+RISK_MULT        = float(os.environ.get("RISK_MULT",         "0.9"))  # SL ligeramente más ajustado — menos pérdida
+RR_EXIT          = float(os.environ.get("RR_EXIT",           "0.4"))  # Trail activo al 40% del TP2 — protege antes
 MIN_PROFIT_PCT   = float(os.environ.get("MIN_PROFIT_PCT",    "0.0"))
 TRADE_EXPIRE_BARS= int(os.environ.get("TRADE_EXPIRE_BARS",  "0"))
 
@@ -168,7 +168,7 @@ RSI_OB_LOW = 10; RSI_OB_HIGH = 25
 RSI_OS_LOW = 78; RSI_OS_HIGH = 90
 
 # ── Risk ──
-MAX_CONSEC_LOSS = 3
+MAX_CONSEC_LOSS = 2   # Tras 2 pérdidas seguidas → reduce tamaño a la mitad
 USE_CB          = True
 HEDGE_MODE: bool = False
 CSV_PATH = "/tmp/saty_v14_trades.csv"
@@ -360,17 +360,15 @@ def tg_startup(balance: float, n: int):
         f"══════════════════════════════\n"
         f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
         f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
-        f"⏱ {TF} · {HTF1} · {HTF2}\n"
+        f"⏱ {TF} · {HTF1} · {HTF2} | Leverage: {LEVERAGE}×\n"
         f"🎯 Score min: {MIN_SCORE}/20 | Max trades: {MAX_OPEN_TRADES}\n"
-        f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.0f}/trade\n"
-        f"🛡 CB: -{CB_DD}% | Límite diario: -{DAILY_LOSS_LIMIT}%\n"
+        f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.0f} × {LEVERAGE}× = ${FIXED_USDT*LEVERAGE:.0f} notional/trade\n"
+        f"🛡 CB: -{CB_DD}% | Límite diario: -{DAILY_LOSS_LIMIT}% | Consec: {MAX_CONSEC_LOSS}\n"
+        f"📐 R:R={RNR} | Trail activo al {RR_EXIT*100:.0f}% | SL mult={RISK_MULT}\n"
+        f"⏳ Cooldown: {COOLDOWN_MIN}min | Spread máx: {MAX_SPREAD_PCT}%\n"
+        f"₿ Filtro BTC: {'✅' if BTC_FILTER else '❌ (long+short libre)'}\n"
+        f"🐋 Whale signals: FR + OI + L/S ratio + Sesión institucional\n"
         f"══════════════════════════════\n"
-        f"📊 SMI({SMI_K_LEN},{SMI_D_LEN},{SMI_EMA_LEN}) OB:{SMI_OB:+.0f}/{SMI_OS:+.0f}\n"
-        f"🌊 WaveTrend({WT_CHAN_LEN},{WT_AVG_LEN}) OB:{WT_OB}/{WT_OS}\n"
-        f"🤖 UTBot KeyVal:{UTBOT_KEY} ATR:{UTBOT_ATR}\n"
-        f"📈 BB({BB_PERIOD},{BB_STD}) | R:R={RNR} | RiskMult={RISK_MULT}\n"
-        f"{'⏳ Expire:' + str(TRADE_EXPIRE_BARS) + 'bars' if TRADE_EXPIRE_BARS > 0 else '⏳ Expire: OFF'}\n"
-        f"₿ Filtro BTC: {'✅' if BTC_FILTER else '❌'}\n"
         f"⏰ {utcnow()}"
     )
 
@@ -1478,7 +1476,7 @@ def manage_trade(ex: ccxt.Exchange, symbol: str,
         atr_now   = atr if atr > 0 else t.atr_entry
         loss_dist = (t.entry_price - live_price if t.side == "long"
                      else live_price - t.entry_price)
-        if loss_dist >= atr_now * 0.8:
+        if loss_dist >= atr_now * 1.0:  # 1.0× ATR — no cerrar antes del SL real del exchange
             close_trade(ex, symbol, "PÉRDIDA DINÁMICA", live_price)
             return
 
@@ -1516,7 +1514,7 @@ def manage_trade(ex: ccxt.Exchange, symbol: str,
                         e8 = bool(row.get("wt_os") or row.get("wt_cross_up"))
                         e9 = bool(row.get("utbot_buy"))
                     exh = sum([e1,e2,e3,e4,e5,e6,e7,e8,e9])
-                    if exh >= 5:
+                    if exh >= 6:  # 6/9 señales — más exigente, deja correr los winners
                         profit = ((live_price - t.entry_price) if t.side == "long"
                                   else (t.entry_price - live_price)) * t.contracts
 
@@ -1593,16 +1591,16 @@ def manage_trade(ex: ccxt.Exchange, symbol: str,
 
         prev_phase = t.trail_phase
         # R:R trail activo → fase más agresiva
-        if t.rr_trail_active and retrace > 15:
+        if t.rr_trail_active and retrace > 12:
             t.trail_phase = "locked"
-        elif retrace > 30:
+        elif retrace > 25:
             t.trail_phase = "locked"
-        elif t.stall_count >= 3:
+        elif t.stall_count >= 2:
             t.trail_phase = "tight"
         else:
             t.trail_phase = "normal"
 
-        trail_m = {"normal": 0.8, "tight": 0.4, "locked": 0.2}[t.trail_phase]
+        trail_m = {"normal": 0.7, "tight": 0.35, "locked": 0.15}[t.trail_phase]
 
         if t.trail_phase != prev_phase:
             tg_trail_phase(t, t.trail_phase, live_price, retrace, trail_m)
@@ -1818,7 +1816,7 @@ def main():
                 log.info(f"Escaneando {len(to_scan)} pares "
                          f"(excluidas bases: {list(bases_open.keys())})")
 
-                with ThreadPoolExecutor(max_workers=8) as pool:
+                with ThreadPoolExecutor(max_workers=12) as pool:
                     futures = {pool.submit(scan_symbol, ex, s): s for s in to_scan}
                     results = [f.result() for f in as_completed(futures)
                                if f.result() is not None]
@@ -1846,15 +1844,16 @@ def main():
 
                     if best_side:
                         new_signals.append({
-                            "symbol":  res["symbol"],
-                            "base":    base,
-                            "side":    best_side,
-                            "score":   best_score,
-                            "row":     res["row"],
-                            "rsi":     res["rsi"],
-                            "smi":     res["smi"],
-                            "wt":      res["wt"],
-                            "uptrend": uptrend,
+                            "symbol":     res["symbol"],
+                            "base":       base,
+                            "side":       best_side,
+                            "score":      best_score,
+                            "row":        res["row"],
+                            "rsi":        res["rsi"],
+                            "smi":        res["smi"],
+                            "wt":         res["wt"],
+                            "uptrend":    uptrend,
+                            "whale_desc": res.get("whale_desc", ""),  # FIX: pasar datos ballenas
                         })
 
                 new_signals.sort(key=lambda x: x["score"], reverse=True)
