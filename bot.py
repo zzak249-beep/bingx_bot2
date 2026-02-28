@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         SATY ELITE v14 — WHALE EDITION                          ║
+║         SATY ELITE v16 — GRAIL + BRAIN + GRID                          ║
 ║         BingX Perpetual Futures · 12 Trades · 24/7             ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  NUEVO v14 — 4 Pine Scripts + Whale Signals:                         ║
+║  NUEVO v15 — 4 Pine Scripts + Whale Signals:                         ║
 ║                                                                  ║
 ║  1. UTBot (HPotter/Yo_adriiiiaan)                               ║
 ║     · ATR Trailing Stop line con Key Value configurable         ║
@@ -74,7 +74,7 @@ VARIABLES — BJ BOT (Risk Management):
     TRADE_EXPIRE_BARS def:0 Barras máx por trade (0=desactivado)
 """
 
-import os, time, logging, csv
+import os, time, logging, csv, json, collections
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
@@ -93,7 +93,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("saty_v14")
+log = logging.getLogger("saty_v16")
 
 # ══════════════════════════════════════════════════════════
 # CONFIG — variables de entorno
@@ -114,7 +114,7 @@ BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 FIXED_USDT       = 8.0  # Fijo: 8 USDT por trade con 12× apalancamiento
 LEVERAGE         = 12   # Apalancamiento fijo 12×
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "6"))    # Máx 6 con capital pequeño
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "9"))    # 9/20 — agresivo pero selectivo
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "9"))    # 9/25 — agresivo pero selectivo
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "12.0")) # Circuit breaker 12% — protege capital pequeño
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "6.0"))  # Límite diario 6% — para antes de sangrar
 COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "10"))   # 10 min cooldown — más oportunidades
@@ -171,7 +171,7 @@ RSI_OS_LOW = 78; RSI_OS_HIGH = 90
 MAX_CONSEC_LOSS = 2   # Tras 2 pérdidas seguidas → reduce tamaño a la mitad
 USE_CB          = True
 HEDGE_MODE: bool = False
-CSV_PATH = "/tmp/saty_v14_trades.csv"
+CSV_PATH = "/tmp/saty_v16_trades.csv"
 
 
 # ══════════════════════════════════════════════════════════
@@ -197,6 +197,239 @@ def fetch_df(ex: ccxt.Exchange, symbol: str, tf: str, limit: int = 400) -> pd.Da
 
 def clear_cache():
     _cache.clear()
+
+
+# ══════════════════════════════════════════════════════════
+# TRADING BRAIN — Aprendizaje de errores (v16)
+# Registra cada trade cerrado y analiza patrones para mejorar
+# Sin ML, sin GPU — estadística pura sobre trades reales
+# ══════════════════════════════════════════════════════════
+BRAIN_PATH = "/tmp/saty_v16_brain.json"
+
+class TradingBrain:
+    """
+    Aprende de cada trade cerrado:
+    - Qué scores realmente ganan vs pierden
+    - Qué indicadores correlacionan con wins
+    - Qué pares están en racha positiva o negativa
+    - Qué horas del día tienen mejor win rate
+    - Ajusta MIN_SCORE dinámicamente si hay datos suficientes
+    """
+    def __init__(self):
+        self.trades: List[dict] = []          # historial completo
+        self.pair_stats: Dict[str, dict] = {} # stats por par
+        self.score_stats: Dict[int, dict] = {}# stats por score
+        self.hour_stats:  Dict[int, dict] = {}# stats por hora UTC
+        self.factor_wins: Dict[str, list] = collections.defaultdict(list)  # factor→[1/0]
+        self.blacklist:   Dict[str, float] = {}  # par→timestamp_expiry
+        self.adaptive_min_score: int = MIN_SCORE # score ajustado dinámicamente
+        self.total_trades: int = 0
+        self.load()
+
+    def load(self):
+        try:
+            if os.path.exists(BRAIN_PATH):
+                with open(BRAIN_PATH) as f:
+                    data = json.load(f)
+                self.trades       = data.get("trades", [])[-500:]  # últimos 500
+                self.pair_stats   = data.get("pair_stats", {})
+                self.score_stats  = {int(k): v for k, v in data.get("score_stats", {}).items()}
+                self.hour_stats   = {int(k): v for k, v in data.get("hour_stats", {}).items()}
+                self.factor_wins  = collections.defaultdict(list, data.get("factor_wins", {}))
+                self.blacklist    = data.get("blacklist", {})
+                self.adaptive_min_score = data.get("adaptive_min_score", MIN_SCORE)
+                self.total_trades = data.get("total_trades", 0)
+                log.info(f"🧠 TradingBrain cargado: {self.total_trades} trades históricos")
+        except Exception as e:
+            log.warning(f"TradingBrain load error: {e}")
+
+    def save(self):
+        try:
+            with open(BRAIN_PATH, "w") as f:
+                json.dump({
+                    "trades":             self.trades[-500:],
+                    "pair_stats":         self.pair_stats,
+                    "score_stats":        self.score_stats,
+                    "hour_stats":         self.hour_stats,
+                    "factor_wins":        dict(self.factor_wins),
+                    "blacklist":          self.blacklist,
+                    "adaptive_min_score": self.adaptive_min_score,
+                    "total_trades":       self.total_trades,
+                }, f, indent=2)
+        except Exception as e:
+            log.warning(f"TradingBrain save error: {e}")
+
+    def is_blacklisted(self, symbol: str) -> bool:
+        """True si el par está temporalmente bloqueado por malas rachas."""
+        expiry = self.blacklist.get(symbol, 0)
+        if time.time() < expiry:
+            return True
+        elif symbol in self.blacklist:
+            del self.blacklist[symbol]
+        return False
+
+    def record_trade(self, symbol: str, side: str, score: int,
+                     pnl: float, reason: str, row: Optional[pd.Series] = None):
+        """Registra un trade cerrado y actualiza todas las estadísticas."""
+        win = 1 if pnl > 0 else 0
+        hour = datetime.now(timezone.utc).hour
+        self.total_trades += 1
+
+        # ── Registro completo ──
+        record = {
+            "ts": time.time(), "symbol": symbol, "side": side,
+            "score": score, "pnl": pnl, "win": win, "reason": reason,
+            "hour": hour,
+        }
+        # Registrar qué indicadores estaban activos
+        if row is not None:
+            factors = {}
+            for f in ["st_bull","st_bear","above_vwap","below_vwap","bos_bull",
+                      "ob_bull","ob_bear","cvd_bull_div","cvd_bear_div",
+                      "utbot_buy","utbot_sell","wt_cross_up","wt_cross_dn",
+                      "macd_cross_up","macd_cross_down","regime_trend"]:
+                try: factors[f] = bool(row.get(f, False))
+                except: pass
+            record["factors"] = factors
+            for f, active in factors.items():
+                if active:
+                    self.factor_wins[f].append(win)
+
+        self.trades.append(record)
+
+        # ── Stats por par ──
+        if symbol not in self.pair_stats:
+            self.pair_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0.0, "streak": 0}
+        ps = self.pair_stats[symbol]
+        ps["pnl"] += pnl
+        if win:
+            ps["wins"] += 1
+            ps["streak"] = max(0, ps["streak"]) + 1
+        else:
+            ps["losses"] += 1
+            ps["streak"] = min(0, ps["streak"]) - 1
+            # 3 pérdidas seguidas en un par → blacklist 4 horas
+            if ps["streak"] <= -3:
+                self.blacklist[symbol] = time.time() + 4 * 3600
+                log.warning(f"🧠 {symbol} blacklisted 4h (3 losses streak)")
+
+        # ── Stats por score ──
+        sc = self.score_stats.setdefault(score, {"wins": 0, "losses": 0})
+        if win: sc["wins"] += 1
+        else:   sc["losses"] += 1
+
+        # ── Stats por hora ──
+        hr = self.hour_stats.setdefault(hour, {"wins": 0, "losses": 0})
+        if win: hr["wins"] += 1
+        else:   hr["losses"] += 1
+
+        # ── Adaptar MIN_SCORE cada 30 trades ──
+        if self.total_trades % 30 == 0:
+            self._adapt_min_score()
+
+        self.save()
+
+    def _adapt_min_score(self):
+        """Ajusta MIN_SCORE basándose en datos reales de win rate por score."""
+        global MIN_SCORE
+        if len(self.trades) < 20:
+            return
+
+        best_score = MIN_SCORE
+        best_wr    = 0.0
+
+        for sc, data in self.score_stats.items():
+            total = data["wins"] + data["losses"]
+            if total < 5:
+                continue
+            wr = data["wins"] / total
+            if wr > best_wr:
+                best_wr    = wr
+                best_score = sc
+
+        # Solo ajustar si hay diferencia significativa y datos suficientes
+        if best_wr > 0.55 and abs(best_score - self.adaptive_min_score) <= 2:
+            old = self.adaptive_min_score
+            # Encontrar el score mínimo con win rate > 50%
+            for sc in sorted(self.score_stats.keys()):
+                d = self.score_stats[sc]
+                total = d["wins"] + d["losses"]
+                if total >= 5 and d["wins"] / total < 0.45:
+                    new_min = sc + 1
+                    if new_min != old:
+                        self.adaptive_min_score = new_min
+                        MIN_SCORE = new_min
+                        log.info(f"🧠 MIN_SCORE ajustado: {old}→{new_min} "
+                                 f"(WR análisis de {self.total_trades} trades)")
+                    break
+
+    def get_report(self) -> str:
+        """Genera un resumen del aprendizaje para Telegram."""
+        if self.total_trades < 5:
+            return f"🧠 Brain: {self.total_trades} trades — datos insuficientes aún"
+
+        recent = [t for t in self.trades[-30:]]
+        if not recent:
+            return "🧠 Sin datos recientes"
+
+        wins    = sum(1 for t in recent if t["win"])
+        wr      = wins / len(recent) * 100
+        avg_pnl = sum(t["pnl"] for t in recent) / len(recent)
+
+        # Mejor y peor score
+        score_report = []
+        for sc in sorted(self.score_stats.keys()):
+            d = self.score_stats[sc]
+            total = d["wins"] + d["losses"]
+            if total >= 3:
+                score_report.append(f"  {sc}/25: {d['wins']}W/{d['losses']}L "
+                                    f"({d['wins']/total*100:.0f}%)")
+
+        # Mejor factor
+        best_factors = []
+        for f, results in self.factor_wins.items():
+            if len(results) >= 5:
+                best_factors.append((f, sum(results)/len(results), len(results)))
+        best_factors.sort(key=lambda x: -x[1])
+
+        bl_active = sum(1 for exp in self.blacklist.values() if time.time() < exp)
+
+        lines = [
+            f"🧠 <b>TRADING BRAIN REPORT</b>",
+            f"Total: {self.total_trades} trades | MIN_SCORE adaptado: {self.adaptive_min_score}/25",
+            f"Últimos 30: {wins}W/{len(recent)-wins}L = {wr:.0f}% | Avg: ${avg_pnl:+.3f}",
+            f"🚫 Pares bloqueados: {bl_active}",
+        ]
+        if score_report:
+            lines.append("📊 Win rate por score:")
+            lines.extend(score_report[:6])
+        if best_factors:
+            lines.append("⭐ Mejores indicadores:")
+            for name, wr_f, n in best_factors[:3]:
+                lines.append(f"  {name}: {wr_f*100:.0f}% ({n} trades)")
+        return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════
+# GRID STATE — Estado de operaciones grid en lateral (v16)
+# ══════════════════════════════════════════════════════════
+@dataclass
+class GridLevel:
+    price:     float = 0.0
+    side:      str   = ""    # "buy" o "sell"
+    order_id:  str   = ""
+    filled:    bool  = False
+    pnl:       float = 0.0
+
+@dataclass
+class GridTrade:
+    symbol:    str   = ""
+    center:    float = 0.0    # precio central del grid
+    spacing:   float = 0.0    # separación entre niveles (ATR-based)
+    levels:    list  = field(default_factory=list)  # List[GridLevel]
+    ts_open:   float = 0.0
+    total_pnl: float = 0.0
+    n_trades:  int   = 0
 
 
 # ══════════════════════════════════════════════════════════
@@ -229,7 +462,7 @@ class TradeState:
     utbot_stop:       float = 0.0   # UTBot ATR trailing stop at entry
     bar_count:        int   = 0     # barras desde entrada (trade expiry)
     uptrend_entry:    bool  = True  # era uptrend en la entrada
-    whale_desc:       str   = ""    # descripción señales ballenas v14
+    whale_desc:       str   = ""    # whale + saint grail signals v15
     rr_trail_active:  bool  = False # R:R trail trigger activado (Bj Bot)
     rr_trail_stop:    float = 0.0   # nivel del trailing Bj Bot
 
@@ -246,9 +479,10 @@ class BotState:
     daily_pnl:      float = 0.0
     daily_reset_ts: float = 0.0
     last_heartbeat: float = 0.0
-    trades:    Dict[str, TradeState] = field(default_factory=dict)
-    cooldowns: Dict[str, float]      = field(default_factory=dict)
-    rsi_alerts:Dict[str, float]      = field(default_factory=dict)
+    trades:       Dict[str, TradeState] = field(default_factory=dict)
+    grid_trades:  Dict[str, GridTrade]  = field(default_factory=dict)  # v16 grid
+    cooldowns:    Dict[str, float]      = field(default_factory=dict)
+    rsi_alerts:   Dict[str, float]      = field(default_factory=dict)
     btc_bull: bool  = True
     btc_bear: bool  = False
     btc_rsi:  float = 50.0
@@ -263,7 +497,7 @@ class BotState:
         return (self.wins / t * 100) if t else 0.0
     def profit_factor(self) -> float:
         return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
-    def score_bar(self, score: int, mx: int = 20) -> str:
+    def score_bar(self, score: int, mx: int = 25) -> str:
         return "█" * min(score, mx) + "░" * (mx - min(score, mx))
     def cb_active(self) -> bool:
         if not USE_CB or self.peak_equity <= 0: return False
@@ -286,6 +520,7 @@ class BotState:
 
 
 state = BotState()
+brain = TradingBrain()  # 🧠 v16 — aprende de cada trade
 
 
 # ══════════════════════════════════════════════════════════
@@ -356,18 +591,20 @@ def tg(msg: str):
 
 def tg_startup(balance: float, n: int):
     tg(
-        f"<b>🚀 SATY ELITE v14 — WHALE EDITION</b>\n"
+        f"<b>🚀 SATY ELITE v16 — GRAIL + BRAIN + GRID</b>\n"
         f"══════════════════════════════\n"
         f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
         f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
         f"⏱ {TF} · {HTF1} · {HTF2} | Leverage: {LEVERAGE}×\n"
-        f"🎯 Score min: {MIN_SCORE}/20 | Max trades: {MAX_OPEN_TRADES}\n"
+        f"🎯 Score min: {MIN_SCORE}/25 | Max trades: {MAX_OPEN_TRADES}\n"
         f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.0f} × {LEVERAGE}× = ${FIXED_USDT*LEVERAGE:.0f} notional/trade\n"
         f"🛡 CB: -{CB_DD}% | Límite diario: -{DAILY_LOSS_LIMIT}% | Consec: {MAX_CONSEC_LOSS}\n"
         f"📐 R:R={RNR} | Trail activo al {RR_EXIT*100:.0f}% | SL mult={RISK_MULT}\n"
         f"⏳ Cooldown: {COOLDOWN_MIN}min | Spread máx: {MAX_SPREAD_PCT}%\n"
         f"₿ Filtro BTC: {'✅' if BTC_FILTER else '❌ (long+short libre)'}\n"
-        f"🐋 Whale signals: FR + OI + L/S ratio + Sesión institucional\n"
+        f"🐋 Whale: FR + OI + L/S ratio + Sesión\n"
+        f"⚜️ Saint Grail: VWAP + Supertrend + CVD + SMC + Regime\n"
+        f"🚫 Regime Chop Filter: activo (bloquea mercados laterales)\n"
         f"══════════════════════════════\n"
         f"⏰ {utcnow()}"
     )
@@ -384,7 +621,7 @@ def tg_signal(t: TradeState, row: pd.Series):
     tg(
         f"{e} <b>{'LONG' if t.side=='long' else 'SHORT'}</b> — {t.symbol}\n"
         f"══════════════════════════════\n"
-        f"🎯 Score: {t.entry_score}/20  {state.score_bar(t.entry_score)}\n"
+        f"🎯 Score: {t.entry_score}/25  {state.score_bar(t.entry_score)}\n"
         f"📊 {trend}\n"
         f"💵 Entrada: <code>{t.entry_price:.6g}</code>\n"
         f"🟡 TP1: <code>{t.tp1_price:.6g}</code> R:R 1:{rr1:.1f}\n"
@@ -395,8 +632,13 @@ def tg_signal(t: TradeState, row: pd.Series):
         f"{smi_label(smi_v)} | {wt_label(wt_v)}\n"
         f"{rsi_zone_label(float(row['rsi']))} | ADX:{row['adx']:.1f}\n"
         f"MACD:{row['macd_hist']:.5f} | Vol:{row['volume']/row['vol_ma']:.2f}x\n"
-        f"ATR:{t.atr_entry:.5f} | ${FIXED_USDT:.0f} fijos\n"
+        f"ATR:{t.atr_entry:.5f} | ${FIXED_USDT:.0f} × {LEVERAGE}×\n"
         f"🐋 {t.whale_desc}\n"
+        f"⚜️ VWAP:{'✅' if row.get('above_vwap' if t.side=='long' else 'below_vwap') else '❌'} "
+        f"ST:{'✅' if row.get('st_bull' if t.side=='long' else 'st_bear') else '❌'} "
+        f"CVD:{'✅' if row.get('cvd_bull_div' if t.side=='long' else 'cvd_bear_div') else '❌'} "
+        f"SMC:{'✅' if row.get('ob_bull' if t.side=='long' else 'ob_bear') else '❌'} "
+        f"Régimen:{'✅' if row.get('regime_trend') else '❌'}\n"
         f"₿{'🟢' if state.btc_bull else '🔴' if state.btc_bear else '⚪'} "
         f"RSI:{state.btc_rsi:.0f}\n"
         f"📊 {state.open_count()}/{MAX_OPEN_TRADES} trades\n"
@@ -428,7 +670,7 @@ def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
     pct = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
     tg(
         f"{e} <b>CERRADO</b> — {t.symbol}\n"
-        f"📋 {t.side.upper()} · {t.entry_score}/20 · {reason}\n"
+        f"📋 {t.side.upper()} · {t.entry_score}/25 · {reason}\n"
         f"💵 <code>{t.entry_price:.6g}</code> → <code>{exit_p:.6g}</code> ({pct:+.2f}%)\n"
         f"{'💰' if pnl>0 else '💸'} PnL: ${pnl:+.2f} | Barras: {t.bar_count}\n"
         f"📊 {state.wins}W/{state.losses}L · WR:{state.win_rate():.1f}% · PF:{state.profit_factor():.2f}\n"
@@ -444,7 +686,7 @@ def tg_rsi_alert(symbol: str, rsi: float, smi: float, wt: float,
         f"{rsi_zone_label(rsi)}\n"
         f"{smi_label(smi)} | {wt_label(wt)}\n"
         f"💵 <code>{price:.6g}</code> | {direction}\n"
-        f"Score: L:{ls}/20 S:{ss}/20\n"
+        f"Score: L:{ls}/25 S:{ss}/25\n"
         f"⏰ {utcnow()}"
     )
 
@@ -456,7 +698,7 @@ def tg_summary(signals: List[dict], n_scanned: int):
     ) or "  (ninguna)"
     top = "\n".join(
         f"  {'🟢' if s['side']=='long' else '🔴'} {s['symbol']} "
-        f"{s['score']}/20 {wt_label(s['wt'])}"
+        f"{s['score']}/25 {wt_label(s['wt'])}"
         for s in signals[:5]
     ) or "  (ninguna)"
     tg(
@@ -473,12 +715,15 @@ def tg_heartbeat(balance: float):
     bases    = state.bases_open()
     open_str = ", ".join(f"{b}({'L' if s=='long' else 'S'})"
                          for b, s in bases.items()) or "ninguna"
+    grids_str = ", ".join(state.grid_trades.keys()) or "ninguno"
     tg(
         f"💓 <b>HEARTBEAT</b> — {utcnow()}\n"
         f"Balance: ${balance:.2f} | Hoy: ${state.daily_pnl:+.2f}\n"
-        f"Trades: {state.open_count()}/{MAX_OPEN_TRADES} | {open_str}\n"
+        f"Trades tendencia: {state.open_count()}/{MAX_OPEN_TRADES} | {open_str}\n"
+        f"🔲 Grids activos: {len(state.grid_trades)} | {grids_str}\n"
         f"₿ {'BULL' if state.btc_bull else 'BEAR' if state.btc_bear else 'NEUTRAL'} "
-        f"RSI:{state.btc_rsi:.0f}"
+        f"RSI:{state.btc_rsi:.0f}\n"
+        f"\n{brain.get_report()}"
     )
 
 def tg_error(msg: str):
@@ -497,7 +742,7 @@ def tg_manual_signal(symbol: str, side: str, score: int,
         f"══════════════════════════════\n"
         f"⚠️ <i>Bot no pudo abrir: {reason[:80]}</i>\n"
         f"══════════════════════════════\n"
-        f"🎯 Score: {score}/20  |  12× apalancamiento\n"
+        f"🎯 Score: {score}/25  |  12× apalancamiento\n"
         f"💵 Entrada: <code>{entry:.6g}</code>\n"
         f"🟡 TP1: <code>{tp1:.6g}</code>  (R:R 1:{rr1:.1f})\n"
         f"🟢 TP2: <code>{tp2:.6g}</code>  (R:R 1:{rr2:.1f})\n"
@@ -835,6 +1080,144 @@ def whale_score_bonus(ex: ccxt.Exchange, symbol: str, side: str) -> Tuple[int, i
     return long_pts, short_pts, " | ".join(desc_parts)
 
 # ══════════════════════════════════════════════════════════
+# SUPERTREND — El filtro de tendencia más fiable (v15)
+# Parámetros probados: period=10, multiplier=3.0
+# Señal: precio cruza por encima → BULL | precio cruza por debajo → BEAR
+# Usado por HaasOnline, Cryptohopper y los mejores bots 2025
+# ══════════════════════════════════════════════════════════
+def calc_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Tuple[pd.Series, pd.Series]:
+    """
+    Retorna (supertrend_line, direction):
+      direction = +1 uptrend (alcista), -1 downtrend (bajista)
+    """
+    h = df["high"]; l = df["low"]; c = df["close"]
+    hl2 = (h + l) / 2.0
+    atr = calc_atr(df, period)
+
+    basic_upper = hl2 + multiplier * atr
+    basic_lower = hl2 - multiplier * atr
+
+    upper = basic_upper.copy()
+    lower = basic_lower.copy()
+
+    for i in range(1, len(df)):
+        # Final upper band
+        if basic_upper.iloc[i] < upper.iloc[i-1] or c.iloc[i-1] > upper.iloc[i-1]:
+            upper.iloc[i] = basic_upper.iloc[i]
+        else:
+            upper.iloc[i] = upper.iloc[i-1]
+        # Final lower band
+        if basic_lower.iloc[i] > lower.iloc[i-1] or c.iloc[i-1] < lower.iloc[i-1]:
+            lower.iloc[i] = basic_lower.iloc[i]
+        else:
+            lower.iloc[i] = lower.iloc[i-1]
+
+    direction = pd.Series(index=df.index, dtype=float)
+    supertrend = pd.Series(index=df.index, dtype=float)
+    direction.iloc[0] = 1.0
+    supertrend.iloc[0] = lower.iloc[0]
+
+    for i in range(1, len(df)):
+        prev_dir = direction.iloc[i-1]
+        if prev_dir == -1:
+            direction.iloc[i] = 1.0 if c.iloc[i] > upper.iloc[i-1] else -1.0
+        else:
+            direction.iloc[i] = -1.0 if c.iloc[i] < lower.iloc[i-1] else 1.0
+        supertrend.iloc[i] = lower.iloc[i] if direction.iloc[i] == 1 else upper.iloc[i]
+
+    return supertrend, direction
+
+
+# ══════════════════════════════════════════════════════════
+# CVD — Cumulative Volume Delta (orden de flujo real)
+# La diferencia entre volumen comprador y vendedor acumulado.
+# Divergencia CVD vs precio = señal de reversal / trampa
+# Usado por traders institucionales para confirmar breakouts
+# ══════════════════════════════════════════════════════════
+def calc_cvd(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    CVD aproximado desde OHLCV (sin datos de tape):
+    - delta_bar = buy_vol - sell_vol (estimación desde velas)
+    - cvd       = delta acumulado rolling period barras
+    - cvd_bull  = CVD sube mientras precio también sube (confluencia)
+    - cvd_bear  = CVD baja mientras precio también baja (confluencia)
+    - cvd_bull_div = precio baja pero CVD sube → absorción (señal LONG fuerte)
+    - cvd_bear_div = precio sube pero CVD baja → distribución (señal SHORT fuerte)
+    """
+    h = df["high"]; l = df["low"]; c = df["close"]; o = df["open"]; v = df["volume"]
+    rng = (h - l).replace(0, np.nan)
+
+    # Estimación delta por vela (buy vol - sell vol)
+    buy_vol  = v * (c - l) / rng
+    sell_vol = v * (h - c) / rng
+    delta    = (buy_vol - sell_vol).fillna(0)
+
+    # CVD rolling (últimas `period` barras)
+    cvd = delta.rolling(period).sum()
+
+    # Divergencia: precio hace mínimo más bajo pero CVD hace mínimo más alto → bullish
+    cvd_bull_div = (
+        (c < c.shift(3)) &           # precio bajó
+        (cvd > cvd.shift(3)) &       # pero CVD subió
+        (cvd < 0)                    # y CVD aún negativo (zona sobreventa)
+    )
+    # Divergencia bajista: precio hace máximo más alto pero CVD hace máximo más bajo
+    cvd_bear_div = (
+        (c > c.shift(3)) &
+        (cvd < cvd.shift(3)) &
+        (cvd > 0)
+    )
+
+    return cvd, cvd_bull_div, cvd_bear_div
+
+
+# ══════════════════════════════════════════════════════════
+# SMC — Smart Money Concepts (Order Blocks + BOS/CHoCH)
+# Lo que usan los hedge funds e instituciones
+# Order Block = zona donde las instituciones colocaron órdenes masivas
+# BOS = Break of Structure (continuación de tendencia)
+# CHoCH = Change of Character (reversión inminente)
+# ══════════════════════════════════════════════════════════
+def calc_smc(df: pd.DataFrame, swing_len: int = 10) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """
+    Retorna:
+    - ob_bull: True si precio está sobre un bullish order block (soporte institucional)
+    - ob_bear: True si precio está bajo un bearish order block (resistencia institucional)
+    - bos_bull: Break of Structure alcista (precio rompió máximo estructural → tendencia LONG)
+    - choch:    Change of Character (posible reversión, cuidado)
+    """
+    h = df["high"]; l = df["low"]; c = df["close"]
+
+    # Swing highs y lows estructurales
+    swing_high = h.rolling(swing_len * 2 + 1, center=True).max() == h
+    swing_low  = l.rolling(swing_len * 2 + 1, center=True).min() == l
+
+    # BOS alcista: precio cierra por encima del swing high anterior
+    prev_swing_high = h.where(swing_high).ffill().shift(1)
+    bos_bull = (c > prev_swing_high) & (c.shift(1) <= prev_swing_high)
+
+    # BOS bajista: precio cierra por debajo del swing low anterior
+    prev_swing_low = l.where(swing_low).ffill().shift(1)
+    bos_bear = (c < prev_swing_low) & (c.shift(1) >= prev_swing_low)
+
+    # CHoCH: después de BOS alcista, si rompe el último swing low = posible reversión
+    choch = bos_bull.shift(1).fillna(False) & bos_bear
+
+    # Order Block alcista: última vela bajista antes de un BOS alcista (zona de compra institucional)
+    # Es la vela roja que precede al movimiento alcista fuerte
+    ob_bull_level = l.where(bos_bull.shift(1).fillna(False)).ffill()
+    ob_bull_top   = h.where(bos_bull.shift(1).fillna(False)).ffill()
+    ob_bull = (c >= ob_bull_level) & (c <= ob_bull_top * 1.005)  # precio dentro o cerca del OB
+
+    # Order Block bajista: última vela alcista antes de un BOS bajista
+    ob_bear_level = h.where(bos_bear.shift(1).fillna(False)).ffill()
+    ob_bear_bottom= l.where(bos_bear.shift(1).fillna(False)).ffill()
+    ob_bear = (c <= ob_bear_level) & (c >= ob_bear_bottom * 0.995)
+
+    return ob_bull.fillna(False), ob_bear.fillna(False), bos_bull.fillna(False), choch.fillna(False)
+
+
+# ══════════════════════════════════════════════════════════
 # BJ BOT — R:R Targets (3Commas framework)
 # ══════════════════════════════════════════════════════════
 def calc_rr_targets(entry: float, side: str,
@@ -976,6 +1359,63 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
         (h > h.shift(1)) & (h.shift(1) > h.shift(2)) &
         (rsi < rsi.shift(1)) & (rsi.shift(1) < rsi.shift(2)) & (rsi > 58)
     )
+
+    # ══════════════════════════════════════════════════════
+    # v15 SAINT GRAIL — Indicadores avanzados
+    # ══════════════════════════════════════════════════════
+
+    # ── P21: VWAP diario (288 velas × 5m = 1 día) ──
+    vwap_period   = min(288, len(df))
+    typical_price = (h + l + c) / 3.0
+    cum_vol       = v.rolling(vwap_period).sum()
+    cum_tpvol     = (typical_price * v).rolling(vwap_period).sum()
+    df["vwap"]           = cum_tpvol / cum_vol.replace(0, np.nan)
+    df["above_vwap"]     = c > df["vwap"]
+    df["below_vwap"]     = c < df["vwap"]
+    df["vwap_cross_up"]  = (c > df["vwap"]) & (c.shift(1) <= df["vwap"].shift(1))
+    df["vwap_cross_down"]= (c < df["vwap"]) & (c.shift(1) >= df["vwap"].shift(1))
+
+    # ── P22: Supertrend (10, 3.0) ──
+    try:
+        st_line, st_dir = calc_supertrend(df, period=10, multiplier=3.0)
+        df["st_bull"]       = (st_dir == 1.0)
+        df["st_bear"]       = (st_dir == -1.0)
+        df["st_cross_bull"] = (st_dir == 1.0) & (st_dir.shift(1).fillna(-1.0) == -1.0)
+        df["st_cross_bear"] = (st_dir == -1.0) & (st_dir.shift(1).fillna(1.0) == 1.0)
+    except Exception:
+        for k in ["st_bull","st_bear","st_cross_bull","st_cross_bear"]:
+            df[k] = False
+
+    # ── P23: CVD Divergence ──
+    try:
+        cvd, cvd_bull_div, cvd_bear_div = calc_cvd(df, period=20)
+        df["cvd"]          = cvd
+        df["cvd_bull_div"] = cvd_bull_div
+        df["cvd_bear_div"] = cvd_bear_div
+        df["cvd_rising"]   = cvd > cvd.shift(3)
+        df["cvd_falling"]  = cvd < cvd.shift(3)
+    except Exception:
+        for k in ["cvd_bull_div","cvd_bear_div","cvd_rising","cvd_falling"]:
+            df[k] = False
+
+    # ── P24: SMC — Order Blocks + BOS ──
+    try:
+        ob_bull, ob_bear, bos_bull, choch = calc_smc(df, swing_len=SWING_LB)
+        df["ob_bull"]  = ob_bull
+        df["ob_bear"]  = ob_bear
+        df["bos_bull"] = bos_bull
+        df["choch"]    = choch
+    except Exception:
+        for k in ["ob_bull","ob_bear","bos_bull","choch"]:
+            df[k] = False
+
+    # ── Market Regime Filter ──
+    atr_pct    = df["atr"] / c.replace(0, np.nan) * 100
+    atr_pct_ma = sma(atr_pct, 50)
+    bb_w_ma    = sma(df["bb_width"], 50)
+    df["regime_trend"] = (adx > 20) & (df["bb_width"] > bb_w_ma * 0.9) & (atr_pct > atr_pct_ma * 0.7)
+    df["regime_chop"]  = (adx < 18) & (df["bb_width"] < bb_w_ma * 0.8)
+
     return df
 
 
@@ -995,7 +1435,7 @@ def htf2_macro(df: pd.DataFrame) -> Tuple[bool, bool]:
 
 
 # ══════════════════════════════════════════════════════════
-# SCORE 20 PUNTOS — v14 Whale Edition
+# SCORE 25 PUNTOS — v15 Saint Grail Edition
 # ══════════════════════════════════════════════════════════
 def confluence_score(row: pd.Series,
                      htf1_bull: bool, htf1_bear: bool,
@@ -1003,9 +1443,9 @@ def confluence_score(row: pd.Series,
                      uptrend: bool,
                      whale_long: int = 0, whale_short: int = 0) -> Tuple[int, int]:
     """
-    20 puntos por dirección (v14 Whale Edition):
-    
-    LONG:
+    25 puntos por dirección (v15 Saint Grail Edition):
+
+    LONG (P1-P16 base + P17-P20 whale + P21-P25 saint grail):
      1. EMA trend alcista
      2. Oscilador cruza al alza
      3. HTF1 bias alcista
@@ -1018,17 +1458,26 @@ def confluence_score(row: pd.Series,
     10. SMI cross up / bull
     11. SMI en OS o saliendo
     12. Bull engulf / div RSI
-    13. UTBot BUY signal       ← Pine (HPotter)
-    14. WaveTrend cross up / OS ← Pine (Instrument-Z)
-    15. MA cross alcista        ← Pine (Bj Bot)
-    16. BB buy signal           ← Pine (rouxam BB+RSI)
-    17. Funding Rate favorable  ← WHALE v14
-    18. Open Interest creciente ← WHALE v14
-    19. Long/Short ratio a favor← WHALE v14
-    20. Sesión institucional    ← WHALE v14
+    13. UTBot BUY signal
+    14. WaveTrend cross up / OS
+    15. MA cross alcista
+    16. BB buy signal
+    17. Funding Rate favorable     ← WHALE v14
+    18. Open Interest creciente    ← WHALE v14
+    19. Long/Short ratio a favor   ← WHALE v14
+    20. Sesión institucional       ← WHALE v14
+    21. Precio sobre VWAP diario   ← SAINT GRAIL v15
+    22. Supertrend alcista         ← SAINT GRAIL v15
+    23. CVD bull divergence        ← SAINT GRAIL v15
+    24. SMC Order Block bull / BOS ← SAINT GRAIL v15
+    25. Régimen de tendencia activo← SAINT GRAIL v15
 
     SHORT: lógica espejada
     """
+    # HARD BLOCK: si el mercado está en chop/lateral, score = 0
+    if bool(row.get("regime_chop", False)):
+        return 0, 0
+
     rsi = float(row["rsi"])
 
     # ─── LONG ─────────────────────────────────────────────
@@ -1044,13 +1493,19 @@ def confluence_score(row: pd.Series,
     l10 = bool(row.get("smi_cross_up") or row.get("smi_bull"))
     l11 = bool(row.get("smi_os")       or row.get("smi_exit_os"))
     l12 = bool(row["bull_engulf"]      or row["bull_div"])
-    l13 = bool(row.get("utbot_buy"))                                      # UTBot
-    l14 = bool(row.get("wt_cross_up")  or row.get("wt_os") or            # WaveTrend
+    l13 = bool(row.get("utbot_buy"))
+    l14 = bool(row.get("wt_cross_up")  or row.get("wt_os") or
                (row.get("wt_bull") and not row.get("wt_ob")))
-    l15 = bool(row.get("ma_cross_up"))                                    # Bj Bot MA cross
-    l16 = bool(row.get("bb_buy") and not row.get("squeeze"))              # BB + RSI
-    # Whale points (P17-P20) vienen precalculados
-    whale_l_pts = min(whale_long, 4)   # máx 4 puntos whale para LONG
+    l15 = bool(row.get("ma_cross_up"))
+    l16 = bool(row.get("bb_buy") and not row.get("squeeze"))
+    # Whale points (P17-P20)
+    whale_l_pts = min(whale_long, 4)
+    # Saint Grail (P21-P25)
+    l21 = bool(row.get("above_vwap") or row.get("vwap_cross_up"))         # VWAP
+    l22 = bool(row.get("st_bull") or row.get("st_cross_bull"))            # Supertrend
+    l23 = bool(row.get("cvd_bull_div") or row.get("cvd_rising"))          # CVD
+    l24 = bool(row.get("ob_bull") or row.get("bos_bull"))                 # SMC
+    l25 = bool(row.get("regime_trend", False))                            # Régimen tendencia
 
     # ─── SHORT ────────────────────────────────────────────
     s1  = bool(row["close"] < row["ema48"] and row["ema8"] < row["ema21"])
@@ -1065,15 +1520,24 @@ def confluence_score(row: pd.Series,
     s10 = bool(row.get("smi_cross_down") or row.get("smi_bear"))
     s11 = bool(row.get("smi_ob")         or row.get("smi_exit_ob"))
     s12 = bool(row["bear_engulf"]        or row["bear_div"])
-    s13 = bool(row.get("utbot_sell"))                                     # UTBot
-    s14 = bool(row.get("wt_cross_dn")    or row.get("wt_ob") or          # WaveTrend
+    s13 = bool(row.get("utbot_sell"))
+    s14 = bool(row.get("wt_cross_dn")    or row.get("wt_ob") or
                (row.get("wt_bear") and not row.get("wt_os")))
-    s15 = bool(row.get("ma_cross_down"))                                  # Bj Bot MA cross
-    s16 = bool(row.get("bb_sell") and not row.get("squeeze"))             # BB + RSI
-    whale_s_pts = min(whale_short, 4)  # máx 4 puntos whale para SHORT
+    s15 = bool(row.get("ma_cross_down"))
+    s16 = bool(row.get("bb_sell") and not row.get("squeeze"))
+    whale_s_pts = min(whale_short, 4)
+    # Saint Grail (P21-P25)
+    s21 = bool(row.get("below_vwap") or row.get("vwap_cross_down"))      # VWAP
+    s22 = bool(row.get("st_bear") or row.get("st_cross_bear"))           # Supertrend
+    s23 = bool(row.get("cvd_bear_div") or row.get("cvd_falling"))        # CVD
+    s24 = bool(row.get("ob_bear") or row.get("choch"))                   # SMC
+    s25 = bool(row.get("regime_trend", False))                           # Régimen tendencia
 
-    return (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16]) + whale_l_pts,
-            sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16]) + whale_s_pts)
+    long_score  = (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16])
+                   + whale_l_pts + sum([l21,l22,l23,l24,l25]))
+    short_score = (sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16])
+                   + whale_s_pts + sum([s21,s22,s23,s24,s25]))
+    return long_score, short_score
 
 
 
@@ -1266,7 +1730,7 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
             log.warning(f"[{symbol}] notional ${amount*price:.2f} excede 3× FIXED_USDT, skipping")
             return None
 
-        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/20 "
+        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/25 "
                  f"SMI={smi_v:.1f} WT={wt_v:.1f} ${usdt:.1f} @ {price:.6g}")
 
         order       = ex.create_order(symbol, "market", side, amount,
@@ -1413,6 +1877,7 @@ def close_trade(ex: ccxt.Exchange, symbol: str, reason: str, price: float):
 
     log_csv("CLOSE", t, price, pnl)
     tg_close(reason, t, price, pnl)
+    brain.record_trade(symbol, t.side, t.entry_score, pnl, reason)
     del state.trades[symbol]
 
 
@@ -1445,6 +1910,7 @@ def manage_trade(ex: ccxt.Exchange, symbol: str,
         state.set_cooldown(symbol)
         log_csv("CLOSE_EXT", t, live_price, pnl)
         tg_close(reason, t, live_price, pnl)
+        brain.record_trade(symbol, t.side, t.entry_score, pnl, reason)
         del state.trades[symbol]
         return
 
@@ -1686,13 +2152,152 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
 
 
 # ══════════════════════════════════════════════════════════
+# GRID MODE — Gana dinero cuando el mercado está lateral (v16)
+# Cuando regime_chop=True, activa un mini-grid de 5 niveles
+# Usa ATR para espaciar niveles, leverage reducido (3×)
+# ══════════════════════════════════════════════════════════
+GRID_LEVELS       = 5      # niveles arriba y abajo del centro
+GRID_ATR_MULT     = 0.6    # separación entre niveles = 0.6 × ATR
+GRID_LEVERAGE     = 3      # leverage reducido para grid (más seguro)
+GRID_USDT         = 4.0    # capital por nivel de grid (mitad del FIXED_USDT)
+GRID_MAX_ACTIVE   = 3      # máximo de grids activos simultáneamente
+GRID_EXPIRE_H     = 6      # cerrar grid si no llega a TP en 6 horas
+GRID_MIN_VOLUME   = 1_000_000  # volumen mínimo para grid (más estricto)
+
+
+def open_grid(ex: ccxt.Exchange, symbol: str, price: float, atr: float):
+    """Abre un mini-grid de 5 niveles cuando el mercado está lateral."""
+    if symbol in state.grid_trades:
+        return
+    if len(state.grid_trades) >= GRID_MAX_ACTIVE:
+        return
+
+    spacing = atr * GRID_ATR_MULT
+    if spacing <= 0 or price <= 0:
+        return
+
+    # Comprueba volumen mínimo
+    try:
+        ticker = ex.fetch_ticker(symbol)
+        vol_24h = float(ticker.get("quoteVolume", 0) or 0)
+        if vol_24h < GRID_MIN_VOLUME:
+            return
+    except Exception:
+        return
+
+    levels = []
+    # Niveles de COMPRA: por debajo del precio actual
+    for i in range(1, GRID_LEVELS + 1):
+        buy_price = price - i * spacing
+        if buy_price <= 0:
+            continue
+        try:
+            ex.set_leverage(GRID_LEVERAGE, symbol, params={})
+        except Exception:
+            pass
+        min_amt = get_min_amount(ex, symbol)
+        amount = max((GRID_USDT * GRID_LEVERAGE) / buy_price, min_amt)
+        try:
+            amount = float(ex.amount_to_precision(symbol, amount))
+            buy_price_p = float(ex.price_to_precision(symbol, buy_price))
+            order = ex.create_order(symbol, "limit", "buy", amount,
+                                    price=buy_price_p,
+                                    params={"reduceOnly": False})
+            levels.append(GridLevel(price=buy_price_p, side="buy",
+                                    order_id=order.get("id", ""), filled=False))
+        except Exception as e:
+            log.warning(f"[GRID] {symbol} buy L{i}: {e}")
+
+    if not levels:
+        return
+
+    gt = GridTrade(
+        symbol=symbol, center=price, spacing=spacing,
+        levels=levels, ts_open=time.time()
+    )
+    state.grid_trades[symbol] = gt
+    tg(f"🔲 <b>GRID ABIERTO</b> — {symbol}\n"
+       f"Precio: <code>{price:.6g}</code> | ATR: {atr:.5f}\n"
+       f"Spacing: {spacing:.5f} | Niveles: {len(levels)}\n"
+       f"Capital: ${GRID_USDT:.0f} × {GRID_LEVERAGE}× por nivel\n"
+       f"⏰ {utcnow()}")
+    log.info(f"[GRID OPEN] {symbol} center={price:.6g} spacing={spacing:.5f} "
+             f"levels={len(levels)}")
+
+
+def manage_grid(ex: ccxt.Exchange, symbol: str, live_price: float):
+    """Gestiona un grid activo: detecta fills y coloca sell en el nivel superior."""
+    if symbol not in state.grid_trades:
+        return
+    gt = state.grid_trades[symbol]
+
+    # ── Expiración ──
+    if time.time() - gt.ts_open > GRID_EXPIRE_H * 3600:
+        close_grid(ex, symbol, "EXPIRADO")
+        return
+
+    # ── Verificar fills ──
+    for lv in gt.levels:
+        if lv.filled or not lv.order_id:
+            continue
+        try:
+            order = ex.fetch_order(lv.order_id, symbol)
+            status = order.get("status", "")
+            if status == "closed":
+                lv.filled = True
+                fill_price = float(order.get("average") or order.get("price") or live_price)
+                tp_price   = fill_price + gt.spacing  # TP en el nivel superior
+                amount     = float(order.get("filled", 0))
+                if amount > 0:
+                    try:
+                        tp_price_p = float(ex.price_to_precision(symbol, tp_price))
+                        sell_ord   = ex.create_order(symbol, "limit", "sell", amount,
+                                                     price=tp_price_p,
+                                                     params={"reduceOnly": True})
+                        pnl_est    = (tp_price - fill_price) * amount
+                        lv.pnl     = pnl_est
+                        gt.total_pnl += pnl_est
+                        gt.n_trades  += 1
+                        tg(f"✅ <b>GRID FILL</b> — {symbol}\n"
+                           f"Compra: <code>{fill_price:.6g}</code> → "
+                           f"TP: <code>{tp_price_p:.6g}</code>\n"
+                           f"PnL est: ~${pnl_est:+.3f} | Total: ${gt.total_pnl:+.3f}\n"
+                           f"⏰ {utcnow()}")
+                    except Exception as e:
+                        log.warning(f"[GRID] {symbol} TP order: {e}")
+        except Exception as e:
+            log.debug(f"[GRID] {symbol} check order: {e}")
+
+    # ── Si el precio sale del rango del grid → cerrar ──
+    lower_bound = gt.center - (GRID_LEVELS + 1) * gt.spacing
+    upper_bound = gt.center + (GRID_LEVELS + 1) * gt.spacing
+    if live_price < lower_bound * 0.995 or live_price > upper_bound * 1.005:
+        close_grid(ex, symbol, "PRECIO FUERA DE RANGO")
+
+
+def close_grid(ex: ccxt.Exchange, symbol: str, reason: str):
+    """Cierra todos los pedidos del grid y lo elimina."""
+    if symbol not in state.grid_trades:
+        return
+    gt = state.grid_trades[symbol]
+    try:
+        ex.cancel_all_orders(symbol)
+    except Exception as e:
+        log.warning(f"[GRID] cancel {symbol}: {e}")
+    tg(f"🔲 <b>GRID CERRADO</b> — {symbol} ({reason})\n"
+       f"Trades: {gt.n_trades} | PnL total: ${gt.total_pnl:+.3f}\n"
+       f"⏰ {utcnow()}")
+    del state.grid_trades[symbol]
+
+
+# ══════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════
 def main():
     global HEDGE_MODE
 
     log.info("=" * 65)
-    log.info("  SATY ELITE v14 — WHALE EDITION · 24/7")
+    log.info("  SATY ELITE v16 — GRAIL + BRAIN + GRID · 24/7")
     log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI")
     log.info("=" * 65)
 
@@ -1788,7 +2393,7 @@ def main():
 
             live_positions = get_all_positions(ex)
 
-            # ── Gestionar trades abiertos ──
+            # ── Gestionar trades de tendencia abiertos ──
             for sym in list(state.trades.keys()):
                 try:
                     lp  = live_positions.get(sym)
@@ -1801,6 +2406,14 @@ def main():
                 except Exception as e:
                     log.warning(f"[{sym}] manage: {e}")
 
+            # ── Gestionar grids activos (mercado lateral) ──
+            for sym in list(state.grid_trades.keys()):
+                try:
+                    lp_ = get_last_price(ex, sym)
+                    manage_grid(ex, sym, lp_)
+                except Exception as e:
+                    log.warning(f"[GRID {sym}] manage: {e}")
+
             # ── Buscar nuevas entradas ──
             new_signals: List[dict] = []
 
@@ -1810,6 +2423,7 @@ def main():
                     s for s in symbols
                     if s not in state.trades
                     and not state.in_cooldown(s)
+                    and not brain.is_blacklisted(s)      # 🧠 Brain blacklist
                     and s.split("/")[0] not in bases_open
                 ]
 
@@ -1837,6 +2451,20 @@ def main():
                     if state.base_has_trade(base):
                         continue
 
+                    # ── 🔲 GRID MODE: mercado lateral → ganar en el rango ──
+                    row = res.get("row")
+                    if (row is not None
+                            and bool(row.get("regime_chop", False))
+                            and res["symbol"] not in state.grid_trades
+                            and res["symbol"] not in state.trades
+                            and len(state.grid_trades) < GRID_MAX_ACTIVE):
+                        try:
+                            open_grid(ex, res["symbol"],
+                                      float(row["close"]), float(row["atr"]))
+                        except Exception as ge:
+                            log.debug(f"[GRID] {res['symbol']}: {ge}")
+                        continue  # No abrir trade de tendencia en mercado chop
+
                     if can_long  and res["long_score"]  > best_score:
                         best_score = res["long_score"];  best_side = "long"
                     if can_short and res["short_score"] > best_score:
@@ -1853,7 +2481,7 @@ def main():
                             "smi":        res["smi"],
                             "wt":         res["wt"],
                             "uptrend":    uptrend,
-                            "whale_desc": res.get("whale_desc", ""),  # FIX: pasar datos ballenas
+                            "whale_desc": res.get("whale_desc", ""),
                         })
 
                 new_signals.sort(key=lambda x: x["score"], reverse=True)
