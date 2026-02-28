@@ -1,0 +1,226 @@
+# ═══════════════════════════════════════════════════════════════
+# VARIABLES RAILWAY — SATY ELITE v13 — FULL STRATEGY EDITION
+# ═══════════════════════════════════════════════════════════════
+# Score: 16 puntos | UTBot · WaveTrend · Bj Bot R:R · BB+RSI · SMI
+# ═══════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 1: VARIABLES OBLIGATORIAS (Rellena con tus datos)      │
+# └─────────────────────────────────────────────────────────────┘
+
+BINGX_API_KEY=COLOCA_TU_API_KEY_AQUI
+BINGX_API_SECRET=COLOCA_TU_API_SECRET_AQUI
+TELEGRAM_BOT_TOKEN=123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+TELEGRAM_CHAT_ID=-1001234567890
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 2: VARIABLES DE CAPITAL (recomendadas)                 │
+# └─────────────────────────────────────────────────────────────┘
+
+FIXED_USDT=8
+MAX_OPEN_TRADES=12
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 3: FILTROS DE ENTRADA                                  │
+# └─────────────────────────────────────────────────────────────┘
+
+MIN_SCORE=5
+MIN_VOLUME_USDT=100000
+TOP_N_SYMBOLS=300
+MAX_SPREAD_PCT=1.0
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 4: PROTECCIONES                                        │
+# └─────────────────────────────────────────────────────────────┘
+
+MAX_DRAWDOWN=15
+DAILY_LOSS_LIMIT=8
+COOLDOWN_MIN=20
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 5: TIMEFRAMES Y CICLOS                                 │
+# └─────────────────────────────────────────────────────────────┘
+
+TIMEFRAME=5m
+HTF1=15m
+HTF2=1h
+POLL_SECONDS=60
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ PASO 6: FILTROS MACRO                                       │
+# └─────────────────────────────────────────────────────────────┘
+
+BTC_FILTER=true
+# BLACKLIST=BTC/USDT:USDT,ETH/USDT:USDT
+
+
+# ═══════════════════════════════════════════════════════════════
+# VARIABLES NUEVAS v13 — INDICADORES PINE SCRIPT
+# ═══════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ SMI — Stochastic Momentum Index                             │
+# └─────────────────────────────────────────────────────────────┘
+# Puntos 10 y 11 del score (16 total)
+
+SMI_K_LEN=10
+SMI_D_LEN=3
+SMI_EMA_LEN=10
+SMI_SMOOTH=5
+SMI_OB=40
+SMI_OS=-40
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ UTBOT — ATR Trailing Stop (HPotter / Yo_adriiiiaan)         │
+# └─────────────────────────────────────────────────────────────┘
+# Punto 13 del score. También actúa como trailing stop en profit.
+# UTBOT_KEY_VALUE: sensibilidad (menor = más señales, mayor = menos ruido)
+# UTBOT_ATR_PERIOD: periodo del ATR interno del UTBot
+
+UTBOT_KEY_VALUE=10
+UTBOT_ATR_PERIOD=10
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ WAVETREND — TCI Oscillator (Instrument-Z / OscillateMatrix) │
+# └─────────────────────────────────────────────────────────────┘
+# Punto 14 del score.
+# WT_OB: nivel sobrecompra (señal SHORT)
+# WT_OS: nivel sobreventa (señal LONG)
+
+WT_CHAN_LEN=9
+WT_AVG_LEN=12
+WT_OB=60
+WT_OS=-60
+
+# Trade Expiration: cierra el trade si lleva X barras abierto (0 = desactivado)
+TRADE_EXPIRE_BARS=0
+
+# Mínimo profit % para permitir cierre por señal de agotamiento (0 = cualquier profit)
+MIN_PROFIT_PCT=0.0
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ BJ BOT — Risk to Reward dinámico (3Commas framework)        │
+# └─────────────────────────────────────────────────────────────┘
+# Punto 15 del score (MA cross).
+# RNR: TP2 = entrada + RNR × riesgo. ej: 2.0 = "2:1 R:R"
+# RISK_MULT: buffer ATR detrás del swing low/high para el SL
+# RR_EXIT: % del camino a TP2 para activar trailing agresivo (0=inmediato, 0.5=50%)
+# SWING_LB: lookback de barras para calcular swing high/low
+
+RNR=2.0
+RISK_MULT=1.0
+RR_EXIT=0.5
+SWING_LB=10
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ BB+RSI — Bollinger Bands con filtro RSI (rouxam / DCA bot)  │
+# └─────────────────────────────────────────────────────────────┘
+# Punto 16 del score.
+# BB_RSI_OB: RSI máximo para señal LONG (precio en banda inferior)
+#            RSI mínimo inverso para señal SHORT (100 - BB_RSI_OB)
+
+BB_PERIOD=20
+BB_STD=2.0
+BB_RSI_OB=65
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIGURACIONES ALTERNATIVAS POR CAPITAL
+# ═══════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN A: CAPITAL PEQUEÑO ($50-$200) — Conservador          │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=5
+# MAX_OPEN_TRADES=8
+# MIN_SCORE=8
+# MAX_DRAWDOWN=12
+# DAILY_LOSS_LIMIT=6
+# MIN_VOLUME_USDT=500000
+# TOP_N_SYMBOLS=100
+# MAX_SPREAD_PCT=0.5
+# BTC_FILTER=true
+# RNR=2.0
+# UTBOT_KEY_VALUE=14
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN B: CAPITAL MEDIO ($200-$1000) — Balanceado           │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=10
+# MAX_OPEN_TRADES=12
+# MIN_SCORE=5
+# MAX_DRAWDOWN=15
+# DAILY_LOSS_LIMIT=8
+# MIN_VOLUME_USDT=100000
+# TOP_N_SYMBOLS=300
+# MAX_SPREAD_PCT=1.0
+# BTC_FILTER=true
+# RNR=2.0
+# UTBOT_KEY_VALUE=10
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN C: CAPITAL GRANDE ($1000+) — Agresivo                │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=25
+# MAX_OPEN_TRADES=15
+# MIN_SCORE=5
+# MAX_DRAWDOWN=15
+# DAILY_LOSS_LIMIT=10
+# MIN_VOLUME_USDT=100000
+# TOP_N_SYMBOLS=300
+# MAX_SPREAD_PCT=1.0
+# BTC_FILTER=false
+# RNR=2.5
+# UTBOT_KEY_VALUE=8
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN D: SCALPER — Alta frecuencia                         │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=8
+# MAX_OPEN_TRADES=15
+# MIN_SCORE=5
+# TIMEFRAME=1m
+# HTF1=5m
+# HTF2=15m
+# POLL_SECONDS=30
+# COOLDOWN_MIN=5
+# BTC_FILTER=false
+# UTBOT_KEY_VALUE=7
+# WT_CHAN_LEN=7
+# TRADE_EXPIRE_BARS=60
+
+
+# ┌─────────────────────────────────────────────────────────────┐
+# │ OPCIÓN E: SWING — Posiciones largas                         │
+# └─────────────────────────────────────────────────────────────┘
+# FIXED_USDT=20
+# MAX_OPEN_TRADES=8
+# MIN_SCORE=9
+# TIMEFRAME=1h
+# HTF1=4h
+# HTF2=1d
+# POLL_SECONDS=300
+# COOLDOWN_MIN=60
+# BTC_FILTER=true
+# RNR=3.0
+# UTBOT_KEY_VALUE=14
+# TRADE_EXPIRE_BARS=0
+
+
+# ═══════════════════════════════════════════════════════════════
+# INSTRUCCIONES RÁPIDAS
+# ═══════════════════════════════════════════════════════════════
+# 1. Rellena las 4 variables OBLIGATORIAS del PASO 1
+# 2. Ajusta FIXED_USDT y MAX_OPEN_TRADES a tu capital
+# 3. Copia TODAS las líneas sin comentarios (#)
+# 4. Railway → Tu proyecto → Variables → RAW Editor
+# 5. Pega el contenido → Update Variables
+# 6. Railway redesplegará en ~2 minutos
+# ═══════════════════════════════════════════════════════════════
+# ⚠️ NO compartas este archivo con tus claves API rellenas
+# ⚠️ El repo de GitHub debe ser PRIVADO
+# ⚠️ Si expones las claves, revócalas en BingX inmediatamente
