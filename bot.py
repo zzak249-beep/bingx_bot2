@@ -1,2739 +1,1568 @@
 """
-╔══════════════════════════════════════════════════════════════════╗
-║         SATY ELITE v18 — DCA + ANTI-LOSS                          ║
-║         BingX Perpetual Futures · 12 Trades · 24/7             ║
-╠══════════════════════════════════════════════════════════════════╣
-║  NUEVO v15 — 4 Pine Scripts + Whale Signals:                         ║
-║                                                                  ║
-║  1. UTBot (HPotter/Yo_adriiiiaan)                               ║
-║     · ATR Trailing Stop line con Key Value configurable         ║
-║     · Señal: EMA cruza ATR Trailing Stop → punto score 13       ║
-║     · UTBot trailing como 2ª capa de protección                 ║
-║                                                                  ║
-║  2. Instrument-Z (OscillateMatrix)                              ║
-║     · WaveTrend (TCI) oscillator → puntos score 14             ║
-║     · Divergencias WaveTrend                                    ║
-║     · TP/SL diferenciados UpTrend vs DownTrend                  ║
-║     · Trade Expiration (cierre por barras máximas)              ║
-║     · Mínimo profit para salidas de señal                       ║
-║                                                                  ║
-║  3. Bj Bot (3Commas framework)                                  ║
-║     · Stops basados en Swing H/L + ATR buffer                  ║
-║     · R:R ratio configurable (Risk to Reward)                   ║
-║     · Trail trigger a X% del reward (rrExit)                   ║
-║     · MA cross signal → punto score 15                          ║
-║                                                                  ║
-║  4. BB+RSI (rouxam)                                             ║
-║     · Bollinger Bands oversold/overbought                       ║
-║     · BB signal filtrada por RSI → punto score 16              ║
-║                                                                  ║
-║  Score total: 16 puntos (antes 12)                              ║
-║  Score mínimo recomendado: 5 (ajustar según perfil)             ║
-╚══════════════════════════════════════════════════════════════════╝
-
-VARIABLES OBLIGATORIAS:
-    BINGX_API_KEY  BINGX_API_SECRET
-    TELEGRAM_BOT_TOKEN  TELEGRAM_CHAT_ID
-
-VARIABLES OPCIONALES — GENERALES:
-    MAX_OPEN_TRADES   def:12    FIXED_USDT      def:8
-    MIN_SCORE         def:5     MAX_DRAWDOWN    def:15
-    DAILY_LOSS_LIMIT  def:8     MIN_VOLUME_USDT def:100000
-    TOP_N_SYMBOLS     def:300   POLL_SECONDS    def:60
-    TIMEFRAME         def:5m    HTF1            def:15m
-    HTF2              def:1h    BTC_FILTER      def:true
-    COOLDOWN_MIN      def:20    MAX_SPREAD_PCT  def:1.0
-    BLACKLIST
-
-VARIABLES — SMI (Stochastic Momentum Index):
-    SMI_K_LEN  def:10   SMI_D_LEN  def:3
-    SMI_EMA_LEN def:10  SMI_SMOOTH def:5
-    SMI_OB     def:40   SMI_OS     def:-40
-
-VARIABLES — UTBOT (ATR Trailing Stop):
-    UTBOT_KEY_VALUE   def:10   sensibilidad (+ bajo = + sensible)
-    UTBOT_ATR_PERIOD  def:10   periodo ATR del trailing stop
-
-VARIABLES — WAVETREND (Instrument-Z):
-    WT_CHAN_LEN   def:9    Canal EMA
-    WT_AVG_LEN    def:12   Media EMA
-    WT_OB         def:60   Sobrecompra
-    WT_OS         def:-60  Sobreventa
-
-VARIABLES — BB+RSI (Bollinger Bands):
-    BB_PERIOD  def:20   periodo de la BB
-    BB_STD     def:2.0  desviaciones estándar
-    BB_RSI_OB  def:65   RSI máximo para señal long
-
-VARIABLES — BJ BOT (Risk Management):
-    RNR        def:2.0  Risk to Reward ratio (TP = RnR × Risk)
-    RISK_MULT  def:1.0  Buffer ATR para stop (detrás del swing)
-    RR_EXIT    def:0.5  % del reward para activar trailing (0=inmediato)
-    SWING_LB   def:10   Lookback swing high/low (redefinible)
-    MIN_PROFIT_PCT def:0.0  Mínimo profit % para cerrar por señal
-    TRADE_EXPIRE_BARS def:0 Barras máx por trade (0=desactivado)
+╔══════════════════════════════════════════════════════════════════════════╗
+║  SAIYAN ELITE BOT v6.0 — COMPETITIVE EDITION                            ║
+║  "Inspired by studying 3Commas, Freqtrade, Gunbot & Pionex internals"   ║
+║                                                                          ║
+║  ESTRATEGIAS INTEGRADAS:                                                 ║
+║  1. Dwell Blocks Breakout  — consolidación + breakout ATR                ║
+║  2. UTBot ATR Trailing     — EMA cross ATR trailing stop                 ║
+║  3. BB + RSI               — Bollinger Bands oversold/overbought         ║
+║  4. EMA Trend Follow       — cruce EMA rápida/lenta con volumen          ║
+║  5. Regime-Adaptive        — detecta tendencia vs rango, elige estrategia║
+║                                                                          ║
+║  AUTO-MEJORA (aprende de errores):                                       ║
+║  • Registra causa de cada pérdida (SL tipo, hora, volatilidad, régimen)  ║
+║  • Ajusta pesos de estrategias según rendimiento reciente                ║
+║  • Sube SL dinámicamente si las últimas N operaciones son pérdidas       ║
+║  • Detecta drawdown por estrategia y la pausa si supera umbral           ║
+║  • Volatility sizing — ajusta tamaño según ATR actual vs histórico       ║
+║  • Patrón de horas malas — bloquea automáticamente horas con pérdidas    ║
+║                                                                          ║
+║  VARIABLES OBLIGATORIAS:                                                 ║
+║    BINGX_API_KEY  BINGX_API_SECRET                                       ║
+║    TELEGRAM_BOT_TOKEN  TELEGRAM_CHAT_ID  WEBHOOK_SECRET                  ║
+║                                                                          ║
+║  VARIABLES OPCIONALES (todas tienen defaults):                           ║
+║    FIXED_USDT=20  LEVERAGE=5  MAX_OPEN_TRADES=5                          ║
+║    MAX_DRAWDOWN=15  DAILY_LOSS_LIMIT=8                                   ║
+║    TP1_PCT=1.0  TP2_PCT=1.8  TP3_PCT=3.0  SL_PCT=0.8                    ║
+║    TRAILING_PCT=0.5  TRAILING_ACTIVATE=1.0                               ║
+║    MIN_STRATEGY_SCORE=0.4   (win rate mín para que estrategia opere)     ║
+║    LEARNING_WINDOW=20       (operaciones para calcular rendimiento)       ║
+║    AUTO_PAUSE_DD_PCT=25     (DD por estrategia para pausarla)             ║
+║    DRY_RUN=false                                                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
 """
 
-import os, time, logging, csv, json, collections
-from datetime import datetime, timezone
+import os, time, logging, csv, threading, json, math
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, List, Tuple, Any
+from collections import deque, defaultdict
+from statistics import mean, stdev
 
 import requests
 import ccxt
-import pandas as pd
 import numpy as np
+from flask import Flask, request, jsonify, Response
 
-# ══════════════════════════════════════════════════════════
-# LOGGING
-# ══════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-log = logging.getLogger("saty_v18")
+    handlers=[logging.StreamHandler()])
+log = logging.getLogger("saiyan_elite")
 
-# ══════════════════════════════════════════════════════════
-# CONFIG — variables de entorno
-# ══════════════════════════════════════════════════════════
-API_KEY    = os.environ.get("BINGX_API_KEY",    "")
-API_SECRET = os.environ.get("BINGX_API_SECRET", "")
-TF         = os.environ.get("TIMEFRAME",  "5m")
-HTF1       = os.environ.get("HTF1",       "15m")
-HTF2       = os.environ.get("HTF2",       "1h")
-POLL_SECS  = int(os.environ.get("POLL_SECONDS", "60"))
-TG_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID",   "")
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+API_KEY           = os.environ.get("BINGX_API_KEY",       "")
+API_SECRET        = os.environ.get("BINGX_API_SECRET",    "")
+TG_TOKEN          = os.environ.get("TELEGRAM_BOT_TOKEN",  "")
+TG_CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID",    "")
+WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET",      "saiyan2024")
 
-_bl = os.environ.get("BLACKLIST", "")
-BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
+FIXED_USDT        = float(os.environ.get("FIXED_USDT",           "20.0"))
+LEVERAGE          = int  (os.environ.get("LEVERAGE",              "5"))
+MAX_OPEN_TRADES   = int  (os.environ.get("MAX_OPEN_TRADES",       "5"))
+CB_DD             = float(os.environ.get("MAX_DRAWDOWN",          "15.0"))
+DAILY_LOSS_PCT    = float(os.environ.get("DAILY_LOSS_LIMIT",      "8.0"))
+TP1_PCT           = float(os.environ.get("TP1_PCT",               "1.0"))
+TP2_PCT           = float(os.environ.get("TP2_PCT",               "1.8"))
+TP3_PCT           = float(os.environ.get("TP3_PCT",               "3.0"))
+SL_PCT            = float(os.environ.get("SL_PCT",                "0.8"))
+TRAILING_PCT      = float(os.environ.get("TRAILING_PCT",          "0.5"))
+TRAILING_ACTIVATE = float(os.environ.get("TRAILING_ACTIVATE",     "1.0"))
+HEARTBEAT_MIN     = int  (os.environ.get("HEARTBEAT_MIN",         "60"))
+COOLDOWN_MIN      = int  (os.environ.get("COOLDOWN_MIN",          "5"))
+ANTI_SPIKE_PCT    = float(os.environ.get("ANTI_SPIKE_PCT",        "3.0"))
+DRY_RUN           = os.environ.get("DRY_RUN", "false").lower() == "true"
+PORT              = int  (os.environ.get("PORT", "8080"))
 
-# ── Capital ──
-FIXED_USDT       = 8.0  # Fijo: 8 USDT por trade con 12× apalancamiento
-LEVERAGE         = 12   # Apalancamiento fijo 12×
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "2"))    # FIX#4: Máx 2 con $50 — 6 trades = 96% capital = cuenta muerta
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "15"))   # FIX#4: 15/25 — APE con 19/25 perdió igual, necesitamos calidad no cantidad
-CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "8.0"))  # 8% — para antes de que sea tarde
-DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "4.0"))  # 4% diario máx = ~$2 con $50
-COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "30"))   # FIX#2: 30 min — STX se abrió y cerró en el mismo minuto
-MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "0.8"))  # Spread estricto
-MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "1000000")) # FIX#4: 1M vol — solo pares top líquidos
-TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "300"))
-BTC_FILTER       = os.environ.get("BTC_FILTER", "false").lower() == "true"  # OFF — captura long y short libremente
+# Auto-mejora
+MIN_STRATEGY_SCORE = float(os.environ.get("MIN_STRATEGY_SCORE", "0.35"))
+LEARNING_WINDOW    = int  (os.environ.get("LEARNING_WINDOW",     "20"))
+AUTO_PAUSE_DD_PCT  = float(os.environ.get("AUTO_PAUSE_DD_PCT",   "25.0"))
+BAD_HOUR_THRESHOLD = int  (os.environ.get("BAD_HOUR_THRESHOLD",  "3"))   # N pérdidas en 1h para bloquearla
 
-# ── SMI ──
-SMI_K_LEN   = int(os.environ.get("SMI_K_LEN",   "10"))
-SMI_D_LEN   = int(os.environ.get("SMI_D_LEN",   "3"))
-SMI_EMA_LEN = int(os.environ.get("SMI_EMA_LEN", "10"))
-SMI_SMOOTH  = int(os.environ.get("SMI_SMOOTH",  "5"))
-SMI_OB      = float(os.environ.get("SMI_OB",    "40.0"))
-SMI_OS      = float(os.environ.get("SMI_OS",    "-40.0"))
+STATE_PATH = "/tmp/saiyan_elite_state.json"
+CSV_PATH   = "/tmp/saiyan_elite_trades.csv"
+BRAIN_PATH = "/tmp/saiyan_elite_brain.json"  # memoria adaptativa
+_lock      = threading.Lock()
 
-# ── UTBot (ATR Trailing Stop) ──
-UTBOT_KEY    = float(os.environ.get("UTBOT_KEY_VALUE",  "10.0"))
-UTBOT_ATR    = int(os.environ.get("UTBOT_ATR_PERIOD",  "10"))
+# Nombres de estrategias
+STRAT_DWELL    = "dwell_blocks"
+STRAT_UTBOT    = "utbot"
+STRAT_BBRSI    = "bb_rsi"
+STRAT_EMA      = "ema_trend"
+STRAT_WEBHOOK  = "webhook"   # señales externas sin estrategia específica
+ALL_STRATEGIES = [STRAT_DWELL, STRAT_UTBOT, STRAT_BBRSI, STRAT_EMA, STRAT_WEBHOOK]
 
-# ── WaveTrend (Instrument-Z) ──
-WT_CHAN_LEN = int(os.environ.get("WT_CHAN_LEN", "9"))
-WT_AVG_LEN  = int(os.environ.get("WT_AVG_LEN", "12"))
-WT_OB       = float(os.environ.get("WT_OB",    "60.0"))
-WT_OS       = float(os.environ.get("WT_OS",    "-60.0"))
+# ─────────────────────────────────────────────────────────────────────────────
+# BRAIN — Memoria Adaptativa (NÚCLEO AUTO-MEJORA)
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class StrategyBrain:
+    """Registra rendimiento por estrategia y aprende."""
+    name:         str
+    trades:       List[dict]   = field(default_factory=list)  # últimas N operaciones
+    total_pnl:    float        = 0.0
+    wins:         int          = 0
+    losses:       int          = 0
+    paused_until: float        = 0.0   # timestamp hasta cuando está pausada
+    pause_reason: str          = ""
+    weight:       float        = 1.0   # multiplicador de confianza (0.1–2.0)
 
-# ── Bollinger Bands + RSI ──
-BB_PERIOD  = int(os.environ.get("BB_PERIOD", "20"))
-BB_STD     = float(os.environ.get("BB_STD",  "2.0"))
-BB_RSI_OB  = float(os.environ.get("BB_RSI_OB", "65.0"))
+    def wr(self) -> float:
+        t = self.wins + self.losses
+        return self.wins / t if t else 0.5
 
-# ── Bj Bot Risk Management ──
-RNR              = float(os.environ.get("RNR",               "2.5"))  # TP2 = 2.5× el riesgo — más ganancia por winner
-RISK_MULT        = float(os.environ.get("RISK_MULT",         "0.9"))  # SL ligeramente más ajustado — menos pérdida
-RR_EXIT          = float(os.environ.get("RR_EXIT",           "0.4"))  # Trail activo al 40% del TP2 — protege antes
-MIN_PROFIT_PCT   = float(os.environ.get("MIN_PROFIT_PCT",    "0.0"))
-TRADE_EXPIRE_BARS= int(os.environ.get("TRADE_EXPIRE_BARS",  "0"))
+    def pf(self) -> float:
+        gross_w = sum(t["pnl"] for t in self.trades if t["pnl"] > 0)
+        gross_l = sum(abs(t["pnl"]) for t in self.trades if t["pnl"] < 0)
+        return gross_w / gross_l if gross_l else 1.0
 
-# ── Indicadores clásicos ──
-FAST_LEN  = 8;   PIVOT_LEN = 21; BIAS_LEN  = 48; SLOW_LEN  = 200
-ADX_LEN   = 14;  ADX_MIN   = 16; RSI_LEN   = 14; ATR_LEN   = 14
-VOL_LEN   = 20;  OSC_LEN   = 3;  SWING_LB  = int(os.environ.get("SWING_LB", "10"))
-MACD_FAST = 12;  MACD_SLOW = 26; MACD_SIG  = 9
+    def recent_wr(self, n: int = None) -> float:
+        n = n or LEARNING_WINDOW
+        recent = self.trades[-n:] if len(self.trades) >= n else self.trades
+        if not recent: return 0.5
+        return sum(1 for t in recent if t["pnl"] > 0) / len(recent)
 
-# ── Exits ──
-TP1_ATR_MULT = 1.2
-SL_ATR_MULT  = 1.0
+    def recent_dd(self) -> float:
+        """Drawdown acumulado en las últimas N operaciones."""
+        peak = 0.0; dd = 0.0; eq = 0.0
+        for t in self.trades[-LEARNING_WINDOW:]:
+            eq += t["pnl"]
+            if eq > peak: peak = eq
+            if peak > 0:
+                cur_dd = (peak - eq) / peak * 100
+                if cur_dd > dd: dd = cur_dd
+        return dd
 
-# ── RSI extremo ──
-RSI_OB_LOW = 10; RSI_OB_HIGH = 25
-RSI_OS_LOW = 78; RSI_OS_HIGH = 90
+    def is_active(self) -> bool:
+        if self.paused_until > time.time():
+            return False
+        if len(self.trades) >= 5 and self.recent_wr() < MIN_STRATEGY_SCORE:
+            return False
+        return True
 
-# ── Risk ──
-MAX_CONSEC_LOSS = 2   # Tras 2 pérdidas seguidas → reduce tamaño a la mitad
-USE_CB          = True
-HEDGE_MODE: bool = False
-CSV_PATH = "/tmp/saty_v18_trades.csv"
+    def add_trade(self, pnl: float, meta: dict):
+        if pnl > 0: self.wins += 1
+        else:        self.losses += 1
+        self.total_pnl += pnl
+        record = {"pnl": pnl, "ts": time.time(), **meta}
+        self.trades.append(record)
+        if len(self.trades) > 200: self.trades = self.trades[-200:]
+        self._update_weight()
 
+    def _update_weight(self):
+        """Ajusta weight según rendimiento reciente."""
+        wr = self.recent_wr()
+        pf = self.pf()
+        # Weight: función de WR y PF
+        w = (wr * 0.6 + min(pf / 3.0, 1.0) * 0.4) * 2.0  # 0 → 2
+        self.weight = max(0.1, min(2.0, w))
 
-# ══════════════════════════════════════════════════════════
-# CACHE OHLCV
-# ══════════════════════════════════════════════════════════
-_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
-CACHE_TTL = 55
+    def dynamic_sl_adj(self) -> float:
+        """
+        Si últimas 3 operaciones son pérdidas, reduce SL en 20%.
+        Si últimas 3 son ganancias, puede ampliar un poco.
+        """
+        recent = self.trades[-3:]
+        if len(recent) < 3: return 1.0
+        all_loss = all(t["pnl"] < 0 for t in recent)
+        all_win  = all(t["pnl"] > 0 for t in recent)
+        if all_loss: return 0.75   # SL más ajustado
+        if all_win:  return 1.15   # SL un poco más holgado
+        return 1.0
 
-def fetch_df(ex: ccxt.Exchange, symbol: str, tf: str, limit: int = 400) -> pd.DataFrame:
-    key = f"{symbol}|{tf}"
-    now = time.time()
-    if key in _cache:
-        ts, df = _cache[key]
-        if now - ts < CACHE_TTL:
-            return df
-    raw = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df  = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.set_index("timestamp", inplace=True)
-    df = df.astype(float)
-    _cache[key] = (now, df)
-    return df
-
-def clear_cache():
-    _cache.clear()
-
-
-# ══════════════════════════════════════════════════════════
-# TRADING BRAIN — Aprendizaje de errores (v16)
-# Registra cada trade cerrado y analiza patrones para mejorar
-# Sin ML, sin GPU — estadística pura sobre trades reales
-# ══════════════════════════════════════════════════════════
-BRAIN_PATH = "/tmp/saty_v18_brain.json"
-
-class TradingBrain:
-    """
-    Aprende de cada trade cerrado:
-    - Qué scores realmente ganan vs pierden
-    - Qué indicadores correlacionan con wins
-    - Qué pares están en racha positiva o negativa
-    - Qué horas del día tienen mejor win rate
-    - Ajusta MIN_SCORE dinámicamente si hay datos suficientes
-    """
-    def __init__(self):
-        self.trades: List[dict] = []          # historial completo
-        self.pair_stats: Dict[str, dict] = {} # stats por par
-        self.score_stats: Dict[int, dict] = {}# stats por score
-        self.hour_stats:  Dict[int, dict] = {}# stats por hora UTC
-        self.factor_wins: Dict[str, list] = collections.defaultdict(list)  # factor→[1/0]
-        self.blacklist:   Dict[str, float] = {}  # par→timestamp_expiry
-        self.adaptive_min_score: int = MIN_SCORE # score ajustado dinámicamente
-        self.total_trades: int = 0
-        self.load()
-
-    def load(self):
-        try:
-            if os.path.exists(BRAIN_PATH):
-                with open(BRAIN_PATH) as f:
-                    data = json.load(f)
-                self.trades       = data.get("trades", [])[-500:]  # últimos 500
-                self.pair_stats   = data.get("pair_stats", {})
-                self.score_stats  = {int(k): v for k, v in data.get("score_stats", {}).items()}
-                self.hour_stats   = {int(k): v for k, v in data.get("hour_stats", {}).items()}
-                self.factor_wins  = collections.defaultdict(list, data.get("factor_wins", {}))
-                self.blacklist    = data.get("blacklist", {})
-                self.adaptive_min_score = data.get("adaptive_min_score", MIN_SCORE)
-                self.total_trades = data.get("total_trades", 0)
-                log.info(f"🧠 TradingBrain cargado: {self.total_trades} trades históricos")
-        except Exception as e:
-            log.warning(f"TradingBrain load error: {e}")
-
-    def save(self):
-        try:
-            with open(BRAIN_PATH, "w") as f:
-                json.dump({
-                    "trades":             self.trades[-500:],
-                    "pair_stats":         self.pair_stats,
-                    "score_stats":        self.score_stats,
-                    "hour_stats":         self.hour_stats,
-                    "factor_wins":        dict(self.factor_wins),
-                    "blacklist":          self.blacklist,
-                    "adaptive_min_score": self.adaptive_min_score,
-                    "total_trades":       self.total_trades,
-                }, f, indent=2)
-        except Exception as e:
-            log.warning(f"TradingBrain save error: {e}")
-
-    def is_blacklisted(self, symbol: str) -> bool:
-        """True si el par está temporalmente bloqueado por malas rachas."""
-        expiry = self.blacklist.get(symbol, 0)
-        if time.time() < expiry:
+    def check_auto_pause(self):
+        """Pausa la estrategia si su DD reciente supera el umbral."""
+        dd = self.recent_dd()
+        if dd >= AUTO_PAUSE_DD_PCT:
+            self.paused_until = time.time() + 4 * 3600  # pausa 4h
+            self.pause_reason = f"DD reciente {dd:.1f}% >= {AUTO_PAUSE_DD_PCT}%"
             return True
-        elif symbol in self.blacklist:
-            del self.blacklist[symbol]
         return False
 
-    def record_trade(self, symbol: str, side: str, score: int,
-                     pnl: float, reason: str, row: Optional[pd.Series] = None):
-        """Registra un trade cerrado y actualiza todas las estadísticas."""
-        win = 1 if pnl > 0 else 0
-        hour = datetime.now(timezone.utc).hour
-        self.total_trades += 1
 
-        # ── Registro completo ──
-        record = {
-            "ts": time.time(), "symbol": symbol, "side": side,
-            "score": score, "pnl": pnl, "win": win, "reason": reason,
-            "hour": hour,
+@dataclass
+class AdaptiveBrain:
+    """Cerebro central de auto-mejora."""
+    strategies:    Dict[str, StrategyBrain]  = field(default_factory=dict)
+    bad_hours:     Dict[int, int]            = field(default_factory=dict)  # hora UTC → n pérdidas
+    blocked_hours: List[int]                 = field(default_factory=list)
+    total_errors:  int                       = 0
+    error_log:     List[dict]                = field(default_factory=list)
+    last_report:   float                     = field(default_factory=time.time)
+
+    def __post_init__(self):
+        for s in ALL_STRATEGIES:
+            if s not in self.strategies:
+                self.strategies[s] = StrategyBrain(name=s)
+
+    def get(self, strat: str) -> StrategyBrain:
+        if strat not in self.strategies:
+            self.strategies[strat] = StrategyBrain(name=strat)
+        return self.strategies[strat]
+
+    def record_result(self, strat: str, pnl: float, meta: dict):
+        sb = self.get(strat)
+        sb.add_trade(pnl, meta)
+        sb.check_auto_pause()
+
+        # Registrar hora mala
+        hour = datetime.now(timezone.utc).hour
+        if pnl < 0:
+            self.bad_hours[hour] = self.bad_hours.get(hour, 0) + 1
+            if self.bad_hours[hour] >= BAD_HOUR_THRESHOLD and hour not in self.blocked_hours:
+                self.blocked_hours.append(hour)
+                log.info(f"Brain: hora {hour}h UTC bloqueada ({self.bad_hours[hour]} pérdidas)")
+                tg_brain_notify(f"🧠 Auto-aprendizaje: hora <b>{hour}:xx UTC</b> bloqueada "
+                                f"({self.bad_hours[hour]} pérdidas consecutivas)")
+
+    def is_hour_ok(self) -> bool:
+        hour = datetime.now(timezone.utc).hour
+        return hour not in self.blocked_hours
+
+    def best_strategy(self) -> str:
+        active = [(s, sb) for s, sb in self.strategies.items() if sb.is_active()]
+        if not active: return STRAT_WEBHOOK
+        return max(active, key=lambda x: x[1].weight * x[1].recent_wr())[0]
+
+    def size_multiplier(self, strat: str) -> float:
+        """Ajusta tamaño de posición basado en confianza de la estrategia."""
+        sb = self.get(strat)
+        if not sb.is_active(): return 0.0
+        return max(0.5, min(1.5, sb.weight))
+
+    def dynamic_sl_for(self, strat: str) -> float:
+        return self.get(strat).dynamic_sl_adj()
+
+    def log_error(self, error_type: str, detail: str, strat: str = ""):
+        self.total_errors += 1
+        self.error_log.append({
+            "ts": now(), "type": error_type, "detail": detail[:200], "strat": strat
+        })
+        if len(self.error_log) > 100: self.error_log = self.error_log[-100:]
+
+    def to_dict(self) -> dict:
+        return {
+            "strategies": {
+                k: {
+                    "name": v.name, "wins": v.wins, "losses": v.losses,
+                    "total_pnl": v.total_pnl, "weight": v.weight,
+                    "paused_until": v.paused_until, "pause_reason": v.pause_reason,
+                    "trades": v.trades[-50:]
+                } for k, v in self.strategies.items()
+            },
+            "bad_hours":     self.bad_hours,
+            "blocked_hours": self.blocked_hours,
+            "total_errors":  self.total_errors,
+            "error_log":     self.error_log[-20:],
         }
-        # Registrar qué indicadores estaban activos
-        if row is not None:
-            factors = {}
-            for f in ["st_bull","st_bear","above_vwap","below_vwap","bos_bull",
-                      "ob_bull","ob_bear","cvd_bull_div","cvd_bear_div",
-                      "utbot_buy","utbot_sell","wt_cross_up","wt_cross_dn",
-                      "macd_cross_up","macd_cross_down","regime_trend"]:
-                try: factors[f] = bool(row.get(f, False))
-                except: pass
-            record["factors"] = factors
-            for f, active in factors.items():
-                if active:
-                    self.factor_wins[f].append(win)
 
-        self.trades.append(record)
-
-        # ── Stats por par ──
-        if symbol not in self.pair_stats:
-            self.pair_stats[symbol] = {"wins": 0, "losses": 0, "pnl": 0.0, "streak": 0}
-        ps = self.pair_stats[symbol]
-        ps["pnl"] += pnl
-        if win:
-            ps["wins"] += 1
-            ps["streak"] = max(0, ps["streak"]) + 1
-        else:
-            ps["losses"] += 1
-            ps["streak"] = min(0, ps["streak"]) - 1
-            # 3 pérdidas seguidas en un par → blacklist 4 horas
-            if ps["streak"] <= -3:
-                self.blacklist[symbol] = time.time() + 4 * 3600
-                log.warning(f"🧠 {symbol} blacklisted 4h (3 losses streak)")
-
-        # ── Stats por score ──
-        sc = self.score_stats.setdefault(score, {"wins": 0, "losses": 0})
-        if win: sc["wins"] += 1
-        else:   sc["losses"] += 1
-
-        # ── Stats por hora ──
-        hr = self.hour_stats.setdefault(hour, {"wins": 0, "losses": 0})
-        if win: hr["wins"] += 1
-        else:   hr["losses"] += 1
-
-        # ── Adaptar MIN_SCORE cada 30 trades ──
-        if self.total_trades % 30 == 0:
-            self._adapt_min_score()
-
-        self.save()
-
-    def _adapt_min_score(self):
-        """Ajusta MIN_SCORE basándose en datos reales de win rate por score."""
-        global MIN_SCORE
-        if len(self.trades) < 20:
-            return
-
-        best_score = MIN_SCORE
-        best_wr    = 0.0
-
-        for sc, data in self.score_stats.items():
-            total = data["wins"] + data["losses"]
-            if total < 5:
-                continue
-            wr = data["wins"] / total
-            if wr > best_wr:
-                best_wr    = wr
-                best_score = sc
-
-        # Solo ajustar si hay diferencia significativa y datos suficientes
-        if best_wr > 0.55 and abs(best_score - self.adaptive_min_score) <= 2:
-            old = self.adaptive_min_score
-            # Encontrar el score mínimo con win rate > 50%
-            for sc in sorted(self.score_stats.keys()):
-                d = self.score_stats[sc]
-                total = d["wins"] + d["losses"]
-                if total >= 5 and d["wins"] / total < 0.45:
-                    new_min = sc + 1
-                    if new_min != old:
-                        self.adaptive_min_score = new_min
-                        MIN_SCORE = new_min
-                        log.info(f"🧠 MIN_SCORE ajustado: {old}→{new_min} "
-                                 f"(WR análisis de {self.total_trades} trades)")
-                    break
-
-    def get_report(self) -> str:
-        """Genera un resumen del aprendizaje para Telegram."""
-        if self.total_trades < 5:
-            return f"🧠 Brain: {self.total_trades} trades — datos insuficientes aún"
-
-        recent = [t for t in self.trades[-30:]]
-        if not recent:
-            return "🧠 Sin datos recientes"
-
-        wins    = sum(1 for t in recent if t["win"])
-        wr      = wins / len(recent) * 100
-        avg_pnl = sum(t["pnl"] for t in recent) / len(recent)
-
-        # Mejor y peor score
-        score_report = []
-        for sc in sorted(self.score_stats.keys()):
-            d = self.score_stats[sc]
-            total = d["wins"] + d["losses"]
-            if total >= 3:
-                score_report.append(f"  {sc}/25: {d['wins']}W/{d['losses']}L "
-                                    f"({d['wins']/total*100:.0f}%)")
-
-        # Mejor factor
-        best_factors = []
-        for f, results in self.factor_wins.items():
-            if len(results) >= 5:
-                best_factors.append((f, sum(results)/len(results), len(results)))
-        best_factors.sort(key=lambda x: -x[1])
-
-        bl_active = sum(1 for exp in self.blacklist.values() if time.time() < exp)
-
-        lines = [
-            f"🧠 <b>TRADING BRAIN REPORT</b>",
-            f"Total: {self.total_trades} trades | MIN_SCORE adaptado: {self.adaptive_min_score}/25",
-            f"Últimos 30: {wins}W/{len(recent)-wins}L = {wr:.0f}% | Avg: ${avg_pnl:+.3f}",
-            f"🚫 Pares bloqueados: {bl_active}",
-        ]
-        if score_report:
-            lines.append("📊 Win rate por score:")
-            lines.extend(score_report[:6])
-        if best_factors:
-            lines.append("⭐ Mejores indicadores:")
-            for name, wr_f, n in best_factors[:3]:
-                lines.append(f"  {name}: {wr_f*100:.0f}% ({n} trades)")
-        return "\n".join(lines)
+    def load_dict(self, d: dict):
+        for k, v in d.get("strategies", {}).items():
+            sb = StrategyBrain(name=k)
+            sb.wins = v.get("wins", 0); sb.losses = v.get("losses", 0)
+            sb.total_pnl = v.get("total_pnl", 0.0); sb.weight = v.get("weight", 1.0)
+            sb.paused_until = v.get("paused_until", 0.0)
+            sb.pause_reason = v.get("pause_reason", "")
+            sb.trades = v.get("trades", [])
+            self.strategies[k] = sb
+        self.bad_hours     = {int(k): v for k, v in d.get("bad_hours", {}).items()}
+        self.blocked_hours = d.get("blocked_hours", [])
+        self.total_errors  = d.get("total_errors", 0)
+        self.error_log     = d.get("error_log", [])
 
 
-# ══════════════════════════════════════════════════════════
-# GRID STATE — Estado de operaciones grid en lateral (v16)
-# ══════════════════════════════════════════════════════════
+brain = AdaptiveBrain()
+
+def tg_brain_notify(msg: str):
+    """Notificación de auto-aprendizaje (se llama sin lock)."""
+    threading.Thread(target=lambda: _tg_raw(msg), daemon=True).start()
+
+def save_brain():
+    try:
+        with open(BRAIN_PATH, "w") as f: json.dump(brain.to_dict(), f)
+    except Exception as e: log.warning(f"save_brain: {e}")
+
+def load_brain():
+    try:
+        if os.path.exists(BRAIN_PATH):
+            with open(BRAIN_PATH) as f: brain.load_dict(json.load(f))
+            log.info("Brain cargado OK")
+    except Exception as e: log.warning(f"load_brain: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATE
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
-class GridLevel:
-    price:     float = 0.0
-    side:      str   = ""    # "buy" o "sell"
-    order_id:  str   = ""
-    filled:    bool  = False
-    pnl:       float = 0.0
+class Trade:
+    symbol:        str
+    side:          str
+    entry_price:   float
+    contracts:     float
+    tp1:           float
+    tp2:           float
+    tp3:           float
+    sl:            float
+    entry_time:    str
+    strategy:      str   = STRAT_WEBHOOK
+    sl_pct_used:   float = 0.0       # SL real usado (tras ajuste dinámico)
+    score:         int   = 0
+    tp1_hit:       bool  = False
+    tp2_hit:       bool  = False
+    sl_at_be:      bool  = False
+    trailing_on:   bool  = False
+    trailing_high: float = 0.0
+    dry_run:       bool  = False
+    # Dwell Blocks extras
+    dwell_high:    float = 0.0
+    dwell_low:     float = 0.0
+    rr_ratio:      float = 2.0
 
 @dataclass
-class GridTrade:
-    symbol:    str   = ""
-    center:    float = 0.0    # precio central del grid
-    spacing:   float = 0.0    # separación entre niveles (ATR-based)
-    levels:    list  = field(default_factory=list)  # List[GridLevel]
-    ts_open:   float = 0.0
-    total_pnl: float = 0.0
-    n_trades:  int   = 0
+class State:
+    trades:           Dict[str, Trade] = field(default_factory=dict)
+    closed_history:   List[dict]       = field(default_factory=list)
+    cooldowns:        Dict[str, float] = field(default_factory=dict)
+    wins:             int   = 0
+    losses:           int   = 0
+    gross_profit:     float = 0.0
+    gross_loss:       float = 0.0
+    peak_equity:      float = 0.0
+    total_pnl:        float = 0.0
+    daily_pnl:        float = 0.0
+    daily_reset_ts:   float = field(default_factory=time.time)
+    start_time:       float = field(default_factory=time.time)
+    total_trades:     int   = 0
+    paused:           bool  = False
+    max_dd_real:      float = 0.0
+    best_trade:       float = 0.0
+    worst_trade:      float = 0.0
+    tg_offset:        int   = 0
 
-
-# ══════════════════════════════════════════════════════════
-# ESTADO
-# ══════════════════════════════════════════════════════════
-@dataclass
-class TradeState:
-    symbol:           str   = ""
-    side:             str   = ""
-    base:             str   = ""
-    entry_price:      float = 0.0
-    tp1_price:        float = 0.0
-    tp2_price:        float = 0.0
-    sl_price:         float = 0.0
-    sl_moved_be:      bool  = False
-    tp1_hit:          bool  = False
-    trail_high:       float = 0.0
-    trail_low:        float = 0.0
-    peak_price:       float = 0.0
-    prev_price:       float = 0.0
-    stall_count:      int   = 0
-    trail_phase:      str   = "normal"
-    max_profit_pct:   float = 0.0
-    entry_score:      int   = 0
-    entry_time:       str   = ""
-    contracts:        float = 0.0
-    atr_entry:        float = 0.0
-    smi_entry:        float = 0.0
-    wt_entry:         float = 0.0
-    utbot_stop:       float = 0.0   # UTBot ATR trailing stop at entry
-    bar_count:        int   = 0     # barras desde entrada (trade expiry)
-    uptrend_entry:    bool  = True  # era uptrend en la entrada
-    whale_desc:       str   = ""    # whale + saint grail signals v15
-    rr_trail_active:  bool  = False # R:R trail trigger activado (Bj Bot)
-    rr_trail_stop:    float = 0.0   # nivel del trailing Bj Bot
-    # ── DCA Averaging (v18) ──────────────────────────────────
-    dca_count:        int   = 0     # cuántas órdenes DCA ejecutadas
-    dca_avg_price:    float = 0.0   # precio promedio ponderado tras DCA
-    dca_total_usdt:   float = 0.0   # capital total comprometido (base + DCAs)
-    dca_total_contr:  float = 0.0   # contratos totales acumulados
-    dca_next_price:   float = 0.0   # precio al que se dispara la próxima orden DCA
-    dca_sl_price:     float = 0.0   # SL duro tras el último DCA
-
-
-@dataclass
-class BotState:
-    wins:           int   = 0
-    losses:         int   = 0
-    gross_profit:   float = 0.0
-    gross_loss:     float = 0.0
-    consec_losses:  int   = 0
-    peak_equity:    float = 0.0
-    total_pnl:      float = 0.0
-    daily_pnl:      float = 0.0
-    daily_reset_ts: float = 0.0
-    last_heartbeat: float = 0.0
-    trades:       Dict[str, TradeState] = field(default_factory=dict)
-    grid_trades:  Dict[str, GridTrade]  = field(default_factory=dict)  # v16 grid
-    cooldowns:    Dict[str, float]      = field(default_factory=dict)
-    rsi_alerts:   Dict[str, float]      = field(default_factory=dict)
-    btc_bull: bool  = True
-    btc_bear: bool  = False
-    btc_rsi:  float = 50.0
-
-    def open_count(self) -> int: return len(self.trades)
-    def bases_open(self) -> Dict[str, str]:
-        return {t.base: t.side for t in self.trades.values()}
-    def base_has_trade(self, base: str) -> bool:
-        return base in self.bases_open()
-    def win_rate(self) -> float:
-        t = self.wins + self.losses
-        return (self.wins / t * 100) if t else 0.0
-    def profit_factor(self) -> float:
-        return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
-    def score_bar(self, score: int, mx: int = 25) -> str:
-        return "█" * min(score, mx) + "░" * (mx - min(score, mx))
-    def cb_active(self) -> bool:
-        if not USE_CB or self.peak_equity <= 0: return False
-        dd = (self.peak_equity - (self.peak_equity + self.total_pnl)) / self.peak_equity * 100
-        return dd >= CB_DD
-    def daily_limit_hit(self) -> bool:
-        if self.peak_equity <= 0: return False
-        return self.daily_pnl < 0 and abs(self.daily_pnl) / self.peak_equity * 100 >= DAILY_LOSS_LIMIT
-    def risk_mult(self) -> float:
-        return 0.5 if self.consec_losses >= MAX_CONSEC_LOSS else 1.0
-    def in_cooldown(self, symbol: str) -> bool:
-        return time.time() - self.cooldowns.get(symbol, 0) < COOLDOWN_MIN * 60
-    def set_cooldown(self, symbol: str):
-        self.cooldowns[symbol] = time.time()
+    def n(self): return len(self.trades)
+    def wr(self):
+        t = self.wins + self.losses; return self.wins/t*100 if t else 0.0
+    def pf(self): return self.gross_profit/self.gross_loss if self.gross_loss else 0.0
+    def avg_win(self): return self.gross_profit/self.wins if self.wins else 0.0
+    def avg_loss(self): return self.gross_loss/self.losses if self.losses else 0.0
+    def expectancy(self):
+        wr=self.wr()/100; return wr*self.avg_win()-(1-wr)*self.avg_loss()
+    def cb(self):
+        if self.peak_equity<=0: return False
+        return self.total_pnl<0 and abs(self.total_pnl)/self.peak_equity*100>=CB_DD
+    def daily_hit(self):
+        if self.peak_equity<=0: return False
+        return self.daily_pnl<0 and abs(self.daily_pnl)/self.peak_equity*100>=DAILY_LOSS_PCT
+    def in_cooldown(self, symbol):
+        return (time.time()-self.cooldowns.get(symbol,0))<COOLDOWN_MIN*60
     def reset_daily(self):
-        now = time.time()
-        if now - self.daily_reset_ts > 86400:
-            self.daily_pnl = 0.0; self.daily_reset_ts = now
-            log.info("Daily PnL reseteado")
+        if time.time()-self.daily_reset_ts>86400:
+            self.daily_pnl=0.0; self.daily_reset_ts=time.time()
+    def record_close(self, pnl, symbol, strategy=STRAT_WEBHOOK):
+        self.total_trades+=1
+        if pnl>=0: self.wins+=1; self.gross_profit+=pnl; self.best_trade=max(self.best_trade,pnl)
+        else: self.losses+=1; self.gross_loss+=abs(pnl); self.worst_trade=min(self.worst_trade,pnl)
+        self.total_pnl+=pnl; self.daily_pnl+=pnl; self.cooldowns[symbol]=time.time()
+        if self.peak_equity>0:
+            dd=abs(self.total_pnl)/self.peak_equity*100
+            if self.total_pnl<0 and dd>self.max_dd_real: self.max_dd_real=dd
+        cur=self.peak_equity+self.total_pnl
+        if cur>self.peak_equity: self.peak_equity=cur
+    def uptime(self):
+        s=int(time.time()-self.start_time); h,m=divmod(s//60,60); d,h=divmod(h,24)
+        return f"{d}d {h}h {m}m" if d else f"{h}h {m}m"
+    def to_persist(self):
+        return {"wins":self.wins,"losses":self.losses,"gross_profit":self.gross_profit,
+                "gross_loss":self.gross_loss,"total_pnl":self.total_pnl,
+                "peak_equity":self.peak_equity,"total_trades":self.total_trades,
+                "best_trade":self.best_trade,"worst_trade":self.worst_trade,
+                "max_dd_real":self.max_dd_real,"closed_history":self.closed_history[-100:],
+                "cooldowns":self.cooldowns}
+    def load_persist(self, d):
+        for k in ("wins","losses","gross_profit","gross_loss","total_pnl","peak_equity",
+                  "total_trades","best_trade","worst_trade","max_dd_real"):
+            if k in d: setattr(self,k,d[k])
+        self.closed_history=d.get("closed_history",[]); self.cooldowns=d.get("cooldowns",{})
 
+st = State()
 
-state = BotState()
-brain = TradingBrain()  # 🧠 v16 — aprende de cada trade
-
-
-# ══════════════════════════════════════════════════════════
-# CSV LOG
-# ══════════════════════════════════════════════════════════
-def log_csv(action: str, t: TradeState, price: float, pnl: float = 0.0):
+def save_state():
     try:
-        exists = os.path.exists(CSV_PATH)
-        with open(CSV_PATH, "a", newline="") as f:
-            w = csv.writer(f)
-            if not exists:
-                w.writerow(["ts","action","symbol","base","side","score",
-                            "smi","wt","entry","exit","pnl","contracts","bars"])
-            w.writerow([utcnow(), action, t.symbol, t.base, t.side,
-                        t.entry_score, round(t.smi_entry,2), round(t.wt_entry,2),
-                        t.entry_price, price, round(pnl,4), t.contracts, t.bar_count])
-    except Exception as e:
-        log.warning(f"CSV: {e}")
-
-
-# ══════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════
-def utcnow() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-def smi_label(smi: float) -> str:
-    if smi >= SMI_OB:  return f"🔴 SMI OB {smi:.1f}"
-    if smi <= SMI_OS:  return f"🟢 SMI OS {smi:.1f}"
-    if smi > 0:        return f"⚪ SMI {smi:.1f}↑"
-    return                    f"⚪ SMI {smi:.1f}↓"
-
-def wt_label(wt: float) -> str:
-    if wt >= WT_OB:  return f"🔴 WT OB {wt:.1f}"
-    if wt <= WT_OS:  return f"🟢 WT OS {wt:.1f}"
-    if wt > 0:       return f"⚪ WT {wt:.1f}↑"
-    return                  f"⚪ WT {wt:.1f}↓"
-
-def rsi_extreme_long(rsi: float) -> bool:
-    return RSI_OB_LOW <= rsi <= RSI_OB_HIGH
-
-def rsi_extreme_short(rsi: float) -> bool:
-    return RSI_OS_LOW <= rsi <= RSI_OS_HIGH
-
-def rsi_zone_label(rsi: float) -> str:
-    if rsi < RSI_OB_LOW:   return f"⚠️ RSI HIPERVENTA {rsi:.1f}"
-    if rsi <= RSI_OB_HIGH: return f"🔥 RSI SOBREVENTA {rsi:.1f}"
-    if rsi < 42:            return f"🟢 RSI bajo {rsi:.1f}"
-    if rsi <= 58:           return f"⚪ RSI neutral {rsi:.1f}"
-    if rsi < RSI_OS_LOW:   return f"🟡 RSI alto {rsi:.1f}"
-    if rsi <= RSI_OS_HIGH: return f"🔥 RSI SOBRECOMPRA {rsi:.1f}"
-    return                        f"⚠️ RSI HIPERCOMPRA {rsi:.1f}"
-
-
-# ══════════════════════════════════════════════════════════
-# TELEGRAM
-# ══════════════════════════════════════════════════════════
-def tg(msg: str):
-    if not TG_TOKEN or not TG_CHAT_ID: return
+        with open(STATE_PATH,"w") as f: json.dump(st.to_persist(),f)
+    except Exception as e: log.warning(f"save_state: {e}")
+def load_state():
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10
-        )
-    except Exception as e:
-        log.warning(f"TG: {e}")
-
-def tg_startup(balance: float, n: int):
-    tg(
-        f"<b>🚀 SATY ELITE v18 — DCA + ANTI-LOSS</b>\n"
-        f"══════════════════════════════\n"
-        f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
-        f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
-        f"⏱ {TF} · {HTF1} · {HTF2} | Leverage: {LEVERAGE}×\n"
-        f"🎯 Score min: {MIN_SCORE}/25 | Max trades: {MAX_OPEN_TRADES}\n"
-        f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.0f} × {LEVERAGE}× = ${FIXED_USDT*LEVERAGE:.0f} notional/trade\n"
-        f"🛡 CB: -{CB_DD}% | Límite diario: -{DAILY_LOSS_LIMIT}% | Consec: {MAX_CONSEC_LOSS}\n"
-        f"📐 R:R={RNR} | Trail activo al {RR_EXIT*100:.0f}% | SL mult={RISK_MULT}\n"
-        f"⏳ Cooldown: {COOLDOWN_MIN}min | Spread máx: {MAX_SPREAD_PCT}%\n"
-        f"₿ Filtro BTC: {'✅' if BTC_FILTER else '❌ (long+short libre)'}\n"
-        f"🐋 Whale: FR + OI + L/S ratio + Sesión\n"
-        f"⚜️ Saint Grail: VWAP + Supertrend + CVD + SMC + Regime\n"
-        f"🚫 Regime Chop Filter: activo (bloquea mercados laterales)\n"
-        f"📉 DCA Averaging: {'✅' if DCA_ENABLED else '❌'} | Máx {DCA_MAX_ORDERS} órdenes | Paso {DCA_STEP_PCT}% | TP +{DCA_TP_PCT}%\n"
-        f"🚫 Macro Override: BTC RSI>75=no shorts | RSI<25=no longs\n"
-        f"══════════════════════════════\n"
-        f"⏰ {utcnow()}"
-    )
-
-def tg_signal(t: TradeState, row: pd.Series):
-    e      = "🟢" if t.side == "long" else "🔴"
-    sl_d   = abs(t.sl_price - t.entry_price)
-    rr1    = abs(t.tp1_price - t.entry_price) / max(sl_d, 1e-9)
-    rr2    = abs(t.tp2_price - t.entry_price) / max(sl_d, 1e-9)
-    smi_v  = float(row.get("smi", 0.0))
-    wt_v   = float(row.get("wt1", 0.0))
-    ut_stop= float(row.get("utbot_stop", 0.0))
-    trend  = "📈 UpTrend" if t.uptrend_entry else "📉 DownTrend"
-    tg(
-        f"{e} <b>{'LONG' if t.side=='long' else 'SHORT'}</b> — {t.symbol}\n"
-        f"══════════════════════════════\n"
-        f"🎯 Score: {t.entry_score}/25  {state.score_bar(t.entry_score)}\n"
-        f"📊 {trend}\n"
-        f"💵 Entrada: <code>{t.entry_price:.6g}</code>\n"
-        f"🟡 TP1: <code>{t.tp1_price:.6g}</code> R:R 1:{rr1:.1f}\n"
-        f"🟢 TP2: <code>{t.tp2_price:.6g}</code> R:R 1:{rr2:.1f}\n"
-        f"🛑 SL: <code>{t.sl_price:.6g}</code> → BE tras TP1\n"
-        f"🤖 UTBot Stop: <code>{ut_stop:.6g}</code>\n"
-        f"══════════════════════════════\n"
-        f"{smi_label(smi_v)} | {wt_label(wt_v)}\n"
-        f"{rsi_zone_label(float(row['rsi']))} | ADX:{row['adx']:.1f}\n"
-        f"MACD:{row['macd_hist']:.5f} | Vol:{row['volume']/row['vol_ma']:.2f}x\n"
-        f"ATR:{t.atr_entry:.5f} | ${FIXED_USDT:.0f} × {LEVERAGE}×\n"
-        f"🐋 {t.whale_desc}\n"
-        f"⚜️ VWAP:{'✅' if row.get('above_vwap' if t.side=='long' else 'below_vwap') else '❌'} "
-        f"ST:{'✅' if row.get('st_bull' if t.side=='long' else 'st_bear') else '❌'} "
-        f"CVD:{'✅' if row.get('cvd_bull_div' if t.side=='long' else 'cvd_bear_div') else '❌'} "
-        f"SMC:{'✅' if row.get('ob_bull' if t.side=='long' else 'ob_bear') else '❌'} "
-        f"Régimen:{'✅' if row.get('regime_trend') else '❌'}\n"
-        f"₿{'🟢' if state.btc_bull else '🔴' if state.btc_bear else '⚪'} "
-        f"RSI:{state.btc_rsi:.0f}\n"
-        f"📊 {state.open_count()}/{MAX_OPEN_TRADES} trades\n"
-        f"⏰ {utcnow()}"
-    )
-
-def tg_tp1_be(t: TradeState, price: float, pnl: float):
-    tg(
-        f"🟡 <b>TP1 + BREAK-EVEN</b> — {t.symbol}\n"
-        f"💵 <code>{price:.6g}</code> | PnL parcial: ~${pnl:+.2f}\n"
-        f"SMI:{t.smi_entry:.1f} | WT:{t.wt_entry:.1f}\n"
-        f"🛡 SL → entrada <code>{t.entry_price:.6g}</code>\n"
-        f"⏰ {utcnow()}"
-    )
-
-def tg_trail_phase(t: TradeState, phase: str, price: float,
-                   retrace: float, trail_m: float):
-    icons = {"normal": "🏃", "tight": "⚡", "locked": "🔒", "utbot": "🤖", "rr": "📐"}
-    tg(
-        f"{icons.get(phase,'⚡')} <b>TRAILING {phase.upper()}</b> — {t.symbol}\n"
-        f"Precio: <code>{price:.6g}</code> | Peak: <code>{t.peak_price:.6g}</code>\n"
-        f"Retroceso: {retrace:.1f}% | Mult: {trail_m}\n"
-        f"Ganancia max: {t.max_profit_pct:.2f}%\n"
-        f"⏰ {utcnow()}"
-    )
-
-def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
-    e   = "✅" if pnl > 0 else "❌"
-    pct = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
-    dca_line = f"📉 DCA usado: {t.dca_count}× | Avg precio: {t.dca_avg_price:.6g}\n" if t.dca_count > 0 else ""
-    tg(
-        f"{e} <b>CERRADO</b> — {t.symbol}\n"
-        f"📋 {t.side.upper()} · {t.entry_score}/25 · {reason}\n"
-        f"💵 <code>{t.entry_price:.6g}</code> → <code>{exit_p:.6g}</code> ({pct:+.2f}%)\n"
-        f"{dca_line}"
-        f"{'💰' if pnl>0 else '💸'} PnL: ${pnl:+.2f} | Barras: {t.bar_count}\n"
-        f"📊 {state.wins}W/{state.losses}L · WR:{state.win_rate():.1f}% · PF:{state.profit_factor():.2f}\n"
-        f"💹 Hoy:${state.daily_pnl:+.2f} · Total:${state.total_pnl:+.2f}\n"
-        f"⏰ {utcnow()}"
-    )
-
-def tg_rsi_alert(symbol: str, rsi: float, smi: float, wt: float,
-                 ls: int, ss: int, price: float):
-    direction = "📉 LONG rebote" if rsi_extreme_long(rsi) else "📈 SHORT caída"
-    tg(
-        f"🔔 <b>RSI EXTREMO</b> — {symbol}\n"
-        f"{rsi_zone_label(rsi)}\n"
-        f"{smi_label(smi)} | {wt_label(wt)}\n"
-        f"💵 <code>{price:.6g}</code> | {direction}\n"
-        f"Score: L:{ls}/25 S:{ss}/25\n"
-        f"⏰ {utcnow()}"
-    )
-
-def tg_summary(signals: List[dict], n_scanned: int):
-    open_lines = "\n".join(
-        f"  {'🟢' if ts.side=='long' else '🔴'} {sym} E:{ts.entry_price:.5g} "
-        f"WT:{ts.wt_entry:.1f} {'🛡' if ts.sl_moved_be else ''}"
-        for sym, ts in state.trades.items()
-    ) or "  (ninguna)"
-    top = "\n".join(
-        f"  {'🟢' if s['side']=='long' else '🔴'} {s['symbol']} "
-        f"{s['score']}/25 {wt_label(s['wt'])}"
-        for s in signals[:5]
-    ) or "  (ninguna)"
-    tg(
-        f"📡 <b>RESUMEN</b> — {n_scanned} pares · {utcnow()}\n"
-        f"Top señales:\n{top}\n"
-        f"══════════════════════════════\n"
-        f"Posiciones ({state.open_count()}/{MAX_OPEN_TRADES}):\n{open_lines}\n"
-        f"══════════════════════════════\n"
-        f"CB:{'⛔' if state.cb_active() else '✅'} Hoy:${state.daily_pnl:+.2f}\n"
-        f"₿{'🟢' if state.btc_bull else '🔴'} {state.wins}W/{state.losses}L PF:{state.profit_factor():.2f}"
-    )
-
-def tg_heartbeat(balance: float):
-    bases    = state.bases_open()
-    open_str = ", ".join(f"{b}({'L' if s=='long' else 'S'})"
-                         for b, s in bases.items()) or "ninguna"
-    grids_str = ", ".join(state.grid_trades.keys()) or "ninguno"
-    tg(
-        f"💓 <b>HEARTBEAT</b> — {utcnow()}\n"
-        f"Balance: ${balance:.2f} | Hoy: ${state.daily_pnl:+.2f}\n"
-        f"Trades tendencia: {state.open_count()}/{MAX_OPEN_TRADES} | {open_str}\n"
-        f"🔲 Grids activos: {len(state.grid_trades)} | {grids_str}\n"
-        f"₿ {'BULL' if state.btc_bull else 'BEAR' if state.btc_bear else 'NEUTRAL'} "
-        f"RSI:{state.btc_rsi:.0f}\n"
-        f"\n{brain.get_report()}"
-    )
-
-def tg_error(msg: str):
-    tg(f"🔥 <b>ERROR:</b> <code>{msg[:300]}</code>\n⏰ {utcnow()}")
-
-def tg_manual_signal(symbol: str, side: str, score: int,
-                     entry: float, tp1: float, tp2: float, sl: float,
-                     atr: float, whale_desc: str, reason: str):
-    """Alerta de operación manual cuando el bot no puede abrir por fondos insuficientes."""
-    e = "🟢" if side == "long" else "🔴"
-    sl_dist = abs(entry - sl)
-    rr1 = abs(tp1 - entry) / max(sl_dist, 1e-9)
-    rr2 = abs(tp2 - entry) / max(sl_dist, 1e-9)
-    tg(
-        f"👤 <b>SEÑAL MANUAL — {side.upper()}</b> {e} — {symbol}\n"
-        f"══════════════════════════════\n"
-        f"⚠️ <i>Bot no pudo abrir: {reason[:80]}</i>\n"
-        f"══════════════════════════════\n"
-        f"🎯 Score: {score}/25  |  12× apalancamiento\n"
-        f"💵 Entrada: <code>{entry:.6g}</code>\n"
-        f"🟡 TP1: <code>{tp1:.6g}</code>  (R:R 1:{rr1:.1f})\n"
-        f"🟢 TP2: <code>{tp2:.6g}</code>  (R:R 1:{rr2:.1f})\n"
-        f"🛑 SL:  <code>{sl:.6g}</code>\n"
-        f"══════════════════════════════\n"
-        f"📐 Margen necesario: ~${FIXED_USDT:.0f} USDT\n"
-        f"📊 Contratos aprox: {(FIXED_USDT * LEVERAGE / entry):.4f}\n"
-        f"🐋 {whale_desc}\n"
-        f"⏰ {utcnow()}"
-    )
-
-
-# ══════════════════════════════════════════════════════════
-# INDICADORES BASE
-# ══════════════════════════════════════════════════════════
-def ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-def sma(s: pd.Series, n: int) -> pd.Series:
-    return s.rolling(n).mean()
-
-def calc_atr(df: pd.DataFrame, n: int) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=n, adjust=False).mean()
-
-def calc_rsi(s: pd.Series, n: int) -> pd.Series:
-    d  = s.diff()
-    g  = d.clip(lower=0).ewm(span=n, adjust=False).mean()
-    lo = (-d.clip(upper=0)).ewm(span=n, adjust=False).mean()
-    return 100 - (100 / (1 + g / lo.replace(0, np.nan)))
-
-def calc_adx(df: pd.DataFrame, n: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    h, l   = df["high"], df["low"]
-    up, dn = h.diff(), -l.diff()
-    pdm    = up.where((up > dn) & (up > 0), 0.0)
-    mdm    = dn.where((dn > up) & (dn > 0), 0.0)
-    atr_s  = calc_atr(df, n)
-    dip    = 100 * pdm.ewm(span=n, adjust=False).mean() / atr_s
-    dim    = 100 * mdm.ewm(span=n, adjust=False).mean() / atr_s
-    dx     = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
-    return dip, dim, dx.ewm(span=n, adjust=False).mean()
-
-def calc_macd(s: pd.Series):
-    m  = ema(s, MACD_FAST) - ema(s, MACD_SLOW)
-    sg = ema(m, MACD_SIG)
-    return m, sg, m - sg
-
-
-# ══════════════════════════════════════════════════════════
-# SMI — Stochastic Momentum Index (Pine Script original)
-# ══════════════════════════════════════════════════════════
-def calc_smi(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    h, l, c = df["high"], df["low"], df["close"]
-    ll      = l.rolling(SMI_K_LEN).min()
-    hh      = h.rolling(SMI_K_LEN).max()
-    diff    = hh - ll
-    rdiff   = c - (hh + ll) / 2
-    avgrel  = rdiff.ewm(span=SMI_D_LEN,  adjust=False).mean()
-    avgdiff = diff.ewm(span=SMI_D_LEN,   adjust=False).mean()
-    smi_raw = pd.Series(
-        np.where(avgdiff.abs() > 1e-10, (avgrel / (avgdiff / 2)) * 100, 0.0),
-        index=df.index
-    )
-    smoothed = smi_raw.rolling(SMI_SMOOTH).mean()
-    signal   = smoothed.ewm(span=SMI_EMA_LEN, adjust=False).mean()
-    return smoothed, signal
-
-
-# ══════════════════════════════════════════════════════════
-# UTBOT — ATR Trailing Stop (HPotter / Yo_adriiiiaan)
-# Traducción exacta del Pine Script v2
-# ══════════════════════════════════════════════════════════
-def calc_utbot(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    xATR  = atr(ATR_PERIOD)
-    nLoss = KEY_VALUE * xATR
-    xATRTrailingStop logic (iff cascade):
-      if close > prev_stop AND close[1] > prev_stop: max(prev_stop, close-nLoss)
-      elif close < prev_stop AND close[1] < prev_stop: min(prev_stop, close+nLoss)
-      elif close > prev_stop: close - nLoss
-      else: close + nLoss
-    buy  = close > stop AND ema(close,1) crosses above stop
-    sell = close < stop AND ema(close,1) crosses below stop
-    """
-    atr_vals = calc_atr(df, UTBOT_ATR)
-    n_loss   = UTBOT_KEY * atr_vals
-    c        = df["close"]
-
-    stop = pd.Series(0.0, index=df.index)
-    c_arr    = c.values
-    nl_arr   = n_loss.values
-    st_arr   = stop.values
-
-    for i in range(1, len(df)):
-        prev = st_arr[i - 1]
-        curr = c_arr[i]
-        prev_c = c_arr[i - 1]
-        loss   = nl_arr[i]
-        if curr > prev and prev_c > prev:
-            st_arr[i] = max(prev, curr - loss)
-        elif curr < prev and prev_c < prev:
-            st_arr[i] = min(prev, curr + loss)
-        elif curr > prev:
-            st_arr[i] = curr - loss
-        else:
-            st_arr[i] = curr + loss
-
-    stop     = pd.Series(st_arr, index=df.index)
-    ema1     = c.ewm(span=1, adjust=False).mean()
-    buy_sig  = (c > stop) & (ema1 > stop) & (ema1.shift() <= stop.shift())
-    sell_sig = (c < stop) & (ema1 < stop) & (ema1.shift() >= stop.shift())
-    return stop, buy_sig, sell_sig
-
-
-# ══════════════════════════════════════════════════════════
-# WAVETREND — TCI (Instrument-Z / OscillateMatrix)
-# ══════════════════════════════════════════════════════════
-def calc_wavetrend(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """
-    ap   = hlc3
-    esa  = ema(ap, CHAN_LEN)
-    d    = ema(abs(ap - esa), CHAN_LEN)
-    ci   = (ap - esa) / (0.015 * d)
-    tci  = ema(ci, AVG_LEN)
-    wt1  = tci
-    wt2  = sma(wt1, 4)
-    cross_up: wt1 > wt2 AND wt1[1] <= wt2[1] AND wt1 < 0  (cross from below zero)
-    cross_dn: wt1 < wt2 AND wt1[1] >= wt2[1] AND wt1 > 0  (cross from above zero)
-    """
-    ap  = (df["high"] + df["low"] + df["close"]) / 3
-    esa = ap.ewm(span=WT_CHAN_LEN, adjust=False).mean()
-    d   = (ap - esa).abs().ewm(span=WT_CHAN_LEN, adjust=False).mean()
-    ci  = (ap - esa) / (0.015 * d.replace(0, np.nan))
-    tci = ci.ewm(span=WT_AVG_LEN, adjust=False).mean()
-    wt1 = tci
-    wt2 = wt1.rolling(4).mean()
-
-    cross_up = (wt1 > wt2) & (wt1.shift() <= wt2.shift()) & (wt1 < 0)
-    cross_dn = (wt1 < wt2) & (wt1.shift() >= wt2.shift()) & (wt1 > 0)
-    return wt1, wt2, cross_up, cross_dn
-
-
-# ══════════════════════════════════════════════════════════
-# BOLLINGER BANDS — BB+RSI (rouxam / 3commas DCA)
-# ══════════════════════════════════════════════════════════
-def calc_bb(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    basis = sma(close, BB_PERIOD)
-    upper = basis + BB_STD * stdev(close, BB_PERIOD)
-    lower = basis - BB_STD * stdev(close, BB_PERIOD)
-    buy  = close < lower AND rsi < BB_RSI_OB   (oversold at lower band)
-    sell = close > upper AND rsi > (100-BB_RSI_OB)  (overbought at upper band)
-    """
-    c     = df["close"]
-    basis = c.rolling(BB_PERIOD).mean()
-    dev   = c.rolling(BB_PERIOD).std()
-    upper = basis + BB_STD * dev
-    lower = basis - BB_STD * dev
-    return upper, lower, basis
-
-
-# ══════════════════════════════════════════════════════════
-# WHALE & INSTITUTIONAL INDICATORS — v14
-# ══════════════════════════════════════════════════════════
-
-# Cache para datos de derivados (funding, OI, L/S ratio)
-_deriv_cache: Dict[str, Tuple[float, dict]] = {}
-DERIV_TTL = 300  # 5 minutos (estos datos cambian lento)
-
-def fetch_funding_rate(ex: ccxt.Exchange, symbol: str) -> float:
-    """Devuelve funding rate actual. Positivo = longs pagan (mercado alcista/sobrepoblado)."""
-    key = f"fr|{symbol}"
-    now = time.time()
-    if key in _deriv_cache:
-        ts, val = _deriv_cache[key]
-        if now - ts < DERIV_TTL:
-            return val.get("rate", 0.0)
-    try:
-        fr = ex.fetch_funding_rate(symbol)
-        rate = float(fr.get("fundingRate") or fr.get("nextFundingRate") or 0.0)
-        _deriv_cache[key] = (now, {"rate": rate})
-        return rate
-    except Exception:
-        return 0.0
-
-def fetch_open_interest(ex: ccxt.Exchange, symbol: str) -> Tuple[float, float]:
-    """Devuelve (OI_actual, OI_anterior). OI creciente = ballenas entrando."""
-    key = f"oi|{symbol}"
-    now = time.time()
-    if key in _deriv_cache:
-        ts, val = _deriv_cache[key]
-        if now - ts < DERIV_TTL:
-            return val.get("oi_now", 0.0), val.get("oi_prev", 0.0)
-    try:
-        hist = ex.fetch_open_interest_history(symbol, timeframe="5m", limit=3)
-        if hist and len(hist) >= 2:
-            oi_now  = float(hist[-1].get("openInterestAmount") or hist[-1].get("openInterest") or 0)
-            oi_prev = float(hist[-2].get("openInterestAmount") or hist[-2].get("openInterest") or 0)
-            _deriv_cache[key] = (now, {"oi_now": oi_now, "oi_prev": oi_prev})
-            return oi_now, oi_prev
-    except Exception:
-        pass
-    return 0.0, 0.0
-
-def fetch_long_short_ratio(ex: ccxt.Exchange, symbol: str) -> float:
-    """Devuelve ratio L/S global. >1 = mayoría long, <1 = mayoría short."""
-    key = f"ls|{symbol}"
-    now = time.time()
-    if key in _deriv_cache:
-        ts, val = _deriv_cache[key]
-        if now - ts < DERIV_TTL:
-            return val.get("ratio", 1.0)
-    try:
-        # Intentar via ccxt unificado primero
-        hist = ex.fetch_long_short_ratio_history(symbol, timeframe="5m", limit=2)
-        if hist and len(hist) >= 1:
-            ls = hist[-1]
-            ratio = float(ls.get("longShortRatio") or ls.get("ratio") or 1.0)
-            _deriv_cache[key] = (now, {"ratio": ratio})
-            return ratio
-    except Exception:
-        pass
-    # Fallback: BingX API directa
-    try:
-        base = symbol.split("/")[0].replace(":USDT", "")
-        url  = f"https://open-api.bingx.com/openApi/swap/v2/quote/longShortRatio"
-        params = {"symbol": f"{base}-USDT", "period": "5m", "limit": 2}
-        resp = requests.get(url, params=params, timeout=5)
-        data = resp.json().get("data", [])
-        if data:
-            ratio = float(data[-1].get("longShortRatio", 1.0))
-            _deriv_cache[key] = (now, {"ratio": ratio})
-            return ratio
-    except Exception:
-        pass
-    return 1.0  # neutral si falla
-
-def is_institutional_session() -> bool:
-    """
-    True si estamos en horario de alta liquidez institucional.
-    Basado en investigación: ballenas reales operan en sesión London-NY overlap (13-16 UTC)
-    y durante las sesiones principales. Evitar 23:00-06:00 UTC (bots dominan, señales falsas).
-    """
-    hour = datetime.now(timezone.utc).hour
-    # Horario institucional activo: Asia tarde (06-08), London (08-16), NY (13-22)
-    # Evitar: 23:00-05:59 UTC = madrugada US/Europa, solo bots asiáticos de baja calidad
-    return 6 <= hour <= 22
-
-def whale_score_bonus(ex: ccxt.Exchange, symbol: str, side: str) -> Tuple[int, int, str]:
-    """
-    Calcula puntos adicionales (0-4) basados en señales de ballenas/institucionales.
-    Retorna (puntos_long, puntos_short, descripcion)
-    
-    Puntos posibles:
-    +1 P17: Funding rate favorable (contrarian — mercado no sobrepoblado en tu dirección)
-    +1 P18: Open Interest creciente (dinero nuevo entrando, confirma movimiento)
-    +1 P19: Long/Short ratio a favor (posicionamiento institucional correcto)
-    +1 P20: Sesión institucional activa (London/NY = ballenas reales operando)
-    """
-    long_pts = 0
-    short_pts = 0
-    desc_parts = []
-
-    try:
-        fr = fetch_funding_rate(ex, symbol)
-        fr_pct = fr * 100
-
-        # P17: Funding rate — contrarian es mejor
-        # FR muy positivo = longs masivos = peligroso para LONG, bueno para SHORT
-        # FR negativo = shorts masivos = bueno para LONG
-        # FR neutral (-0.03% a +0.03%) = ok para ambos
-        FR_EXTREME = 0.05   # >0.05% cada 8h = mercado sobrepoblado (bloquear esa dirección)
-        FR_FAVORABLE = -0.01  # FR negativo = beneficioso para LONG (shorts pagando)
-
-        if fr < FR_FAVORABLE:    # FR negativo: favorable para LONG
-            long_pts += 1
-            desc_parts.append(f"FR:{fr_pct:.3f}%🟢L")
-        elif fr > FR_EXTREME:    # FR muy positivo: favorable para SHORT (longs sobrecargados)
-            short_pts += 1
-            desc_parts.append(f"FR:{fr_pct:.3f}%🔴S")
-        elif -FR_EXTREME < fr < FR_EXTREME:  # FR neutral: punto para ambos (mercado equilibrado)
-            long_pts += 1
-            short_pts += 1
-            desc_parts.append(f"FR:{fr_pct:.3f}%⚪")
-    except Exception:
-        long_pts += 1; short_pts += 1  # neutral si falla
-
-    try:
-        oi_now, oi_prev = fetch_open_interest(ex, symbol)
-        if oi_now > 0 and oi_prev > 0:
-            oi_change_pct = (oi_now - oi_prev) / oi_prev * 100
-            # OI creciente con precio subiendo = ballenas comprando (LONG)
-            # OI creciente con precio bajando = ballenas vendiendo (SHORT)
-            if oi_change_pct > 0.5:  # OI crece >0.5%
-                long_pts += 1   # dinero nuevo entrando, puede ser en cualquier dirección
-                short_pts += 1  # ambos se benefician del aumento de OI
-                desc_parts.append(f"OI:+{oi_change_pct:.1f}%📈")
-            else:
-                desc_parts.append(f"OI:{oi_change_pct:+.1f}%")
-        else:
-            long_pts += 1; short_pts += 1
-    except Exception:
-        long_pts += 1; short_pts += 1
-
-    try:
-        ls_ratio = fetch_long_short_ratio(ex, symbol)
-        # L/S ratio: si mayoría está LONG (>1.3), seguir a las ballenas para LONG
-        # Si mayoría está SHORT (<0.7), seguir para SHORT
-        # Si ratio extremo (>2.0 o <0.5) = trampa, contrarian
-        if 1.1 <= ls_ratio <= 1.8:      # mayoría institucional en LONG moderado
-            long_pts += 1
-            desc_parts.append(f"L/S:{ls_ratio:.2f}🟢")
-        elif 0.6 <= ls_ratio < 0.9:     # mayoría en SHORT moderado
-            short_pts += 1
-            desc_parts.append(f"L/S:{ls_ratio:.2f}🔴")
-        elif 0.9 <= ls_ratio < 1.1:     # equilibrado = neutral
-            long_pts += 1; short_pts += 1
-            desc_parts.append(f"L/S:{ls_ratio:.2f}⚪")
-        else:                            # extremo = trampa, no puntúa
-            desc_parts.append(f"L/S:{ls_ratio:.2f}⚠️")
-    except Exception:
-        long_pts += 1; short_pts += 1
-
-    # P20: Sesión institucional
-    if is_institutional_session():
-        long_pts += 1
-        short_pts += 1
-        hour = datetime.now(timezone.utc).hour
-        session = "🏦London" if 8 <= hour < 13 else "🗽NY" if 13 <= hour < 22 else "🌏Asia"
-        desc_parts.append(f"Sesión:{session}")
-    else:
-        desc_parts.append("Sesión:🌙OFF-hrs")
-
-    return long_pts, short_pts, " | ".join(desc_parts)
-
-# ══════════════════════════════════════════════════════════
-# SUPERTREND — El filtro de tendencia más fiable (v15)
-# Parámetros probados: period=10, multiplier=3.0
-# Señal: precio cruza por encima → BULL | precio cruza por debajo → BEAR
-# Usado por HaasOnline, Cryptohopper y los mejores bots 2025
-# ══════════════════════════════════════════════════════════
-def calc_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Tuple[pd.Series, pd.Series]:
-    """
-    Retorna (supertrend_line, direction):
-      direction = +1 uptrend (alcista), -1 downtrend (bajista)
-    """
-    h = df["high"]; l = df["low"]; c = df["close"]
-    hl2 = (h + l) / 2.0
-    atr = calc_atr(df, period)
-
-    basic_upper = hl2 + multiplier * atr
-    basic_lower = hl2 - multiplier * atr
-
-    upper = basic_upper.copy()
-    lower = basic_lower.copy()
-
-    for i in range(1, len(df)):
-        # Final upper band
-        if basic_upper.iloc[i] < upper.iloc[i-1] or c.iloc[i-1] > upper.iloc[i-1]:
-            upper.iloc[i] = basic_upper.iloc[i]
-        else:
-            upper.iloc[i] = upper.iloc[i-1]
-        # Final lower band
-        if basic_lower.iloc[i] > lower.iloc[i-1] or c.iloc[i-1] < lower.iloc[i-1]:
-            lower.iloc[i] = basic_lower.iloc[i]
-        else:
-            lower.iloc[i] = lower.iloc[i-1]
-
-    direction = pd.Series(index=df.index, dtype=float)
-    supertrend = pd.Series(index=df.index, dtype=float)
-    direction.iloc[0] = 1.0
-    supertrend.iloc[0] = lower.iloc[0]
-
-    for i in range(1, len(df)):
-        prev_dir = direction.iloc[i-1]
-        if prev_dir == -1:
-            direction.iloc[i] = 1.0 if c.iloc[i] > upper.iloc[i-1] else -1.0
-        else:
-            direction.iloc[i] = -1.0 if c.iloc[i] < lower.iloc[i-1] else 1.0
-        supertrend.iloc[i] = lower.iloc[i] if direction.iloc[i] == 1 else upper.iloc[i]
-
-    return supertrend, direction
-
-
-# ══════════════════════════════════════════════════════════
-# CVD — Cumulative Volume Delta (orden de flujo real)
-# La diferencia entre volumen comprador y vendedor acumulado.
-# Divergencia CVD vs precio = señal de reversal / trampa
-# Usado por traders institucionales para confirmar breakouts
-# ══════════════════════════════════════════════════════════
-def calc_cvd(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    CVD aproximado desde OHLCV (sin datos de tape):
-    - delta_bar = buy_vol - sell_vol (estimación desde velas)
-    - cvd       = delta acumulado rolling period barras
-    - cvd_bull  = CVD sube mientras precio también sube (confluencia)
-    - cvd_bear  = CVD baja mientras precio también baja (confluencia)
-    - cvd_bull_div = precio baja pero CVD sube → absorción (señal LONG fuerte)
-    - cvd_bear_div = precio sube pero CVD baja → distribución (señal SHORT fuerte)
-    """
-    h = df["high"]; l = df["low"]; c = df["close"]; o = df["open"]; v = df["volume"]
-    rng = (h - l).replace(0, np.nan)
-
-    # Estimación delta por vela (buy vol - sell vol)
-    buy_vol  = v * (c - l) / rng
-    sell_vol = v * (h - c) / rng
-    delta    = (buy_vol - sell_vol).fillna(0)
-
-    # CVD rolling (últimas `period` barras)
-    cvd = delta.rolling(period).sum()
-
-    # Divergencia: precio hace mínimo más bajo pero CVD hace mínimo más alto → bullish
-    cvd_bull_div = (
-        (c < c.shift(3)) &           # precio bajó
-        (cvd > cvd.shift(3)) &       # pero CVD subió
-        (cvd < 0)                    # y CVD aún negativo (zona sobreventa)
-    )
-    # Divergencia bajista: precio hace máximo más alto pero CVD hace máximo más bajo
-    cvd_bear_div = (
-        (c > c.shift(3)) &
-        (cvd < cvd.shift(3)) &
-        (cvd > 0)
-    )
-
-    return cvd, cvd_bull_div, cvd_bear_div
-
-
-# ══════════════════════════════════════════════════════════
-# SMC — Smart Money Concepts (Order Blocks + BOS/CHoCH)
-# Lo que usan los hedge funds e instituciones
-# Order Block = zona donde las instituciones colocaron órdenes masivas
-# BOS = Break of Structure (continuación de tendencia)
-# CHoCH = Change of Character (reversión inminente)
-# ══════════════════════════════════════════════════════════
-def calc_smc(df: pd.DataFrame, swing_len: int = 10) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """
-    Retorna:
-    - ob_bull: True si precio está sobre un bullish order block (soporte institucional)
-    - ob_bear: True si precio está bajo un bearish order block (resistencia institucional)
-    - bos_bull: Break of Structure alcista (precio rompió máximo estructural → tendencia LONG)
-    - choch:    Change of Character (posible reversión, cuidado)
-    """
-    h = df["high"]; l = df["low"]; c = df["close"]
-
-    # Swing highs y lows estructurales
-    swing_high = h.rolling(swing_len * 2 + 1, center=True).max() == h
-    swing_low  = l.rolling(swing_len * 2 + 1, center=True).min() == l
-
-    # BOS alcista: precio cierra por encima del swing high anterior
-    prev_swing_high = h.where(swing_high).ffill().shift(1)
-    bos_bull = (c > prev_swing_high) & (c.shift(1) <= prev_swing_high)
-
-    # BOS bajista: precio cierra por debajo del swing low anterior
-    prev_swing_low = l.where(swing_low).ffill().shift(1)
-    bos_bear = (c < prev_swing_low) & (c.shift(1) >= prev_swing_low)
-
-    # CHoCH: después de BOS alcista, si rompe el último swing low = posible reversión
-    choch = bos_bull.shift(1).fillna(False) & bos_bear
-
-    # Order Block alcista: última vela bajista antes de un BOS alcista (zona de compra institucional)
-    # Es la vela roja que precede al movimiento alcista fuerte
-    ob_bull_level = l.where(bos_bull.shift(1).fillna(False)).ffill()
-    ob_bull_top   = h.where(bos_bull.shift(1).fillna(False)).ffill()
-    ob_bull = (c >= ob_bull_level) & (c <= ob_bull_top * 1.005)  # precio dentro o cerca del OB
-
-    # Order Block bajista: última vela alcista antes de un BOS bajista
-    ob_bear_level = h.where(bos_bear.shift(1).fillna(False)).ffill()
-    ob_bear_bottom= l.where(bos_bear.shift(1).fillna(False)).ffill()
-    ob_bear = (c <= ob_bear_level) & (c >= ob_bear_bottom * 0.995)
-
-    return ob_bull.fillna(False), ob_bear.fillna(False), bos_bull.fillna(False), choch.fillna(False)
-
-
-# ══════════════════════════════════════════════════════════
-# BJ BOT — R:R Targets (3Commas framework)
-# ══════════════════════════════════════════════════════════
-def calc_rr_targets(entry: float, side: str,
-                    swing_low: float, swing_high: float,
-                    atr: float) -> Tuple[float, float, float]:
-    """
-    Traducción directa de Bj Bot:
-      longStop  = lowestLow  - atr * RiskM
-      shortStop = highestHigh + atr * RiskM
-      longRisk  = entry - longStop
-      longlimit = entry + RnR * longRisk     ← TP2 basado en R:R
-      TP1       = entry + (longlimit - entry) * 0.5  ← 50% del camino a TP2
-    """
-    if side == "long":
-        stop   = min(swing_low  - atr * RISK_MULT, entry - atr * SL_ATR_MULT)
-        risk   = entry - stop
-        tp2    = entry + RNR * risk
-        tp1    = entry + (tp2 - entry) * 0.5
-    else:
-        stop   = max(swing_high + atr * RISK_MULT, entry + atr * SL_ATR_MULT)
-        risk   = stop - entry
-        tp2    = entry - RNR * risk
-        tp1    = entry - (entry - tp2) * 0.5
-    return tp1, tp2, stop
-
-
-# ══════════════════════════════════════════════════════════
-# COMPUTE — todos los indicadores
-# ══════════════════════════════════════════════════════════
-def compute(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    c, h, l, v, o = df["close"], df["high"], df["low"], df["volume"], df["open"]
-
-    # ── EMAs ──
-    df["ema8"]   = ema(c, FAST_LEN)
-    df["ema21"]  = ema(c, PIVOT_LEN)
-    df["ema48"]  = ema(c, BIAS_LEN)
-    df["ema200"] = ema(c, SLOW_LEN)
-    df["atr"]    = calc_atr(df, ATR_LEN)
-    df["rsi"]    = calc_rsi(c, RSI_LEN)
-
-    # ── ADX ──
-    dip, dim, adx = calc_adx(df, ADX_LEN)
-    df["dip"] = dip; df["dim"] = dim; df["adx"] = adx
-
-    # ── MACD ──
-    macd, macd_sg, macd_h = calc_macd(c)
-    df["macd_hist"]       = macd_h
-    df["macd_bull"]       = (macd_h > 0) & (macd_h > macd_h.shift())
-    df["macd_bear"]       = (macd_h < 0) & (macd_h < macd_h.shift())
-    df["macd_cross_up"]   = (macd > macd_sg) & (macd.shift() <= macd_sg.shift())
-    df["macd_cross_down"] = (macd < macd_sg) & (macd.shift() >= macd_sg.shift())
-
-    # ── SMI ──
-    smi_s, smi_sig = calc_smi(df)
-    df["smi"]          = smi_s
-    df["smi_signal"]   = smi_sig
-    df["smi_cross_up"]   = (smi_s > smi_sig) & (smi_s.shift() <= smi_sig.shift())
-    df["smi_cross_down"] = (smi_s < smi_sig) & (smi_s.shift() >= smi_sig.shift())
-    df["smi_bull"]     = (smi_s > smi_sig) & (smi_s < SMI_OB)
-    df["smi_bear"]     = (smi_s < smi_sig) & (smi_s > SMI_OS)
-    df["smi_ob"]       = smi_s >= SMI_OB
-    df["smi_os"]       = smi_s <= SMI_OS
-    df["smi_exit_ob"]  = (smi_s < SMI_OB) & (smi_s.shift() >= SMI_OB)
-    df["smi_exit_os"]  = (smi_s > SMI_OS) & (smi_s.shift() <= SMI_OS)
-
-    # ── UTBot ──
-    ut_stop, ut_buy, ut_sell = calc_utbot(df)
-    df["utbot_stop"] = ut_stop
-    df["utbot_buy"]  = ut_buy
-    df["utbot_sell"] = ut_sell
-
-    # ── WaveTrend ──
-    wt1, wt2, wt_cross_up, wt_cross_dn = calc_wavetrend(df)
-    df["wt1"]          = wt1
-    df["wt2"]          = wt2
-    df["wt_cross_up"]  = wt_cross_up
-    df["wt_cross_dn"]  = wt_cross_dn
-    df["wt_bull"]      = (wt1 > wt2) & (wt1 < WT_OB)
-    df["wt_bear"]      = (wt1 < wt2) & (wt1 > WT_OS)
-    df["wt_ob"]        = wt1 >= WT_OB
-    df["wt_os"]        = wt1 <= WT_OS
-
-    # ── Bollinger Bands ──
-    bb_up, bb_lo, bb_basis = calc_bb(df)
-    df["bb_upper"] = bb_up
-    df["bb_lower"] = bb_lo
-    df["bb_basis"] = bb_basis
-    # BB signal: precio toca banda inferior con RSI no sobrecomprado
-    df["bb_buy"]  = (c < bb_lo) & (df["rsi"] < BB_RSI_OB)
-    df["bb_sell"] = (c > bb_up) & (df["rsi"] > (100 - BB_RSI_OB))
-    # Squeeze: BB dentro de Keltner
-    kc_up         = df["ema21"] + 2.0 * df["atr"]
-    df["squeeze"] = bb_up < kc_up
-    bb_w          = (bb_up - bb_lo) / df["ema21"].replace(0, np.nan)
-    df["bb_width"]    = bb_w
-
-    # ── MA cross (Bj Bot) — usa ema8 vs ema21 ──
-    df["ma_cross_up"]  = (df["ema8"] > df["ema21"]) & (df["ema8"].shift() <= df["ema21"].shift())
-    df["ma_cross_down"]= (df["ema8"] < df["ema21"]) & (df["ema8"].shift() >= df["ema21"].shift())
-
-    # ── Oscilador ──
-    df["osc"]    = ema(((c - df["ema21"]) / (3.0 * df["atr"].replace(0,np.nan))) * 100, OSC_LEN)
-    df["osc_up"] = (df["osc"] > 0) & (df["osc"].shift() <= 0)
-    df["osc_dn"] = (df["osc"] < 0) & (df["osc"].shift() >= 0)
-
-    # ── Tendencia ──
-    df["is_trending"] = (adx > ADX_MIN) & (bb_w > sma(bb_w, 20) * 0.8)
-
-    # ── Volumen ──
-    rng            = (h - l).replace(0, np.nan)
-    df["buy_vol"]  = v * (c - l) / rng
-    df["sell_vol"] = v * (h - c) / rng
-    df["vol_ma"]   = sma(v, VOL_LEN)
-    df["vol_spike"]= v > df["vol_ma"] * 1.05
-    df["vol_bull"] = df["buy_vol"] > df["sell_vol"]
-    df["vol_bear"] = df["sell_vol"] > df["buy_vol"]
-
-    # ── Velas ──
-    body              = (c - o).abs()
-    body_pct          = body / rng.replace(0, np.nan)
-    df["bull_candle"] = (c > o) & (body_pct >= 0.30)
-    df["bear_candle"] = (c < o) & (body_pct >= 0.30)
-    prev_body = (o.shift() - c.shift()).abs()
-    df["bull_engulf"] = (c > o) & (o <= c.shift()) & (c >= o.shift()) & (body > prev_body * 0.8)
-    df["bear_engulf"] = (c < o) & (o >= c.shift()) & (c <= o.shift()) & (body > prev_body * 0.8)
-
-    # ── Swing H/L ──
-    df["swing_low"]  = l.rolling(SWING_LB).min()
-    df["swing_high"] = h.rolling(SWING_LB).max()
-
-    # ── Divergencias RSI ──
-    rsi = df["rsi"]
-    df["bull_div"] = (
-        (l < l.shift(1)) & (l.shift(1) < l.shift(2)) &
-        (rsi > rsi.shift(1)) & (rsi.shift(1) > rsi.shift(2)) & (rsi < 42)
-    )
-    df["bear_div"] = (
-        (h > h.shift(1)) & (h.shift(1) > h.shift(2)) &
-        (rsi < rsi.shift(1)) & (rsi.shift(1) < rsi.shift(2)) & (rsi > 58)
-    )
-
-    # ══════════════════════════════════════════════════════
-    # v15 SAINT GRAIL — Indicadores avanzados
-    # ══════════════════════════════════════════════════════
-
-    # ── P21: VWAP diario (288 velas × 5m = 1 día) ──
-    vwap_period   = min(288, len(df))
-    typical_price = (h + l + c) / 3.0
-    cum_vol       = v.rolling(vwap_period).sum()
-    cum_tpvol     = (typical_price * v).rolling(vwap_period).sum()
-    df["vwap"]           = cum_tpvol / cum_vol.replace(0, np.nan)
-    df["above_vwap"]     = c > df["vwap"]
-    df["below_vwap"]     = c < df["vwap"]
-    df["vwap_cross_up"]  = (c > df["vwap"]) & (c.shift(1) <= df["vwap"].shift(1))
-    df["vwap_cross_down"]= (c < df["vwap"]) & (c.shift(1) >= df["vwap"].shift(1))
-
-    # ── P22: Supertrend (10, 3.0) ──
-    try:
-        st_line, st_dir = calc_supertrend(df, period=10, multiplier=3.0)
-        df["st_bull"]       = (st_dir == 1.0)
-        df["st_bear"]       = (st_dir == -1.0)
-        df["st_cross_bull"] = (st_dir == 1.0) & (st_dir.shift(1).fillna(-1.0) == -1.0)
-        df["st_cross_bear"] = (st_dir == -1.0) & (st_dir.shift(1).fillna(1.0) == 1.0)
-    except Exception:
-        for k in ["st_bull","st_bear","st_cross_bull","st_cross_bear"]:
-            df[k] = False
-
-    # ── P23: CVD Divergence ──
-    try:
-        cvd, cvd_bull_div, cvd_bear_div = calc_cvd(df, period=20)
-        df["cvd"]          = cvd
-        df["cvd_bull_div"] = cvd_bull_div
-        df["cvd_bear_div"] = cvd_bear_div
-        df["cvd_rising"]   = cvd > cvd.shift(3)
-        df["cvd_falling"]  = cvd < cvd.shift(3)
-    except Exception:
-        for k in ["cvd_bull_div","cvd_bear_div","cvd_rising","cvd_falling"]:
-            df[k] = False
-
-    # ── P24: SMC — Order Blocks + BOS ──
-    try:
-        ob_bull, ob_bear, bos_bull, choch = calc_smc(df, swing_len=SWING_LB)
-        df["ob_bull"]  = ob_bull
-        df["ob_bear"]  = ob_bear
-        df["bos_bull"] = bos_bull
-        df["choch"]    = choch
-    except Exception:
-        for k in ["ob_bull","ob_bear","bos_bull","choch"]:
-            df[k] = False
-
-    # ── Market Regime Filter ──
-    atr_pct    = df["atr"] / c.replace(0, np.nan) * 100
-    atr_pct_ma = sma(atr_pct, 50)
-    bb_w_ma    = sma(df["bb_width"], 50)
-    df["regime_trend"] = (adx > 20) & (df["bb_width"] > bb_w_ma * 0.9) & (atr_pct > atr_pct_ma * 0.7)
-    df["regime_chop"]  = (adx < 18) & (df["bb_width"] < bb_w_ma * 0.8)
-
-    return df
-
-
-def htf_bias(df: pd.DataFrame) -> Tuple[bool, bool]:
-    df  = compute(df)
-    row = df.iloc[-2]
-    bull = bool(row["close"] > row["ema48"] and row["ema21"] > row["ema48"])
-    bear = bool(row["close"] < row["ema48"] and row["ema21"] < row["ema48"])
-    return bull, bear
-
-def htf2_macro(df: pd.DataFrame) -> Tuple[bool, bool]:
-    df  = compute(df)
-    row = df.iloc[-2]
-    bull = bool(row["close"] > row["ema48"] and row["ema48"] > row["ema200"])
-    bear = bool(row["close"] < row["ema48"] and row["ema48"] < row["ema200"])
-    return bull, bear
-
-
-# ══════════════════════════════════════════════════════════
-# SCORE 25 PUNTOS — v15 Saint Grail Edition
-# ══════════════════════════════════════════════════════════
-def confluence_score(row: pd.Series,
-                     htf1_bull: bool, htf1_bear: bool,
-                     htf2_bull: bool, htf2_bear: bool,
-                     uptrend: bool,
-                     whale_long: int = 0, whale_short: int = 0) -> Tuple[int, int]:
-    """
-    25 puntos por dirección (v15 Saint Grail Edition):
-
-    LONG (P1-P16 base + P17-P20 whale + P21-P25 saint grail):
-     1. EMA trend alcista
-     2. Oscilador cruza al alza
-     3. HTF1 bias alcista
-     4. HTF2 macro alcista
-     5. ADX con DI+ > DI-
-     6. RSI en zona sana
-     7. Volumen comprador + spike
-     8. Vela alcista + close > ema21
-     9. MACD alcista o cruce
-    10. SMI cross up / bull
-    11. SMI en OS o saliendo
-    12. Bull engulf / div RSI
-    13. UTBot BUY signal
-    14. WaveTrend cross up / OS
-    15. MA cross alcista
-    16. BB buy signal
-    17. Funding Rate favorable     ← WHALE v14
-    18. Open Interest creciente    ← WHALE v14
-    19. Long/Short ratio a favor   ← WHALE v14
-    20. Sesión institucional       ← WHALE v14
-    21. Precio sobre VWAP diario   ← SAINT GRAIL v15
-    22. Supertrend alcista         ← SAINT GRAIL v15
-    23. CVD bull divergence        ← SAINT GRAIL v15
-    24. SMC Order Block bull / BOS ← SAINT GRAIL v15
-    25. Régimen de tendencia activo← SAINT GRAIL v15
-
-    SHORT: lógica espejada
-    """
-    # HARD BLOCK: si el mercado está en chop/lateral, score = 0
-    if bool(row.get("regime_chop", False)):
-        return 0, 0
-
-    rsi = float(row["rsi"])
-
-    # ─── LONG ─────────────────────────────────────────────
-    l1  = bool(row["close"] > row["ema48"] and row["ema8"] > row["ema21"])
-    l2  = bool(row["osc_up"])
-    l3  = htf1_bull
-    l4  = htf2_bull
-    l5  = bool(row["adx"] > ADX_MIN and row["dip"] > row["dim"])
-    l6  = bool(42 <= rsi <= 78)
-    l7  = bool(row["vol_bull"] and row["vol_spike"] and not row["squeeze"])
-    l8  = bool(row["bull_candle"] and row["close"] > row["ema21"])
-    l9  = bool(row["macd_bull"] or row["macd_cross_up"])
-    l10 = bool(row.get("smi_cross_up") or row.get("smi_bull"))
-    l11 = bool(row.get("smi_os")       or row.get("smi_exit_os"))
-    l12 = bool(row["bull_engulf"]      or row["bull_div"])
-    l13 = bool(row.get("utbot_buy"))
-    l14 = bool(row.get("wt_cross_up")  or row.get("wt_os") or
-               (row.get("wt_bull") and not row.get("wt_ob")))
-    l15 = bool(row.get("ma_cross_up"))
-    l16 = bool(row.get("bb_buy") and not row.get("squeeze"))
-    # Whale points (P17-P20)
-    whale_l_pts = min(whale_long, 4)
-    # Saint Grail (P21-P25)
-    l21 = bool(row.get("above_vwap") or row.get("vwap_cross_up"))         # VWAP
-    l22 = bool(row.get("st_bull") or row.get("st_cross_bull"))            # Supertrend
-    l23 = bool(row.get("cvd_bull_div") or row.get("cvd_rising"))          # CVD
-    l24 = bool(row.get("ob_bull") or row.get("bos_bull"))                 # SMC
-    l25 = bool(row.get("regime_trend", False))                            # Régimen tendencia
-
-    # ─── SHORT ────────────────────────────────────────────
-    s1  = bool(row["close"] < row["ema48"] and row["ema8"] < row["ema21"])
-    s2  = bool(row["osc_dn"])
-    s3  = htf1_bear
-    s4  = htf2_bear
-    s5  = bool(row["adx"] > ADX_MIN and row["dim"] > row["dip"])
-    s6  = bool(22 <= rsi <= 58)
-    s7  = bool(row["vol_bear"] and row["vol_spike"] and not row["squeeze"])
-    s8  = bool(row["bear_candle"] and row["close"] < row["ema21"])
-    s9  = bool(row["macd_bear"]   or row["macd_cross_down"])
-    s10 = bool(row.get("smi_cross_down") or row.get("smi_bear"))
-    s11 = bool(row.get("smi_ob")         or row.get("smi_exit_ob"))
-    s12 = bool(row["bear_engulf"]        or row["bear_div"])
-    s13 = bool(row.get("utbot_sell"))
-    s14 = bool(row.get("wt_cross_dn")    or row.get("wt_ob") or
-               (row.get("wt_bear") and not row.get("wt_os")))
-    s15 = bool(row.get("ma_cross_down"))
-    s16 = bool(row.get("bb_sell") and not row.get("squeeze"))
-    whale_s_pts = min(whale_short, 4)
-    # Saint Grail (P21-P25)
-    s21 = bool(row.get("below_vwap") or row.get("vwap_cross_down"))      # VWAP
-    s22 = bool(row.get("st_bear") or row.get("st_cross_bear"))           # Supertrend
-    s23 = bool(row.get("cvd_bear_div") or row.get("cvd_falling"))        # CVD
-    s24 = bool(row.get("ob_bear") or row.get("choch"))                   # SMC
-    s25 = bool(row.get("regime_trend", False))                           # Régimen tendencia
-
-    long_score  = (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16])
-                   + whale_l_pts + sum([l21,l22,l23,l24,l25]))
-    short_score = (sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16])
-                   + whale_s_pts + sum([s21,s22,s23,s24,s25]))
-    return long_score, short_score
-
-
-
-# ══════════════════════════════════════════════════════════
-# BTC BIAS
-# ══════════════════════════════════════════════════════════
-def update_btc_bias(ex: ccxt.Exchange):
-    try:
-        df  = fetch_df(ex, "BTC/USDT:USDT", "1h", limit=250)
-        df  = compute(df)
-        row = df.iloc[-2]
-        state.btc_bull = bool(row["close"] > row["ema48"] and row["ema48"] > row["ema200"])
-        state.btc_bear = bool(row["close"] < row["ema48"] and row["ema48"] < row["ema200"])
-        state.btc_rsi  = float(row["rsi"])
-        log.info(
-            f"BTC: {'BULL' if state.btc_bull else 'BEAR' if state.btc_bear else 'NEUTRAL'} "
-            f"RSI:{state.btc_rsi:.1f} "
-            f"SMI:{float(row.get('smi',0)):.1f} "
-            f"WT:{float(row.get('wt1',0)):.1f} "
-            f"UTBot:{'BUY' if row.get('utbot_buy') else 'SELL' if row.get('utbot_sell') else '-'}"
-        )
-    except Exception as e:
-        log.warning(f"BTC bias: {e}")
-
-
-# ══════════════════════════════════════════════════════════
+        if os.path.exists(STATE_PATH):
+            with open(STATE_PATH) as f: st.load_persist(json.load(f))
+            log.info(f"Estado restaurado: {st.total_trades} trades")
+    except Exception as e: log.warning(f"load_state: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EXCHANGE
-# ══════════════════════════════════════════════════════════
-def build_exchange() -> ccxt.Exchange:
-    ex = ccxt.bingx({
-        "apiKey": API_KEY, "secret": API_SECRET,
-        "options": {"defaultType": "swap"},
-        "enableRateLimit": True,
-    })
-    ex.load_markets()
-    return ex
+# ─────────────────────────────────────────────────────────────────────────────
+_ex = None; _ex_lock = threading.Lock()
+def ex():
+    global _ex
+    with _ex_lock:
+        if _ex is None:
+            _ex = ccxt.bingx({"apiKey":API_KEY,"secret":API_SECRET,
+                "options":{"defaultType":"swap","defaultMarginMode":"cross"},
+                "enableRateLimit":True})
+            _ex.load_markets(); log.info("BingX conectado OK")
+        return _ex
 
-def detect_hedge_mode(ex: ccxt.Exchange) -> bool:
+def ex_call(fn, *args, retries=3, **kwargs):
+    for attempt in range(retries):
+        try: return fn(*args, **kwargs)
+        except ccxt.NetworkError as e:
+            wait=2**attempt; log.warning(f"Network({attempt+1}): {e} {wait}s"); time.sleep(wait)
+        except ccxt.RateLimitExceeded: log.warning("RateLimit 15s"); time.sleep(15)
+        except ccxt.AuthenticationError as e: log.error(f"Auth: {e}"); raise
+        except Exception as e:
+            if attempt==retries-1: raise
+            time.sleep(2**attempt)
+    raise RuntimeError(f"Failed {retries}")
+
+def sym(raw):
+    r=raw.upper().strip()
+    for s in (".P","PERP","-PERP","_PERP"):
+        if r.endswith(s): r=r[:-len(s)]
+    if ":" in r: return r
+    if "/" in r:
+        b,q=r.split("/",1); q2=q.split(":")[0]; return f"{b}/{q2}:{q2}"
+    if r.endswith("USDT"): return f"{r[:-4]}/USDT:USDT"
+    return f"{r}/USDT:USDT"
+
+def price(symbol): return float(ex_call(ex().fetch_ticker,symbol)["last"])
+def price_validated(symbol):
+    t=ex_call(ex().fetch_ticker,symbol); last=float(t["last"])
+    bid=float(t.get("bid") or last); ask=float(t.get("ask") or last); mid=(bid+ask)/2
+    if mid>0 and abs(last-mid)/mid*100>ANTI_SPIKE_PCT:
+        raise ValueError(f"Anti-spike {last:.6g} vs {mid:.6g}")
+    return last
+
+def balance():
+    b=ex_call(ex().fetch_balance); usdt=b.get("USDT",{})
+    free=float(usdt.get("free",0) or 0)
+    if free==0:
+        for item in b.get("info",{}).get("data",{}).get("balance",[]):
+            if item.get("asset")=="USDT": free=float(item.get("availableMargin",0) or 0); break
+    return free
+
+def get_position(symbol):
     try:
-        for p in ex.fetch_positions()[:5]:
-            if p.get("info", {}).get("positionSide", "") in ("LONG", "SHORT"):
-                return True
-    except Exception:
-        pass
-    return False
-
-def get_balance(ex: ccxt.Exchange) -> float:
-    return float(ex.fetch_balance()["USDT"]["free"])
-
-def get_position(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
-    try:
-        for p in ex.fetch_positions([symbol]):
-            if abs(float(p.get("contracts", 0) or 0)) > 0:
-                return p
-    except Exception:
-        pass
+        for p in ex_call(ex().fetch_positions,[symbol]):
+            qty=abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt",0) or 0))
+            if qty>0: return p
+    except Exception as e: log.warning(f"get_pos: {e}")
     return None
 
-def get_all_positions(ex: ccxt.Exchange) -> Dict[str, dict]:
-    result: Dict[str, dict] = {}
+def set_lev(symbol):
+    try: ex_call(ex().set_leverage,LEVERAGE,symbol,{"marginMode":"cross"}); log.info(f"  Lev {LEVERAGE}x OK")
+    except Exception as e: log.warning(f"  set_lev: {e}")
+
+def cancel_all_safe(symbol):
+    try: ex_call(ex().cancel_all_orders,symbol); return
+    except Exception: pass
     try:
-        for p in ex.fetch_positions():
-            if abs(float(p.get("contracts", 0) or 0)) > 0:
-                result[p["symbol"]] = p
-    except Exception as e:
-        log.warning(f"fetch_positions: {e}")
-    return result
+        for o in ex_call(ex().fetch_open_orders,symbol):
+            try: ex_call(ex().cancel_order,o["id"],symbol)
+            except Exception as e2: log.warning(f"cancel {o['id']}: {e2}")
+    except Exception as e: log.warning(f"cancel_all: {e}")
 
-def get_last_price(ex: ccxt.Exchange, symbol: str) -> float:
-    return float(ex.fetch_ticker(symbol)["last"])
-
-def get_spread_pct(ex: ccxt.Exchange, symbol: str) -> float:
+def place_tp(e,symbol,cs,qty,tp_price):
     try:
-        ob  = ex.fetch_order_book(symbol, limit=1)
-        bid = ob["bids"][0][0] if ob["bids"] else 0
-        ask = ob["asks"][0][0] if ob["asks"] else 0
-        mid = (bid + ask) / 2
-        return ((ask - bid) / mid * 100) if mid > 0 else 999.0
-    except Exception:
-        return 0.0
+        tp=float(e.price_to_precision(symbol,tp_price))
+        q=float(e.amount_to_precision(symbol,qty))
+        if q*tp<1: return False
+        ex_call(e.create_order,symbol,"limit",cs,q,tp,{"reduceOnly":True})
+        log.info(f"  TP @ {tp:.6g} qty={q} OK"); return True
+    except Exception as err: log.warning(f"  place_tp: {err}"); return False
 
-def get_min_amount(ex: ccxt.Exchange, symbol: str) -> float:
+def place_sl(e,symbol,cs,qty,stop_price):
     try:
-        mkt = ex.markets.get(symbol, {})
-        return float(mkt.get("limits", {}).get("amount", {}).get("min", 0) or 0)
-    except Exception:
-        return 0.0
-
-def entry_params(side: str) -> dict:
-    if HEDGE_MODE:
-        return {"positionSide": "LONG" if side == "buy" else "SHORT"}
-    return {}
-
-def exit_params(trade_side: str) -> dict:
-    if HEDGE_MODE:
-        return {"positionSide": "LONG" if trade_side == "long" else "SHORT",
-                "reduceOnly": True}
-    return {"reduceOnly": True}
-
-
-# ══════════════════════════════════════════════════════════
-# UNIVERSO
-# ══════════════════════════════════════════════════════════
-def get_symbols(ex: ccxt.Exchange) -> List[str]:
-    candidates = []
-    for sym, mkt in ex.markets.items():
-        if not (mkt.get("swap") and mkt.get("quote") == "USDT"
-                and mkt.get("active", True)):
-            continue
-        if sym in BLACKLIST: continue
-        candidates.append(sym)
-
-    if not candidates:
-        log.warning("Sin candidatos de mercado")
-        return []
-
-    log.info(f"Obteniendo tickers para {len(candidates)} pares...")
-    try:
-        tickers = ex.fetch_tickers(candidates)
-    except Exception as e:
-        log.warning(f"fetch_tickers: {e}")
-        return candidates[:TOP_N_SYMBOLS]
-
-    ranked = []
-    for sym in candidates:
-        tk  = tickers.get(sym, {})
-        vol = float(tk.get("quoteVolume", 0) or 0)
-        if vol >= MIN_VOLUME_USDT:
-            info    = ex.markets.get(sym, {}).get("info", {})
-            created = info.get("onboardDate", 0) or info.get("deliveryDate", 0)
-            is_new  = False
-            if created:
-                try:
-                    age_days = (time.time() - float(created) / 1000) / 86400
-                    is_new   = age_days < 30
-                except Exception:
-                    pass
-            ranked.append((sym, vol, is_new))
-
-    ranked.sort(key=lambda x: (not x[2], -x[1]))
-    result = [s for s, _, _ in ranked]
-    if TOP_N_SYMBOLS > 0:
-        result = result[:TOP_N_SYMBOLS]
-
-    new_count = sum(1 for _, _, n in ranked[:len(result)] if n)
-    log.info(f"Universo: {len(result)} pares "
-             f"(vol≥${MIN_VOLUME_USDT/1000:.0f}K, {new_count} nuevos primero)")
-    return result
-
-
-# ══════════════════════════════════════════════════════════
-# APERTURA DE POSICIÓN — con targets Bj Bot (R:R)
-# ══════════════════════════════════════════════════════════
-def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
-               side: str, score: int, row: pd.Series,
-               uptrend: bool, whale_desc: str = "") -> Optional[TradeState]:
-    try:
-        spread = get_spread_pct(ex, symbol)
-        if spread > MAX_SPREAD_PCT:
-            log.warning(f"[{symbol}] spread {spread:.3f}% > {MAX_SPREAD_PCT}% — skip")
-            return None
-
-        # Establecer apalancamiento 12x antes de abrir
-        try:
-            lv_params = {"hedged": True} if HEDGE_MODE else {}
-            ex.set_leverage(LEVERAGE, symbol, params=lv_params)
-        except Exception as lv_err:
-            log.warning(f"[{symbol}] set_leverage {LEVERAGE}x: {lv_err} (continuando)")
-
-        price   = get_last_price(ex, symbol)
-        atr     = float(row["atr"])
-        smi_v   = float(row.get("smi", 0.0))
-        wt_v    = float(row.get("wt1", 0.0))
-        ut_stop = float(row.get("utbot_stop", 0.0))
-        usdt    = FIXED_USDT * state.risk_mult()
-        raw_amt = (usdt * LEVERAGE) / price  # 8 USDT x 12 = 96 USDT notional
-        min_amt = get_min_amount(ex, symbol)
-        # Usar el máximo entre el importe calculado y el mínimo del exchange
-        raw_amt = max(raw_amt, min_amt) if min_amt > 0 else raw_amt
-        amount  = float(ex.amount_to_precision(symbol, raw_amt))
-
-        # Verificar que el notional no excede demasiado FIXED_USDT (máx 3×)
-        if amount <= 0:
-            log.warning(f"[{symbol}] amount calculado es 0")
-            return None
-        if amount * price < 3:
-            log.warning(f"[{symbol}] notional ${amount*price:.2f} < $3")
-            return None
-        if amount * price > FIXED_USDT * LEVERAGE * 3:
-            log.warning(f"[{symbol}] notional ${amount*price:.2f} excede 3× FIXED_USDT, skipping")
-            return None
-
-        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/25 "
-                 f"SMI={smi_v:.1f} WT={wt_v:.1f} ${usdt:.1f} @ {price:.6g}")
-
-        order       = ex.create_order(symbol, "market", side, amount,
-                                      params=entry_params(side))
-        entry_price = float(order.get("average") or price)
-        trade_side  = "long" if side == "buy" else "short"
-
-        # ── Targets Bj Bot (R:R) ──
-        tp1_p, tp2_p, sl_p = calc_rr_targets(
-            entry_price, trade_side,
-            float(row["swing_low"]), float(row["swing_high"]), atr
-        )
-
-        tp1_p = float(ex.price_to_precision(symbol, tp1_p))
-        tp2_p = float(ex.price_to_precision(symbol, tp2_p))
-        sl_p  = float(ex.price_to_precision(symbol, sl_p))
-
-        # R:R trail trigger (Bj Bot rrExit)
-        if trade_side == "long":
-            rr_trigger = entry_price + (tp2_p - entry_price) * RR_EXIT
-        else:
-            rr_trigger = entry_price - (entry_price - tp2_p) * RR_EXIT
-
-        close_side = "sell" if side == "buy" else "buy"
-        half       = float(ex.amount_to_precision(symbol, amount * 0.5))
-        ep         = exit_params(trade_side)
-
-        for lbl, qty, px in [("TP1", half, tp1_p), ("TP2", half, tp2_p)]:
+        sp=float(e.price_to_precision(symbol,stop_price))
+        q=float(e.amount_to_precision(symbol,qty))
+        params={"reduceOnly":True,"stopPrice":sp}
+        for otype in ["stop_market","stop"]:
             try:
-                ex.create_order(symbol, "limit", close_side, qty, px, ep)
-                log.info(f"[{symbol}] {lbl} @ {px:.6g}")
-            except Exception as e:
-                log.warning(f"[{symbol}] {lbl}: {e}")
+                ex_call(e.create_order,symbol,otype,cs,q,None,params)
+                log.info(f"  SL {otype} @ {sp:.6g} OK"); return True
+            except Exception as te: log.warning(f"  SL {otype}: {te}")
+        return False
+    except Exception as err: log.warning(f"  place_sl: {err}"); return False
 
-        try:
-            sl_ep = {**ep, "stopPrice": sl_p}
-            ex.create_order(symbol, "stop_market", close_side, amount, None, sl_ep)
-            log.info(f"[{symbol}] SL @ {sl_p:.6g}")
-        except Exception as e:
-            log.warning(f"[{symbol}] SL: {e}")
+def update_sl(t,new_sl):
+    if t.dry_run: return
+    try:
+        cancel_all_safe(t.symbol)
+        place_sl(ex(),t.symbol,"sell" if t.side=="long" else "buy",t.contracts,new_sl)
+    except Exception as e: log.warning(f"update_sl: {e}")
 
-        t = TradeState(
-            symbol=symbol,       base=base,        side=trade_side,
-            entry_price=entry_price,               tp1_price=tp1_p,
-            tp2_price=tp2_p,     sl_price=sl_p,
-            entry_score=score,   entry_time=utcnow(),
-            contracts=amount,    atr_entry=atr,
-            smi_entry=smi_v,     wt_entry=wt_v,
-            utbot_stop=ut_stop,
-            uptrend_entry=uptrend,
-            whale_desc=whale_desc,
-            rr_trail_stop=rr_trigger,
-        )
-        if side == "buy":
-            t.trail_high = entry_price
-            t.rr_trail_stop = rr_trigger
-        else:
-            t.trail_low  = entry_price
-            t.rr_trail_stop = rr_trigger
+# ─────────────────────────────────────────────────────────────────────────────
+# INDICADORES TÉCNICOS (calculados en tiempo real desde OHLCV)
+# ─────────────────────────────────────────────────────────────────────────────
+_ohlcv_cache: Dict[str, Tuple[float, np.ndarray]] = {}  # symbol → (ts, array)
+_ohlcv_lock = threading.Lock()
+OHLCV_TTL = 60  # segundos
 
-        # ── Inicializar DCA (v18) ──
-        if DCA_ENABLED and DCA_MAX_ORDERS > 0:
-            t.dca_avg_price  = entry_price
-            t.dca_total_usdt = usdt
-            t.dca_total_contr = amount
-            # Precio que dispara la 1ª orden DCA
-            if trade_side == "long":
-                t.dca_next_price = entry_price * (1 - DCA_STEP_PCT / 100)
-            else:
-                t.dca_next_price = entry_price * (1 + DCA_STEP_PCT / 100)
-            t.dca_sl_price = sl_p  # SL inicial (se actualiza tras cada DCA)
+def get_ohlcv(symbol: str, timeframe="15m", limit=100) -> Optional[np.ndarray]:
+    now_ts = time.time()
+    with _ohlcv_lock:
+        cached = _ohlcv_cache.get(symbol)
+        if cached and now_ts - cached[0] < OHLCV_TTL:
+            return cached[1]
+    try:
+        data = ex_call(ex().fetch_ohlcv, symbol, timeframe, limit=limit)
+        if not data or len(data) < 20: return None
+        arr = np.array(data, dtype=float)
+        with _ohlcv_lock: _ohlcv_cache[symbol] = (now_ts, arr)
+        return arr
+    except Exception as e: log.warning(f"ohlcv({symbol}): {e}"); return None
 
-        log_csv("OPEN", t, entry_price)
-        tg_signal(t, row)
-        return t
+def calc_atr(h, l, c, period=14):
+    trs = []
+    for i in range(1, len(c)):
+        trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+    trs = np.array(trs)
+    if len(trs) < period: return float(np.mean(trs)) if len(trs) else 0.0
+    atr = float(np.mean(trs[:period]))
+    for tr in trs[period:]: atr = (atr*(period-1)+tr)/period
+    return atr
 
-    except Exception as e:
-        err_str = str(e).lower()
-        log.error(f"[{symbol}] open_trade: {e}")
-        # Detectar error de margen insuficiente → enviar señal manual
-        if any(k in err_str for k in ["insufficient margin", "insufficient balance",
-                                       "not enough", "margin", "balance"]):
-            try:
-                # Calcular targets para el trader manual
-                _price = get_last_price(ex, symbol)
-                _atr   = float(row["atr"])
-                _side  = "long" if side == "buy" else "short"
-                _tp1, _tp2, _sl = calc_rr_targets(
-                    _price, _side,
-                    float(row["swing_low"]), float(row["swing_high"]), _atr
-                )
-                tg_manual_signal(
-                    symbol=symbol, side=_side, score=score,
-                    entry=_price, tp1=_tp1, tp2=_tp2, sl=_sl,
-                    atr=_atr, whale_desc=whale_desc,
-                    reason=str(e)[:120]
-                )
-            except Exception as me:
-                log.warning(f"[{symbol}] no pude enviar señal manual: {me}")
-                tg_error(f"open_trade {symbol}: {e}")
-        else:
-            tg_error(f"open_trade {symbol}: {e}")
+def calc_ema(closes, period):
+    if len(closes) < period: return float(closes[-1])
+    k = 2/(period+1); ema = float(np.mean(closes[:period]))
+    for c in closes[period:]: ema = c*k + ema*(1-k)
+    return ema
+
+def calc_rsi(closes, period=14):
+    if len(closes) < period+1: return 50.0
+    d = np.diff(closes)
+    g = np.where(d>0,d,0); l = np.where(d<0,-d,0)
+    ag = float(np.mean(g[:period])); al = float(np.mean(l[:period]))
+    for i in range(period, len(d)):
+        ag = (ag*(period-1)+g[i])/period; al = (al*(period-1)+l[i])/period
+    return 100.0 if al==0 else 100-100/(1+ag/al)
+
+def calc_bb(closes, period=20, std_mult=2.0):
+    if len(closes) < period: return closes[-1], closes[-1], closes[-1]
+    recent = closes[-period:]
+    mid = float(np.mean(recent)); sd = float(np.std(recent))
+    return mid - std_mult*sd, mid, mid + std_mult*sd  # lower, mid, upper
+
+def calc_adx(h, l, c, period=14):
+    """ADX para detectar fuerza de tendencia."""
+    if len(c) < period+2: return 25.0
+    dm_plus = []; dm_minus = []; tr_list = []
+    for i in range(1, len(c)):
+        tr = max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
+        tr_list.append(tr)
+        up = h[i]-h[i-1]; dn = l[i-1]-l[i]
+        dm_plus.append(up if up>dn and up>0 else 0)
+        dm_minus.append(dn if dn>up and dn>0 else 0)
+    def smooth(arr, p):
+        s = sum(arr[:p])
+        result = [s]
+        for v in arr[p:]: s = s - s/p + v; result.append(s)
+        return result
+    atr_s = smooth(tr_list, period); dmp = smooth(dm_plus, period); dmm = smooth(dm_minus, period)
+    dx_list = []
+    for i in range(len(atr_s)):
+        if atr_s[i]==0: continue
+        pdi = 100*dmp[i]/atr_s[i]; mdi = 100*dmm[i]/atr_s[i]
+        if pdi+mdi==0: continue
+        dx_list.append(100*abs(pdi-mdi)/(pdi+mdi))
+    if not dx_list: return 25.0
+    return float(np.mean(dx_list[-period:])) if len(dx_list)>=period else float(np.mean(dx_list))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESTRATEGIA 1 — DWELL BLOCKS BREAKOUT
+# Basada en el Pine Script proporcionado
+# ─────────────────────────────────────────────────────────────────────────────
+def strategy_dwell_blocks(symbol: str, side_hint: str = None) -> Optional[dict]:
+    """
+    Detecta bloques de consolidación (dwell) y señala breakouts.
+    Retorna señal con: side, sl, tp, dwell_high, dwell_low, rr_ratio
+    o None si no hay señal.
+    """
+    arr = get_ohlcv(symbol, "15m", 60)
+    if arr is None: return None
+
+    closes = arr[:,4]; highs = arr[:,2]; lows = arr[:,3]
+    cons_length = 20
+    atr_mult    = 1.5
+    atr_length  = 14
+    rr_ratio    = 2.0
+    risk_pct    = SL_PCT / 100
+
+    atr = calc_atr(highs, lows, closes, atr_length)
+    if atr == 0: return None
+
+    # Lookback sobre las últimas cons_length velas
+    range_high = float(np.max(highs[-cons_length-1:-1]))  # shifted [1]
+    range_low  = float(np.min(lows[-cons_length-1:-1]))
+    range_width = range_high - range_low
+
+    is_consolidation = range_width < atr_mult * atr
+    if not is_consolidation:
         return None
 
+    current_close = float(closes[-1])
+    prev_close    = float(closes[-2])
 
-def move_be(ex: ccxt.Exchange, symbol: str):
-    if symbol not in state.trades: return
-    t = state.trades[symbol]
-    if t.sl_moved_be: return
-    try:
-        ex.cancel_all_orders(symbol)
-    except Exception as e:
-        log.warning(f"[{symbol}] cancel for BE: {e}")
-    be    = float(ex.price_to_precision(symbol, t.entry_price))
-    ep    = {**exit_params(t.side), "stopPrice": be}
-    cside = "sell" if t.side == "long" else "buy"
-    try:
-        ex.create_order(symbol, "stop_market", cside, t.contracts, None, ep)
-        t.sl_price    = be
-        t.sl_moved_be = True
-        log.info(f"[{symbol}] BE @ {be:.6g}")
-    except Exception as e:
-        log.warning(f"[{symbol}] BE failed: {e}")
-
-
-def close_trade(ex: ccxt.Exchange, symbol: str, reason: str, price: float):
-    if symbol not in state.trades: return
-    t = state.trades[symbol]
-    try: ex.cancel_all_orders(symbol)
-    except Exception as e: log.warning(f"[{symbol}] cancel: {e}")
-
-    pos = get_position(ex, symbol)
-    pnl = 0.0
-    if pos:
-        contracts  = abs(float(pos.get("contracts", 0)))
-        close_side = "sell" if t.side == "long" else "buy"
-        try:
-            ex.create_order(symbol, "market", close_side, contracts,
-                            params=exit_params(t.side))
-            pnl = ((price - t.entry_price) if t.side == "long"
-                   else (t.entry_price - price)) * contracts
-        except Exception as e:
-            log.error(f"[{symbol}] close: {e}")
-            tg_error(f"close {symbol}: {e}")
-            return
-
-    if pnl > 0:
-        state.wins += 1; state.gross_profit += pnl; state.consec_losses = 0
-    elif pnl < 0:
-        state.losses += 1; state.gross_loss += abs(pnl); state.consec_losses += 1
-
-    state.total_pnl   += pnl
-    state.daily_pnl   += pnl
-    state.peak_equity  = max(state.peak_equity, state.peak_equity + pnl)
-    state.set_cooldown(symbol)
-
-    log_csv("CLOSE", t, price, pnl)
-    tg_close(reason, t, price, pnl)
-    brain.record_trade(symbol, t.side, t.entry_score, pnl, reason)
-    del state.trades[symbol]
-
-
-# ══════════════════════════════════════════════════════════
-# GESTIÓN DEL TRADE — v14 con todas las capas de salida
-# ══════════════════════════════════════════════════════════
-def execute_dca_order(ex: ccxt.Exchange, symbol: str, live_price: float, atr: float):
-    """
-    DCA Averaging — modelo 3Commas/Bitsgap.
-    Cuando el precio va -DCA_STEP_PCT% contra la posición:
-      1. Abre una nueva orden market al precio actual (tamaño escalonado)
-      2. Recalcula el precio promedio ponderado
-      3. Actualiza el TP al nuevo precio promedio + DCA_TP_PCT%
-      4. Actualiza el SL duro a avg_price - DCA_SL_ATR_MULT × ATR
-      5. Programa el próximo nivel DCA
-    Máximo DCA_MAX_ORDERS niveles para evitar sobre-exposición.
-    """
-    if symbol not in state.trades:
-        return
-    t = state.trades[symbol]
-
-    if not DCA_ENABLED or t.dca_count >= DCA_MAX_ORDERS:
-        return
-
-    try:
-        # Calcular tamaño de la orden DCA (escalonado × DCA_SIZE_MULT)
-        usdt_base  = FIXED_USDT * state.risk_mult()
-        dca_usdt   = usdt_base * (DCA_SIZE_MULT ** t.dca_count)  # 1ª: 8×1.2=9.6, 2ª: 9.6×1.2=11.52
-        raw_amt    = (dca_usdt * LEVERAGE) / live_price
-        min_amt    = get_min_amount(ex, symbol)
-        raw_amt    = max(raw_amt, min_amt) if min_amt > 0 else raw_amt
-        dca_amount = float(ex.amount_to_precision(symbol, raw_amt))
-
-        if dca_amount <= 0:
-            return
-
-        # Verificar margen disponible antes de abrir
-        try:
-            bal = get_balance(ex)
-            if bal < dca_usdt * 0.8:
-                log.warning(f"[DCA] {symbol}: sin margen suficiente (${bal:.2f} < ${dca_usdt:.2f})")
-                return
-        except Exception:
-            pass
-
-        side_order = "buy" if t.side == "long" else "sell"
-        order = ex.create_order(symbol, "market", side_order, dca_amount,
-                                params=entry_params(side_order))
-        fill_price = float(order.get("average") or live_price)
-
-        # Recalcular precio promedio ponderado
-        total_cost   = t.dca_avg_price * t.dca_total_contr + fill_price * dca_amount
-        t.dca_total_contr += dca_amount
-        t.dca_total_usdt  += dca_usdt
-        t.dca_avg_price    = total_cost / t.dca_total_contr
-        t.dca_count       += 1
-
-        # Nuevo TP al precio promedio + DCA_TP_PCT%
-        if t.side == "long":
-            new_tp2 = t.dca_avg_price * (1 + DCA_TP_PCT / 100)
-            new_tp1 = t.dca_avg_price * (1 + DCA_TP_PCT / 200)  # TP1 = mitad del camino
-            # Nuevo SL duro debajo del promedio
-            new_sl  = t.dca_avg_price - atr * DCA_SL_ATR_MULT
-            # Siguiente nivel DCA más abajo (distancia × DCA_STEP_MULT)
-            step_pct = DCA_STEP_PCT * (DCA_STEP_MULT ** t.dca_count)
-            t.dca_next_price = t.dca_avg_price * (1 - step_pct / 100)
-        else:
-            new_tp2 = t.dca_avg_price * (1 - DCA_TP_PCT / 100)
-            new_tp1 = t.dca_avg_price * (1 - DCA_TP_PCT / 200)
-            new_sl  = t.dca_avg_price + atr * DCA_SL_ATR_MULT
-            step_pct = DCA_STEP_PCT * (DCA_STEP_MULT ** t.dca_count)
-            t.dca_next_price = t.dca_avg_price * (1 + step_pct / 100)
-
-        new_tp2   = float(ex.price_to_precision(symbol, new_tp2))
-        new_tp1   = float(ex.price_to_precision(symbol, new_tp1))
-        new_sl    = float(ex.price_to_precision(symbol, new_sl))
-
-        t.tp2_price   = new_tp2
-        t.tp1_price   = new_tp1
-        t.dca_sl_price = new_sl
-        t.sl_price     = new_sl   # el SL del estado se actualiza
-        t.contracts    = t.dca_total_contr  # para cálculo de PnL correcto
-
-        # Cancelar TP/SL anteriores y colocar los nuevos
-        close_side = "sell" if t.side == "long" else "buy"
-        ep = exit_params(t.side)
-        try:
-            ex.cancel_all_orders(symbol)
-        except Exception:
-            pass
-        half = float(ex.amount_to_precision(symbol, t.dca_total_contr * 0.5))
-        for lbl, qty, px in [("TP1", half, new_tp1), ("TP2", half, new_tp2)]:
-            try:
-                ex.create_order(symbol, "limit", close_side, qty, px, ep)
-            except Exception as e:
-                log.warning(f"[DCA-TP] {symbol} {lbl}: {e}")
-        try:
-            sl_ep = {**ep, "stopPrice": new_sl}
-            ex.create_order(symbol, "stop_market", close_side, t.dca_total_contr, None, sl_ep)
-        except Exception as e:
-            log.warning(f"[DCA-SL] {symbol}: {e}")
-
-        log.info(f"[DCA #{t.dca_count}] {symbol} fill={fill_price:.6g} "
-                 f"avg={t.dca_avg_price:.6g} TP2={new_tp2:.6g} SL={new_sl:.6g}")
-
-        pnl_est = ((t.dca_avg_price - live_price) if t.side == "long"
-                   else (live_price - t.dca_avg_price)) * t.dca_total_contr
-
-        tg(f"📉 DCA #{t.dca_count} — {symbol}\n"
-           f"{'LONG' if t.side=='long' else 'SHORT'} · Orden {t.dca_count}/{DCA_MAX_ORDERS}\n"
-           f"💵 Fill: {fill_price:.6g} | Prom: {t.dca_avg_price:.6g}\n"
-           f"🟢 Nuevo TP2: {new_tp2:.6g} (+{DCA_TP_PCT:.1f}%)\n"
-           f"🛑 Nuevo SL:  {new_sl:.6g}\n"
-           f"📊 Capital DCA: ${t.dca_total_usdt:.2f} | Contratos: {t.dca_total_contr:.4f}\n"
-           f"⏰ {utcnow()}")
-
-    except Exception as e:
-        log.error(f"[DCA] {symbol}: {e}")
-
-
-def manage_trade(ex: ccxt.Exchange, symbol: str,
-                 live_price: float, atr: float,
-                 long_score: int, short_score: int,
-                 live_pos: Optional[dict],
-                 result: Optional[dict] = None):
-
-    if symbol not in state.trades: return
-    t = state.trades[symbol]
-    t.bar_count += 1
-
-    # ── Posición cerrada externamente (SL/TP ejecutado) ──
-    if live_pos is None:
-        pnl = ((live_price - t.entry_price) if t.side == "long"
-               else (t.entry_price - live_price)) * t.contracts
-        reason = ("TP2 ALCANZADO"
-                  if (t.side=="long"  and live_price >= t.tp2_price) or
-                     (t.side=="short" and live_price <= t.tp2_price)
-                  else "SL ALCANZADO")
-        if pnl > 0:
-            state.wins += 1; state.gross_profit += pnl; state.consec_losses = 0
-        else:
-            state.losses += 1; state.gross_loss += abs(pnl); state.consec_losses += 1
-        state.total_pnl += pnl; state.daily_pnl += pnl
-        state.set_cooldown(symbol)
-        log_csv("CLOSE_EXT", t, live_price, pnl)
-        tg_close(reason, t, live_price, pnl)
-        brain.record_trade(symbol, t.side, t.entry_score, pnl, reason)
-        del state.trades[symbol]
-        return
-
-    # ── Trade Expiration (Instrument-Z) ──
-    if TRADE_EXPIRE_BARS > 0 and t.bar_count >= TRADE_EXPIRE_BARS:
-        close_trade(ex, symbol, f"EXPIRADO ({t.bar_count} barras)", live_price)
-        return
-
-    # ── DCA SL DURO: si precio supera el SL del promedio → cierre inmediato ──
-    if t.dca_count > 0 and t.dca_sl_price > 0:
-        sl_hit = (
-            (t.side == "long"  and live_price <= t.dca_sl_price) or
-            (t.side == "short" and live_price >= t.dca_sl_price)
-        )
-        if sl_hit:
-            close_trade(ex, symbol, f"DCA SL DURO (tras {t.dca_count} avg)", live_price)
-            return
-
-    # ── UTBot trailing stop como 2ª línea de defensa ──
-    # Si el precio cruza la línea UTBot en dirección contraria → cierre
-    if result is not None and symbol in state.trades:
-        row = result.get("row")
-        if row is not None:
-            ut_stop_now = float(row.get("utbot_stop", 0.0))
-            if t.side == "long" and ut_stop_now > 0:
-                # UTBot sell signal activo Y precio bajo el stop
-                if bool(row.get("utbot_sell")) and live_price < ut_stop_now:
-                    if t.tp1_hit:  # solo si ya está en profit
-                        close_trade(ex, symbol, "UTBOT TRAILING STOP", live_price)
-                        return
-            elif t.side == "short" and ut_stop_now > 0:
-                if bool(row.get("utbot_buy")) and live_price > ut_stop_now:
-                    if t.tp1_hit:
-                        close_trade(ex, symbol, "UTBOT TRAILING STOP", live_price)
-                        return
-
-    # ── Cierre por pérdida dinámica (antes de TP1) ──
-    if not t.tp1_hit:
-        atr_now   = atr if atr > 0 else t.atr_entry
-        loss_dist = (t.entry_price - live_price if t.side == "long"
-                     else live_price - t.entry_price)
-        if loss_dist >= atr_now * 1.0:
-            # ── DCA AVERAGING (v18): antes de cerrar, intentar promediar ──
-            if (DCA_ENABLED and t.dca_count < DCA_MAX_ORDERS
-                    and t.dca_next_price > 0):
-                trigger_hit = (
-                    (t.side == "long"  and live_price <= t.dca_next_price) or
-                    (t.side == "short" and live_price >= t.dca_next_price)
-                )
-                if trigger_hit:
-                    execute_dca_order(ex, symbol, live_price, atr_now)
-                    return  # No cerrar — promediamos
-            # Sin DCA disponible → cerrar
-            close_trade(ex, symbol, "PÉRDIDA DINÁMICA", live_price)
-            return
-
-    # ── Agotamiento (7 señales incluyendo SMI, WT, UTBot) ──
-    if result is not None and symbol in state.trades:
-        row = result.get("row")
-        if row is not None:
-            try:
-                in_profit = ((t.side == "long"  and live_price > t.entry_price) or
-                             (t.side == "short" and live_price < t.entry_price))
-                if in_profit:
-                    rsi_v     = float(row["rsi"])
-                    adx_v     = float(row["adx"])
-                    vol_ratio = float(row["volume"]) / max(float(row["vol_ma"]), 1)
-                    smi_now   = float(row.get("smi", 0.0))
-                    wt_now    = float(row.get("wt1", 0.0))
-                    if t.side == "long":
-                        e1 = bool(row["macd_bear"])
-                        e2 = adx_v < 20
-                        e3 = vol_ratio < 0.7
-                        e4 = bool(row["bear_div"])
-                        e5 = bool(row["osc_dn"])
-                        e6 = rsi_v > 72
-                        e7 = bool(row.get("smi_ob") or row.get("smi_cross_down"))
-                        e8 = bool(row.get("wt_ob") or row.get("wt_cross_dn"))
-                        e9 = bool(row.get("utbot_sell"))
-                    else:
-                        e1 = bool(row["macd_bull"])
-                        e2 = adx_v < 20
-                        e3 = vol_ratio < 0.7
-                        e4 = bool(row["bull_div"])
-                        e5 = bool(row["osc_up"])
-                        e6 = rsi_v < 28
-                        e7 = bool(row.get("smi_os") or row.get("smi_cross_up"))
-                        e8 = bool(row.get("wt_os") or row.get("wt_cross_up"))
-                        e9 = bool(row.get("utbot_buy"))
-                    exh = sum([e1,e2,e3,e4,e5,e6,e7,e8,e9])
-                    if exh >= 6:  # 6/9 señales — más exigente, deja correr los winners
-                        profit = ((live_price - t.entry_price) if t.side == "long"
-                                  else (t.entry_price - live_price)) * t.contracts
-
-                        # Minimum profit check (Instrument-Z)
-                        min_profit_usdt = t.entry_price * t.contracts * MIN_PROFIT_PCT
-                        if profit < min_profit_usdt:
-                            pass  # no cerrar si no alcanza mínimo
-                        else:
-                            tg(
-                                f"🏁 <b>AGOTAMIENTO</b> — {symbol}\n"
-                                f"Señales: {exh}/9 | ${profit:+.2f}\n"
-                                f"{'✅' if e1 else '❌'} MACD  {'✅' if e2 else '❌'} ADX\n"
-                                f"{'✅' if e3 else '❌'} Vol↓  {'✅' if e4 else '❌'} DivRSI\n"
-                                f"{'✅' if e5 else '❌'} OSC   {'✅' if e6 else '❌'} RSIext\n"
-                                f"{'✅' if e7 else '❌'} SMI{smi_now:.1f} "
-                                f"{'✅' if e8 else '❌'} WT{wt_now:.1f} "
-                                f"{'✅' if e9 else '❌'} UTBot\n"
-                                f"⏰ {utcnow()}"
-                            )
-                            close_trade(ex, symbol, "AGOTAMIENTO", live_price)
-                            return
-            except Exception as e:
-                log.debug(f"[{symbol}] agotamiento: {e}")
-
-    # ── TP1 → Break-Even ──
-    if not t.tp1_hit:
-        hit = ((t.side == "long"  and live_price >= t.tp1_price) or
-               (t.side == "short" and live_price <= t.tp1_price))
-        if hit:
-            t.tp1_hit    = True
-            t.peak_price = live_price
-            t.prev_price = live_price
-            contracts    = float(live_pos.get("contracts", 0))
-            pnl_est      = abs(t.tp1_price - t.entry_price) * contracts * 0.5
-            move_be(ex, symbol)
-            tg_tp1_be(t, live_price, pnl_est)
-
-    # ── R:R Trail trigger (Bj Bot rrExit) ──
-    if t.tp1_hit and symbol in state.trades and not t.rr_trail_active:
-        triggered = ((t.side == "long"  and live_price >= t.rr_trail_stop) or
-                     (t.side == "short" and live_price <= t.rr_trail_stop))
-        if triggered:
-            t.rr_trail_active = True
-            tg(
-                f"📐 <b>R:R TRAIL ACTIVADO</b> — {symbol}\n"
-                f"Precio trigger: <code>{t.rr_trail_stop:.6g}</code>\n"
-                f"R:R={RNR} | {RR_EXIT*100:.0f}% del camino al TP2\n"
-                f"⏰ {utcnow()}"
-            )
-
-    # ── Trailing stop (3 fases + R:R) ──
-    if t.tp1_hit and symbol in state.trades:
-        atr_t = atr if atr > 0 else t.atr_entry
-
-        if t.side == "long":
-            cur_pct = (live_price - t.entry_price) / t.entry_price * 100
-        else:
-            cur_pct = (t.entry_price - live_price) / t.entry_price * 100
-        t.max_profit_pct = max(t.max_profit_pct, cur_pct)
-
-        new_peak = (live_price > t.peak_price if t.side == "long"
-                    else live_price < t.peak_price)
-        if new_peak:
-            t.peak_price  = live_price
-            t.stall_count = 0
-        else:
-            t.stall_count += 1
-
-        denom = abs(t.peak_price - t.entry_price)
-        if t.side == "long":
-            retrace = (t.peak_price - live_price) / max(denom, 1e-9) * 100
-        else:
-            retrace = (live_price - t.peak_price) / max(denom, 1e-9) * 100
-
-        prev_phase = t.trail_phase
-        # R:R trail activo → fase más agresiva
-        if t.rr_trail_active and retrace > 12:
-            t.trail_phase = "locked"
-        elif retrace > 25:
-            t.trail_phase = "locked"
-        elif t.stall_count >= 2:
-            t.trail_phase = "tight"
-        else:
-            t.trail_phase = "normal"
-
-        trail_m = {"normal": 0.7, "tight": 0.35, "locked": 0.15}[t.trail_phase]
-
-        if t.trail_phase != prev_phase:
-            tg_trail_phase(t, t.trail_phase, live_price, retrace, trail_m)
-
-        if t.side == "long":
-            t.trail_high = max(t.trail_high, live_price)
-            if live_price <= t.trail_high - atr_t * trail_m:
-                close_trade(ex, symbol, f"TRAILING {t.trail_phase.upper()}", live_price)
-                return
-        else:
-            t.trail_low = min(t.trail_low, live_price)
-            if live_price >= t.trail_low + atr_t * trail_m:
-                close_trade(ex, symbol, f"TRAILING {t.trail_phase.upper()}", live_price)
-                return
-
-        t.prev_price = live_price
-
-    # ── Flip de dirección ──
-    if symbol in state.trades:
-        if t.side == "long"  and short_score >= MIN_SCORE + 2:
-            close_trade(ex, symbol, "FLIP LONG→SHORT", live_price)
-        elif t.side == "short" and long_score >= MIN_SCORE + 2:
-            close_trade(ex, symbol, "FLIP SHORT→LONG", live_price)
-
-
-# ══════════════════════════════════════════════════════════
-# SCAN DE UN SÍMBOLO
-# ══════════════════════════════════════════════════════════
-def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
-    try:
-        df  = fetch_df(ex, symbol, TF,   400)
-        df1 = fetch_df(ex, symbol, HTF1, 200)
-        df2 = fetch_df(ex, symbol, HTF2, 300)
-
-        df  = compute(df)
-        row = df.iloc[-2]
-
-        # Validar que los indicadores están disponibles
-        for col in ["adx", "rsi", "macd_hist", "smi", "wt1", "utbot_stop"]:
-            if pd.isna(row.get(col, np.nan)):
-                return None
-
-        htf1_bull, htf1_bear = htf_bias(df1)
-        htf2_bull, htf2_bear = htf2_macro(df2)
-
-        # UpTrend: precio sobre EMA200
-        uptrend = bool(row["close"] > row["ema200"])
-
-        # ── Whale & Institutional signals (v14) ──
-        wl, ws, whale_desc = whale_score_bonus(ex, symbol, "both")
-        ls, ss = confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear,
-                                  uptrend, whale_long=wl, whale_short=ws)
-
-        rsi_v = float(row["rsi"])
-        smi_v = float(row.get("smi", 0.0))
-        wt_v  = float(row.get("wt1", 0.0))
-
-        if rsi_extreme_long(rsi_v) or rsi_extreme_short(rsi_v):
-            now  = time.time()
-            last = state.rsi_alerts.get(symbol, 0)
-            if now - last > 1800:
-                state.rsi_alerts[symbol] = now
-                tg_rsi_alert(symbol, rsi_v, smi_v, wt_v, ls, ss, float(row["close"]))
-
+    # Long breakout: close cruza por encima de range_high[1]
+    # (prev_close <= range_high y current_close > range_high)
+    if prev_close <= range_high < current_close:
+        sl_price  = current_close * (1 - risk_pct)
+        tp_price  = current_close * (1 + risk_pct * rr_ratio)
         return {
-            "symbol":      symbol,
-            "base":        symbol.split("/")[0],
-            "long_score":  ls,
-            "short_score": ss,
-            "row":         row,
-            "atr":         float(row["atr"]),
-            "live_price":  float(row["close"]),
-            "is_trending": bool(row["is_trending"]),
-            "rsi":         rsi_v,
-            "smi":         smi_v,
-            "wt":          wt_v,
-            "uptrend":     uptrend,
-            "whale_desc":  whale_desc,
+            "side": "long", "sl": sl_price, "tp": tp_price,
+            "dwell_high": range_high, "dwell_low": range_low,
+            "rr_ratio": rr_ratio, "strategy": STRAT_DWELL,
+            "atr": atr, "range_width": range_width
         }
-    except Exception as e:
-        log.debug(f"[{symbol}] scan: {e}")
-        return None
 
+    # Short breakout: close cruza por debajo de range_low[1]
+    if prev_close >= range_low > current_close:
+        sl_price  = current_close * (1 + risk_pct)
+        tp_price  = current_close * (1 - risk_pct * rr_ratio)
+        return {
+            "side": "short", "sl": sl_price, "tp": tp_price,
+            "dwell_high": range_high, "dwell_low": range_low,
+            "rr_ratio": rr_ratio, "strategy": STRAT_DWELL,
+            "atr": atr, "range_width": range_width
+        }
 
-# ══════════════════════════════════════════════════════════
-# GRID MODE — Gana dinero cuando el mercado está lateral (v16)
-# Cuando regime_chop=True, activa un mini-grid de 5 niveles
-# Usa ATR para espaciar niveles, leverage reducido (3×)
-# ══════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
-# DCA AVERAGING (v18) — Modelo 3Commas/Bitsgap
-# En vez de SL inmediato, promedia cuando el precio va en contra.
-# Solo activa si el trade está en -1.5% y hay presupuesto disponible.
-# ══════════════════════════════════════════════════════════════
-DCA_ENABLED       = os.environ.get("DCA_ENABLED", "true").lower() == "true"
-DCA_MAX_ORDERS    = int(os.environ.get("DCA_MAX_ORDERS",   "2"))    # máx 2 órdenes de promediado (seguro con $50)
-DCA_STEP_PCT      = float(os.environ.get("DCA_STEP_PCT",   "1.5"))  # 1ª orden DCA si precio baja 1.5%
-DCA_STEP_MULT     = float(os.environ.get("DCA_STEP_MULT",  "1.5"))  # cada paso multiplica distancia × 1.5 (3Commas default)
-DCA_SIZE_MULT     = float(os.environ.get("DCA_SIZE_MULT",  "1.2"))  # cada orden DCA es 1.2× la anterior
-DCA_SL_ATR_MULT   = float(os.environ.get("DCA_SL_ATR_MULT","3.0"))  # SL duro tras último DCA = 3× ATR del promedio
-DCA_TP_PCT        = float(os.environ.get("DCA_TP_PCT",     "1.0"))  # TP cuando el precio vuelve al avg_entry + 1%
+    return None
 
-GRID_LEVELS       = 3      # REDUCIDO: 3 niveles (antes 5 = demasiada exposición)
-GRID_ATR_MULT     = 0.7    # spacing ligeramente mayor = más margen entre niveles
-GRID_LEVERAGE     = 2      # REDUCIDO: 2× (antes 3× — con $50 es demasiado)
-GRID_USDT         = 2.0    # REDUCIDO: $2 por nivel (antes $4 = 360% exposición con $50)
-GRID_MAX_ACTIVE   = 1      # REDUCIDO: máx 1 grid a la vez (antes 3 = colapsaba margen)
-GRID_EXPIRE_H     = 4      # Cierre más rápido si no funciona (antes 6h)
-GRID_MIN_VOLUME   = 1_000_000  # Volumen mínimo para grid
+# ─────────────────────────────────────────────────────────────────────────────
+# ESTRATEGIA 2 — UTBot (ATR Trailing Stop + EMA cross)
+# ─────────────────────────────────────────────────────────────────────────────
+def strategy_utbot(symbol: str) -> Optional[dict]:
+    arr = get_ohlcv(symbol, "15m", 80)
+    if arr is None: return None
+    closes = arr[:,4]; highs = arr[:,2]; lows = arr[:,3]
+    atr = calc_atr(highs, lows, closes, 14)
+    key_value = 2.0  # configurable, equivale al "Key Value" del UTBot
 
+    # ATR Trailing Stop (simplificado)
+    atr_stop = float(closes[-1]) - key_value * atr
+    atr_stop_short = float(closes[-1]) + key_value * atr
 
-def open_grid(ex: ccxt.Exchange, symbol: str, price: float, atr: float):
-    """Abre un mini-grid de 5 niveles cuando el mercado está lateral."""
-    if symbol in state.grid_trades:
-        return
-    if len(state.grid_trades) >= GRID_MAX_ACTIVE:
-        return
+    ema_fast = calc_ema(closes, 20)
+    ema_slow = calc_ema(closes, 50)
 
-    spacing = atr * GRID_ATR_MULT
-    if spacing <= 0 or price <= 0:
-        return
+    # Long: EMA fast cruza sobre EMA slow Y precio sobre ATR stop
+    if ema_fast > ema_slow and float(closes[-1]) > atr_stop and float(closes[-2]) <= calc_ema(closes[:-1], 50):
+        sl = atr_stop
+        tp = float(closes[-1]) + (float(closes[-1]) - sl) * 2
+        return {"side":"long","sl":sl,"tp":tp,"strategy":STRAT_UTBOT,"atr":atr}
+    # Short: inverso
+    if ema_fast < ema_slow and float(closes[-1]) < atr_stop_short:
+        sl = atr_stop_short
+        tp = float(closes[-1]) - (sl - float(closes[-1])) * 2
+        return {"side":"short","sl":sl,"tp":tp,"strategy":STRAT_UTBOT,"atr":atr}
+    return None
 
-    # Comprueba volumen mínimo
-    try:
-        ticker = ex.fetch_ticker(symbol)
-        vol_24h = float(ticker.get("quoteVolume", 0) or 0)
-        if vol_24h < GRID_MIN_VOLUME:
-            return
-    except Exception:
-        return
+# ─────────────────────────────────────────────────────────────────────────────
+# ESTRATEGIA 3 — BB + RSI (oversold/overbought reversal)
+# ─────────────────────────────────────────────────────────────────────────────
+def strategy_bbrsi(symbol: str) -> Optional[dict]:
+    arr = get_ohlcv(symbol, "15m", 60)
+    if arr is None: return None
+    closes = arr[:,4]; highs = arr[:,2]; lows = arr[:,3]
+    rsi = calc_rsi(closes, 14)
+    bb_low, bb_mid, bb_high = calc_bb(closes, 20, 2.0)
+    atr = calc_atr(highs, lows, closes, 14)
+    cur = float(closes[-1])
 
-    levels = []
-    # Niveles de COMPRA: por debajo del precio actual
-    for i in range(1, GRID_LEVELS + 1):
-        buy_price = price - i * spacing
-        if buy_price <= 0:
-            continue
+    # Long: precio toca BB inferior Y RSI < 30
+    if cur <= bb_low and rsi < 30:
+        sl = cur - 1.5*atr
+        tp = bb_mid + (bb_mid - bb_low) * 0.5
+        return {"side":"long","sl":sl,"tp":tp,"strategy":STRAT_BBRSI,"rsi":rsi,"atr":atr}
+    # Short: precio toca BB superior Y RSI > 70
+    if cur >= bb_high and rsi > 70:
+        sl = cur + 1.5*atr
+        tp = bb_mid - (bb_high - bb_mid) * 0.5
+        return {"side":"short","sl":sl,"tp":tp,"strategy":STRAT_BBRSI,"rsi":rsi,"atr":atr}
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESTRATEGIA 4 — EMA Trend Follow + Volumen
+# ─────────────────────────────────────────────────────────────────────────────
+def strategy_ema_trend(symbol: str) -> Optional[dict]:
+    arr = get_ohlcv(symbol, "15m", 80)
+    if arr is None: return None
+    closes = arr[:,4]; highs = arr[:,2]; lows = arr[:,3]; vols = arr[:,5]
+    ema9  = calc_ema(closes, 9)
+    ema21 = calc_ema(closes, 21)
+    ema9_prev  = calc_ema(closes[:-1], 9)
+    ema21_prev = calc_ema(closes[:-1], 21)
+    atr = calc_atr(highs, lows, closes, 14)
+    adx = calc_adx(highs, lows, closes, 14)
+    vol_ratio = float(vols[-1]) / float(np.mean(vols[-20:-1])) if float(np.mean(vols[-20:-1]))>0 else 1.0
+
+    # Solo operar si ADX > 20 (tendencia fuerte) y volumen > 1.1x media
+    if adx < 20 or vol_ratio < 1.1: return None
+
+    cur = float(closes[-1])
+    if ema9_prev <= ema21_prev and ema9 > ema21:  # cruce alcista
+        sl = cur - atr * 1.5
+        tp = cur + atr * 3.0
+        return {"side":"long","sl":sl,"tp":tp,"strategy":STRAT_EMA,"adx":adx,"vol_ratio":vol_ratio,"atr":atr}
+    if ema9_prev >= ema21_prev and ema9 < ema21:  # cruce bajista
+        sl = cur + atr * 1.5
+        tp = cur - atr * 3.0
+        return {"side":"short","sl":sl,"tp":tp,"strategy":STRAT_EMA,"adx":adx,"vol_ratio":vol_ratio,"atr":atr}
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCANNER DE SEÑALES (hilo autónomo)
+# ─────────────────────────────────────────────────────────────────────────────
+SCAN_SYMBOLS = os.environ.get("SCAN_SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
+SCAN_ENABLED = os.environ.get("SCAN_ENABLED", "true").lower() == "true"
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))  # cada 5min
+
+def _scanner_worker():
+    """Escanea símbolos automáticamente con las estrategias activas."""
+    log.info(f"Scanner iniciado: {SCAN_SYMBOLS} cada {SCAN_INTERVAL_SEC}s")
+    time.sleep(120)  # esperar startup
+    while True:
         try:
-            ex.set_leverage(GRID_LEVERAGE, symbol, params={})
-        except Exception:
-            pass
-        min_amt = get_min_amount(ex, symbol)
-        amount = max((GRID_USDT * GRID_LEVERAGE) / buy_price, min_amt)
-        try:
-            amount = float(ex.amount_to_precision(symbol, amount))
-            buy_price_p = float(ex.price_to_precision(symbol, buy_price))
-            order = ex.create_order(symbol, "limit", "buy", amount,
-                                    price=buy_price_p,
-                                    params={"reduceOnly": False})
-            levels.append(GridLevel(price=buy_price_p, side="buy",
-                                    order_id=order.get("id", ""), filled=False))
-        except Exception as e:
-            log.warning(f"[GRID] {symbol} buy L{i}: {e}")
+            if not SCAN_ENABLED or st.paused or st.cb() or st.daily_hit():
+                time.sleep(SCAN_INTERVAL_SEC); continue
+            if not brain.is_hour_ok():
+                time.sleep(60); continue
 
-    if not levels:
-        return
+            for raw_sym in SCAN_SYMBOLS:
+                raw_sym = raw_sym.strip()
+                if not raw_sym: continue
+                symbol = sym(raw_sym)
+                with _lock:
+                    if symbol in st.trades: continue
+                    if st.in_cooldown(symbol): continue
+                    if st.n() >= MAX_OPEN_TRADES: break
 
-    gt = GridTrade(
-        symbol=symbol, center=price, spacing=spacing,
-        levels=levels, ts_open=time.time()
-    )
-    state.grid_trades[symbol] = gt
-    tg(f"🔲 <b>GRID ABIERTO</b> — {symbol}\n"
-       f"Precio: <code>{price:.6g}</code> | ATR: {atr:.5f}\n"
-       f"Spacing: {spacing:.5f} | Niveles: {len(levels)}\n"
-       f"Capital: ${GRID_USDT:.0f} × {GRID_LEVERAGE}× por nivel\n"
-       f"⏰ {utcnow()}")
-    log.info(f"[GRID OPEN] {symbol} center={price:.6g} spacing={spacing:.5f} "
-             f"levels={len(levels)}")
-
-
-def manage_grid(ex: ccxt.Exchange, symbol: str, live_price: float):
-    """Gestiona un grid activo: detecta fills y coloca sell en el nivel superior."""
-    if symbol not in state.grid_trades:
-        return
-    gt = state.grid_trades[symbol]
-
-    # ── Expiración ──
-    if time.time() - gt.ts_open > GRID_EXPIRE_H * 3600:
-        close_grid(ex, symbol, "EXPIRADO")
-        return
-
-    # ── Verificar fills ──
-    for lv in gt.levels:
-        if lv.filled or not lv.order_id:
-            continue
-        try:
-            order = ex.fetch_order(lv.order_id, symbol)
-            status = order.get("status", "")
-            if status == "closed":
-                lv.filled = True
-                fill_price = float(order.get("average") or order.get("price") or live_price)
-                tp_price   = fill_price + gt.spacing  # TP en el nivel superior
-                amount     = float(order.get("filled", 0))
-                if amount > 0:
+                # Probar cada estrategia activa según su weight
+                strategies_to_try = [
+                    (STRAT_DWELL, strategy_dwell_blocks),
+                    (STRAT_BBRSI, strategy_bbrsi),
+                    (STRAT_EMA,   strategy_ema_trend),
+                    (STRAT_UTBOT, strategy_utbot),
+                ]
+                for strat_name, strat_fn in strategies_to_try:
+                    if not brain.get(strat_name).is_active(): continue
                     try:
-                        tp_price_p = float(ex.price_to_precision(symbol, tp_price))
-                        sell_ord   = ex.create_order(symbol, "limit", "sell", amount,
-                                                     price=tp_price_p,
-                                                     params={"reduceOnly": True})
-                        pnl_est    = (tp_price - fill_price) * amount
-                        lv.pnl     = pnl_est
-                        gt.total_pnl += pnl_est
-                        gt.n_trades  += 1
-                        tg(f"✅ <b>GRID FILL</b> — {symbol}\n"
-                           f"Compra: <code>{fill_price:.6g}</code> → "
-                           f"TP: <code>{tp_price_p:.6g}</code>\n"
-                           f"PnL est: ~${pnl_est:+.3f} | Total: ${gt.total_pnl:+.3f}\n"
-                           f"⏰ {utcnow()}")
+                        signal = strat_fn(symbol)
+                        if signal:
+                            log.info(f"[SCAN] {symbol} señal {strat_name}: {signal['side']}")
+                            open_trade_from_signal(symbol, signal)
+                            time.sleep(2)
+                            break
                     except Exception as e:
-                        log.warning(f"[GRID] {symbol} TP order: {e}")
+                        log.warning(f"Scanner {strat_name}/{symbol}: {e}")
+
         except Exception as e:
-            log.debug(f"[GRID] {symbol} check order: {e}")
+            log.warning(f"Scanner main: {e}")
+        time.sleep(SCAN_INTERVAL_SEC)
 
-    # ── Si el precio sale del rango del grid → cerrar ──
-    lower_bound = gt.center - (GRID_LEVELS + 1) * gt.spacing
-    upper_bound = gt.center + (GRID_LEVELS + 1) * gt.spacing
-    if live_price < lower_bound * 0.995 or live_price > upper_bound * 1.005:
-        close_grid(ex, symbol, "PRECIO FUERA DE RANGO")
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE LOGIC — OPEN TRADE
+# ─────────────────────────────────────────────────────────────────────────────
+def open_trade_from_signal(raw_symbol: str, signal: dict) -> dict:
+    """Abre un trade desde una señal de estrategia interna."""
+    side     = signal.get("side", "long")
+    strategy = signal.get("strategy", STRAT_WEBHOOK)
+    return open_trade(raw_symbol, side, strategy=strategy, signal_meta=signal)
+
+def open_trade(raw_symbol: str, side: str,
+               strategy: str = STRAT_WEBHOOK,
+               signal_meta: dict = None) -> dict:
+    with _lock:
+        symbol = sym(raw_symbol)
+        log.info(f"[OPEN] {symbol} {side.upper()} strat={strategy}")
+
+        if st.paused:         return {"result":"paused"}
+        if st.n()>=MAX_OPEN_TRADES:
+            msg_blocked(f"Max {MAX_OPEN_TRADES}",side,symbol); return {"result":"blocked_max_trades"}
+        if symbol in st.trades: return {"result":"already_open"}
+        if st.cb():
+            msg_blocked(f"Circuit Breaker {CB_DD}%",side,symbol); return {"result":"blocked_cb"}
+        if st.daily_hit():
+            msg_blocked(f"Daily limit {DAILY_LOSS_PCT}%",side,symbol); return {"result":"blocked_daily"}
+        if st.in_cooldown(symbol): return {"result":"cooldown"}
+        if not brain.is_hour_ok():
+            return {"result":"blocked_bad_hour"}
+        if not brain.get(strategy).is_active():
+            return {"result":f"strategy_{strategy}_paused",
+                    "reason": brain.get(strategy).pause_reason}
+
+        try:
+            e = ex()
+            if symbol not in e.markets: ex_call(e.load_markets)
+            if symbol not in e.markets: raise ValueError(f"Simbolo no encontrado: {symbol}")
+
+            set_lev(symbol)
+            px  = price_validated(symbol)
+            bal = balance()
+
+            # Sizing dinámico por brain
+            size_mult = brain.size_multiplier(strategy)
+            usdt_size = FIXED_USDT * size_mult
+            notl      = usdt_size * LEVERAGE
+            qty       = float(e.amount_to_precision(symbol, notl/px))
+            if qty*px < 5: raise ValueError(f"Notional muy pequeno: ${qty*px:.2f}")
+
+            order_side = "buy" if side=="long" else "sell"
+
+            # SL dinámico — ajuste por brain
+            sl_adj   = brain.dynamic_sl_for(strategy)
+            sl_pct_n = SL_PCT * sl_adj / 100  # ajustado
+
+            # Calcular niveles desde señal o por defecto
+            if DRY_RUN: entry_p = px
+            else:
+                order   = ex_call(e.create_order,symbol,"market",order_side,qty,params={"reduceOnly":False})
+                entry_p = float(order.get("average") or order.get("price") or px)
+                if entry_p==0: entry_p=px
+                log.info(f"  Fill @ {entry_p:.6g}")
+
+            mult       = 1 if side=="long" else -1
+            meta       = signal_meta or {}
+
+            # Si la señal provee SL/TP específicos (Dwell Blocks, UTBot, etc.)
+            if meta.get("sl") and meta.get("tp"):
+                sl  = float(e.price_to_precision(symbol, meta["sl"]))
+                # Convertir TP único a tres niveles
+                tp_dist = abs(meta["tp"] - entry_p)
+                tp1 = float(e.price_to_precision(symbol, entry_p + mult*tp_dist*0.40))
+                tp2 = float(e.price_to_precision(symbol, entry_p + mult*tp_dist*0.70))
+                tp3 = float(e.price_to_precision(symbol, entry_p + mult*tp_dist*1.00))
+            else:
+                sl  = float(e.price_to_precision(symbol, entry_p*(1-mult*sl_pct_n)))
+                tp1 = float(e.price_to_precision(symbol, entry_p*(1+mult*TP1_PCT/100)))
+                tp2 = float(e.price_to_precision(symbol, entry_p*(1+mult*TP2_PCT/100)))
+                tp3 = float(e.price_to_precision(symbol, entry_p*(1+mult*TP3_PCT/100)))
+
+            close_side = "sell" if side=="long" else "buy"
+            if not DRY_RUN:
+                place_tp(e,symbol,close_side,qty*0.50,tp1)
+                place_tp(e,symbol,close_side,qty*0.30,tp2)
+                place_tp(e,symbol,close_side,qty*0.20,tp3)
+                place_sl(e,symbol,close_side,qty,sl)
+
+            t = Trade(symbol=symbol,side=side,entry_price=entry_p,
+                      contracts=qty,tp1=tp1,tp2=tp2,tp3=tp3,sl=sl,
+                      entry_time=now(),strategy=strategy,
+                      sl_pct_used=sl_pct_n*100,trailing_high=entry_p,
+                      dry_run=DRY_RUN,
+                      dwell_high=meta.get("dwell_high",0.0),
+                      dwell_low=meta.get("dwell_low",0.0),
+                      rr_ratio=meta.get("rr_ratio",2.0))
+            st.trades[symbol]=t
+            csv_log("OPEN",t)
+            msg_open(t,bal,meta)
+            log.info(f"[OPEN] {symbol} {side.upper()} OK strat={strategy} size_mult={size_mult:.2f}")
+            return {"result":"opened","symbol":symbol,"side":side,"entry":entry_p,
+                    "qty":qty,"strategy":strategy,"size_mult":size_mult,"dry_run":DRY_RUN}
+
+        except Exception as err:
+            log.error(f"open_trade {symbol}: {err}")
+            brain.log_error("open_trade_error", str(err), strategy)
+            msg_error(f"open_trade {symbol}: {err}")
+            return {"result":"error","detail":str(err)}
 
 
-def close_grid(ex: ccxt.Exchange, symbol: str, reason: str):
-    """Cierra todos los pedidos del grid y lo elimina."""
-    if symbol not in state.grid_trades:
-        return
-    gt = state.grid_trades[symbol]
+def close_trade(raw_symbol: str, reason: str) -> dict:
+    with _lock:
+        symbol = sym(raw_symbol)
+        if symbol not in st.trades: return {"result":"not_found"}
+        t = st.trades[symbol]
+        try:
+            e = ex()
+            cancel_all_safe(symbol)
+            exit_p = price(symbol); pnl = 0.0
+
+            if t.dry_run:
+                pnl=((exit_p-t.entry_price) if t.side=="long" else (t.entry_price-exit_p))*t.contracts
+            else:
+                pos=get_position(symbol)
+                if pos:
+                    qty_pos=abs(float(pos.get("contracts") or pos.get("info",{}).get("positionAmt",0) or 0))
+                    if qty_pos>0:
+                        csid="sell" if t.side=="long" else "buy"
+                        ord_=ex_call(e.create_order,symbol,"market",csid,qty_pos,params={"reduceOnly":True})
+                        exit_p=float(ord_.get("average") or ord_.get("price") or exit_p)
+                        if exit_p==0: exit_p=price(symbol)
+                        pnl=((exit_p-t.entry_price) if t.side=="long" else (t.entry_price-exit_p))*qty_pos
+                    else:
+                        pnl=((exit_p-t.entry_price) if t.side=="long" else (t.entry_price-exit_p))*t.contracts
+                else:
+                    pnl=((exit_p-t.entry_price) if t.side=="long" else (t.entry_price-exit_p))*t.contracts
+
+            dur = _dur(t.entry_time)
+            st.closed_history.append({
+                "symbol":t.symbol,"side":t.side,"entry":t.entry_price,"exit":exit_p,
+                "pnl":round(pnl,4),"reason":reason,"duration":dur,"ts":now(),
+                "strategy":t.strategy,"dry_run":t.dry_run
+            })
+            if len(st.closed_history)>100: st.closed_history=st.closed_history[-100:]
+
+            st.record_close(pnl, symbol, t.strategy)
+
+            # BRAIN: registrar resultado
+            hour = datetime.now(timezone.utc).hour
+            brain.record_result(t.strategy, pnl, {
+                "symbol": symbol, "side": t.side,
+                "duration_min": int((time.time()-
+                    datetime.strptime(t.entry_time,"%Y-%m-%d %H:%M UTC")
+                    .replace(tzinfo=timezone.utc).timestamp())/60) if t.entry_time else 0,
+                "hour_utc": hour,
+                "sl_adj": t.sl_pct_used,
+                "reason": reason
+            })
+
+            csv_log("CLOSE",t,exit_p,pnl)
+            msg_close(t,exit_p,pnl,reason)
+            del st.trades[symbol]
+            save_state(); save_brain()
+
+            # Notificar si estrategia fue pausada tras esta operación
+            sb = brain.get(t.strategy)
+            if not sb.is_active() and sb.paused_until > time.time():
+                tg(f"🧠 <b>Auto-aprendizaje</b>: estrategia <code>{t.strategy}</code> "
+                   f"pausada 4h\n📉 Motivo: {sb.pause_reason}\n{now()}")
+
+            return {"result":"closed","pnl":round(pnl,4)}
+        except Exception as err:
+            log.error(f"close_trade {symbol}: {err}")
+            brain.log_error("close_trade_error", str(err), t.strategy)
+            msg_error(f"close_trade {symbol}: {err}")
+            return {"result":"error","detail":str(err)}
+
+
+def handle_tp(raw_symbol: str, tp_label: str) -> dict:
+    with _lock:
+        symbol = sym(raw_symbol)
+        if symbol not in st.trades: return {"result":"not_found"}
+        t = st.trades[symbol]
+        try:
+            e=ex(); pos=get_position(symbol)
+            rem=str(round(abs(float(pos.get("contracts") or
+                pos.get("info",{}).get("positionAmt",0) or 0)),4)) if pos else "~"
+
+            if tp_label=="TP1" and not t.tp1_hit:
+                t.tp1_hit=True
+                pnl_est=abs(t.tp1-t.entry_price)*t.contracts*0.50
+                if not t.dry_run:
+                    try:
+                        be=float(e.price_to_precision(symbol,t.entry_price))
+                        csid="sell" if t.side=="long" else "buy"
+                        cancel_all_safe(symbol); rem_qty=t.contracts*0.50
+                        place_tp(e,symbol,csid,rem_qty*0.60,t.tp2)
+                        place_tp(e,symbol,csid,rem_qty*0.40,t.tp3)
+                        place_sl(e,symbol,csid,rem_qty,be)
+                        t.sl=be; t.sl_at_be=True; t.trailing_on=True
+                        t.trailing_high=price(symbol)
+                    except Exception as be_err: log.warning(f"  BE: {be_err}")
+                else: t.sl_at_be=True; t.trailing_on=True
+                msg_tp(t,"TP1",pnl_est,rem)
+
+            elif tp_label=="TP2" and not t.tp2_hit:
+                t.tp2_hit=True
+                pnl_est=abs(t.tp2-t.entry_price)*t.contracts*0.30
+                msg_tp(t,"TP2",pnl_est,rem)
+
+            elif tp_label=="TP3":
+                pnl_est=abs(t.tp3-t.entry_price)*t.contracts*0.20
+                msg_tp(t,"TP3",pnl_est,"0")
+                st.record_close(pnl_est,symbol,t.strategy)
+                brain.record_result(t.strategy, pnl_est, {"symbol":symbol,"reason":"TP3"})
+                csv_log("CLOSE",t,t.tp3,pnl_est)
+                if symbol in st.trades: del st.trades[symbol]
+                save_state(); save_brain()
+
+            return {"result":f"{tp_label}_handled"}
+        except Exception as err:
+            log.error(f"handle_tp {symbol} {tp_label}: {err}")
+            return {"result":"error","detail":str(err)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────────────────────────────────────
+_tg_queue=deque(maxlen=50); _tg_q_lock=threading.Lock()
+def _tg_raw(msg: str, silent=False):
+    if not(TG_TOKEN and TG_CHAT_ID): return
     try:
-        ex.cancel_all_orders(symbol)
+        r=requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            data={"chat_id":TG_CHAT_ID,"text":msg[:4096],"parse_mode":"HTML","disable_notification":silent},
+            timeout=15)
+        if not r.ok: log.warning(f"TG {r.status_code}"); return
+    except Exception as e: log.warning(f"TG: {e}")
+
+def tg(msg, silent=False):
+    if not(TG_TOKEN and TG_CHAT_ID): return
+    try: _tg_raw(msg, silent)
     except Exception as e:
-        log.warning(f"[GRID] cancel {symbol}: {e}")
-    tg(f"🔲 <b>GRID CERRADO</b> — {symbol} ({reason})\n"
-       f"Trades: {gt.n_trades} | PnL total: ${gt.total_pnl:+.3f}\n"
-       f"⏰ {utcnow()}")
-    del state.grid_trades[symbol]
+        log.warning(f"TG: {e}")
+        with _tg_q_lock: _tg_queue.append(msg)
 
+def _tg_retry_worker():
+    while True:
+        time.sleep(30)
+        with _tg_q_lock: pending=list(_tg_queue); _tg_queue.clear()
+        for m in pending:
+            try: _tg_raw(m)
+            except Exception: pass
 
-# ══════════════════════════════════════════════════════════
-# MAIN LOOP
-# ══════════════════════════════════════════════════════════
-def main():
-    global HEDGE_MODE
+def now(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _bar(v,mx,w=10): f=int(min(v/mx,1.0)*w) if mx>0 else 0; return "█"*f+"░"*(w-f)
+def _dur(ts):
+    try:
+        dt=datetime.strptime(ts,"%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        s=int((datetime.now(timezone.utc)-dt).total_seconds()); h,r=divmod(s,3600)
+        return f"{h}h {r//60}m" if h else f"{r//60}m"
+    except Exception: return "?"
 
-    log.info("=" * 65)
-    log.info("  SATY ELITE v18 — DCA + ANTI-LOSS · 24/7")
-    log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI")
-    log.info("=" * 65)
+def _strat_emoji(strat):
+    return {"dwell_blocks":"🧱","utbot":"🤖","bb_rsi":"🎯","ema_trend":"📈","webhook":"📡"}.get(strat,"⚡")
 
-    if not (API_KEY and API_SECRET):
-        log.warning("DRY-RUN: sin claves API")
-        while True: log.info("DRY-RUN..."); time.sleep(POLL_SECS)
+# ─────────────────────────────────────────────────────────────────────────────
+# MENSAJES ENRIQUECIDOS
+# ─────────────────────────────────────────────────────────────────────────────
+def msg_start(bal):
+    strats_status = ""
+    for s in ALL_STRATEGIES:
+        sb=brain.get(s); icon="✅" if sb.is_active() else "⏸"
+        strats_status += f"  {icon} {_strat_emoji(s)} {s}: WR={sb.wr()*100:.0f}% W={sb.weight:.2f}\n"
+    tg(
+        f"<b>🔥 SAIYAN ELITE v6.0 — ONLINE</b>\n"
+        f"{'🔸 DRY-RUN ACTIVO\n' if DRY_RUN else ''}"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Balance: <b>${bal:.2f} USDT</b>\n"
+        f"⚙️ ${FIXED_USDT:.0f}/trade x{LEVERAGE} | max {MAX_OPEN_TRADES} pos\n"
+        f"🎯 TP1+{TP1_PCT}% TP2+{TP2_PCT}% TP3+{TP3_PCT}% SL-{SL_PCT}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 <b>Auto-Mejora Activa:</b>\n"
+        f"  Score mínimo: {MIN_STRATEGY_SCORE*100:.0f}% | Ventana: {LEARNING_WINDOW} ops\n"
+        f"  DD pausa: {AUTO_PAUSE_DD_PCT}% | Horas bloq: {brain.blocked_hours or 'ninguna'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Estrategias:</b>\n{strats_status}"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔍 Scanner: {'✅ '+str(SCAN_SYMBOLS) if SCAN_ENABLED else '❌ OFF'}\n"
+        f"📲 /status /brain /pos /strats /pause /resume /help\n{now()}"
+    )
 
-    ex = None
+def msg_open(t, bal, meta=None):
+    icon="▲ LONG" if t.side=="long" else "▼ SHORT"
+    dry=" [DRY]" if t.dry_run else ""
+    sl_info=f"SL-{t.sl_pct_used:.2f}% (adj)" if t.sl_pct_used!=SL_PCT else f"SL-{SL_PCT}%"
+    dwell_info=""
+    if t.dwell_high and t.dwell_low:
+        dwell_info=f"🧱 Dwell: {t.dwell_low:.6g} – {t.dwell_high:.6g}\n"
+    tg(
+        f"{_strat_emoji(t.strategy)} <b>{icon}{dry}</b> — <code>{t.symbol}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 Entrada: <code>{t.entry_price:.6g}</code> | Strat: <b>{t.strategy}</b>\n"
+        f"🟡 TP1 50%: <code>{t.tp1:.6g}</code>\n"
+        f"🟠 TP2 30%: <code>{t.tp2:.6g}</code>\n"
+        f"🟢 TP3 20%: <code>{t.tp3:.6g}</code>\n"
+        f"🛑 SL: <code>{t.sl:.6g}</code>  {sl_info}\n"
+        f"{dwell_info}"
+        f"📦 {t.contracts} contratos | R:R {t.rr_ratio:.1f}\n"
+        f"🧠 Brain weight: {brain.get(t.strategy).weight:.2f}\n"
+        f"📊 {st.wins}W/{st.losses}L WR:{st.wr():.1f}% | {st.n()}/{MAX_OPEN_TRADES}\n"
+        f"💰 Bal: ${bal:.2f}\n{now()}"
+    )
+
+def msg_tp(t, label, pnl_est, rem):
+    extra="🛡 SL→BE + Trailing ON\n" if label=="TP1" else ""
+    tg(f"🏆 <b>{label} HIT</b> — <code>{t.symbol}</code>\n"
+       f"~${pnl_est:+.2f} | Restante: {rem}\n{extra}"
+       f"Hoy: ${st.daily_pnl:+.2f} | Total: ${st.total_pnl:+.2f}\n{now()}")
+
+def msg_trailing_update(t, new_sl, gain_pct):
+    tg(f"〽️ TRAILING <code>{t.symbol}</code> SL→<code>{new_sl:.6g}</code> +{gain_pct:.2f}%\n{now()}", silent=True)
+
+def msg_close(t, exit_p, pnl, reason):
+    e="✅" if pnl>=0 else "❌"
+    pct=(exit_p-t.entry_price)/t.entry_price*100*(1 if t.side=="long" else -1)
+    sb=brain.get(t.strategy)
+    tg(
+        f"{e} <b>CERRADO [{t.strategy}]</b> — {reason}\n"
+        f"<code>{t.symbol}</code> {t.side.upper()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<code>{t.entry_price:.6g}</code>→<code>{exit_p:.6g}</code> ({pct:+.2f}%)\n"
+        f"PnL: <b>${pnl:+.2f}</b>  ⏱{_dur(t.entry_time)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 {t.strategy} W={sb.weight:.2f} WR={sb.wr()*100:.0f}%\n"
+        f"📊 {st.wins}W/{st.losses}L WR:{st.wr():.1f}% PF:{st.pf():.2f}\n"
+        f"💹 Hoy: ${st.daily_pnl:+.2f} | Total: ${st.total_pnl:+.2f}\n{now()}"
+    )
+
+def msg_blocked(reason, action, symbol):
+    tg(f"⛔ <b>BLOQUEADO</b> — {reason}\n{action} {symbol}\n{now()}")
+def msg_error(txt):
+    tg(f"🔥 <b>ERROR:</b> <code>{txt[:400]}</code>\n{now()}")
+
+def msg_status():
+    try: bal=balance()
+    except Exception: bal=0.0
+    db=_bar(abs(st.daily_pnl),st.peak_equity*DAILY_LOSS_PCT/100 if st.peak_equity>0 else 1)
+    cb=_bar(abs(st.total_pnl) if st.total_pnl<0 else 0,st.peak_equity*CB_DD/100 if st.peak_equity>0 else 1)
+    tg(
+        f"📊 <b>STATUS — SAIYAN ELITE v6.0</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{'⏸ PAUSA\n' if st.paused else ''}"
+        f"{'🚨 CIRCUIT BREAKER\n' if st.cb() else ''}"
+        f"{'🚨 LIMITE DIARIO\n' if st.daily_hit() else ''}"
+        f"💰 ${bal:.2f} USDT | {st.n()}/{MAX_OPEN_TRADES} pos\n"
+        f"⏱ Uptime: {st.uptime()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 {st.wins}W/{st.losses}L WR:{st.wr():.1f}% PF:{st.pf():.2f}\n"
+        f"💡 E:${st.expectancy():.2f}/trade\n"
+        f"🏆 Best: ${st.best_trade:+.2f} | Worst: ${st.worst_trade:+.2f}\n"
+        f"💹 Hoy: ${st.daily_pnl:+.2f} [{db}]\n"
+        f"🛡 DD: [{cb}] Max:{st.max_dd_real:.1f}%\n"
+        f"💼 Total: ${st.total_pnl:+.2f}\n"
+        f"🧠 Horas bloq: {brain.blocked_hours or 'ninguna'}\n{now()}"
+    )
+
+def msg_brain_report():
+    lines = ["🧠 <b>BRAIN REPORT — Auto-Aprendizaje</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for s in ALL_STRATEGIES:
+        sb = brain.get(s)
+        active = "✅" if sb.is_active() else f"⏸ {sb.pause_reason[:30]}"
+        lines.append(
+            f"{_strat_emoji(s)} <b>{s}</b> {active}\n"
+            f"  WR:{sb.wr()*100:.0f}% ({sb.wins}W/{sb.losses}L) | PF:{sb.pf():.2f}\n"
+            f"  Weight:{sb.weight:.2f} | Recent WR:{sb.recent_wr()*100:.0f}% | DD:{sb.recent_dd():.1f}%\n"
+            f"  Total PnL: ${sb.total_pnl:+.2f}"
+        )
+    lines.append(f"\n⏰ Horas bloq: {brain.blocked_hours or 'ninguna'}")
+    lines.append(f"🔢 Errores: {brain.total_errors}")
+    lines.append(f"🏆 Mejor estrategia ahora: <b>{brain.best_strategy()}</b>")
+    tg("\n".join(lines))
+
+def msg_positions():
+    if not st.trades: tg("📦 <b>Sin posiciones abiertas</b>"); return
+    lines=[f"📦 <b>POSICIONES ({st.n()})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for sym_,t in st.trades.items():
+        try:
+            px=price(sym_); gain=(px-t.entry_price)/t.entry_price*100*(1 if t.side=="long" else -1)
+            icon="🟢" if gain>=0 else "🔴"
+            lines.append(
+                f"{icon} <code>{sym_}</code> {t.side.upper()} [{t.strategy}]\n"
+                f"   {t.entry_price:.6g}→{px:.6g} ({gain:+.2f}%) SL:{t.sl:.6g} ⏱{_dur(t.entry_time)}"
+            )
+        except Exception: lines.append(f"<code>{sym_}</code> {t.side.upper()}")
+    tg("\n".join(lines))
+
+def msg_strats():
+    lines=["📊 <b>ESTRATEGIAS STATUS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for s in ALL_STRATEGIES:
+        sb=brain.get(s); active="✅ Activa" if sb.is_active() else "⏸ Pausada"
+        lines.append(f"{_strat_emoji(s)} <b>{s}</b>: {active}\n"
+                     f"  WR:{sb.recent_wr()*100:.0f}% | Weight:{sb.weight:.2f} | PnL:${sb.total_pnl:+.2f}")
+    tg("\n".join(lines))
+
+def msg_heartbeat():
+    try:
+        bal=balance()
+        open_lines=""
+        for sym_,t in list(st.trades.items()):
+            try:
+                px=price(sym_); gain=(px-t.entry_price)/t.entry_price*100*(1 if t.side=="long" else -1)
+                open_lines+=f"  {'🟢' if gain>=0 else '🔴'} <code>{sym_}</code> {t.side.upper()} {gain:+.2f}% [{t.strategy}]\n"
+            except Exception: open_lines+=f"  <code>{sym_}</code>\n"
+        if not open_lines: open_lines="  (sin posiciones)\n"
+        best = brain.best_strategy()
+        db=_bar(abs(st.daily_pnl),st.peak_equity*DAILY_LOSS_PCT/100 if st.peak_equity>0 else 1)
+        tg(
+            f"💓 <b>HEARTBEAT</b> · {now()}\n"
+            f"💰 ${bal:.2f} | {st.n()}/{MAX_OPEN_TRADES} pos\n"
+            f"{open_lines}"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {st.wins}W/{st.losses}L WR:{st.wr():.1f}% PF:{st.pf():.2f}\n"
+            f"💹 Hoy: ${st.daily_pnl:+.2f} [{db}]\n"
+            f"🧠 Mejor strat: {best} | Horas bloq: {brain.blocked_hours or 'ninguna'}\n"
+            f"⏱ {st.uptime()}",
+            silent=True
+        )
+    except Exception as e: log.warning(f"heartbeat: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV
+# ─────────────────────────────────────────────────────────────────────────────
+def csv_log(action, t, exit_p=0.0, pnl=0.0):
+    try:
+        exists=os.path.exists(CSV_PATH)
+        with open(CSV_PATH,"a",newline="") as f:
+            w=csv.writer(f)
+            if not exists:
+                w.writerow(["ts","action","symbol","side","entry","exit","pnl","qty",
+                            "strategy","trailing","sl_at_be","sl_pct","dry_run"])
+            w.writerow([now(),action,t.symbol,t.side,t.entry_price,
+                        exit_p or t.entry_price,round(pnl,4),t.contracts,
+                        t.strategy,t.trailing_on,t.sl_at_be,t.sl_pct_used,t.dry_run])
+    except Exception as e: log.warning(f"CSV: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _trailing_worker():
+    log.info("Trailing worker iniciado")
+    while True:
+        time.sleep(15)
+        with _lock: symbols=list(st.trades.keys())
+        for symbol in symbols:
+            try:
+                with _lock:
+                    if symbol not in st.trades: continue
+                    t=st.trades[symbol]
+                px=price(symbol)
+                gain_pct=(px-t.entry_price)/t.entry_price*100*(1 if t.side=="long" else -1)
+                with _lock:
+                    if symbol not in st.trades: continue
+                    t=st.trades[symbol]
+                    if not t.trailing_on and gain_pct>=TRAILING_ACTIVATE:
+                        t.trailing_on=True; t.trailing_high=px
+                    if not t.trailing_on: continue
+                    if t.side=="long":
+                        if px>t.trailing_high: t.trailing_high=px
+                        new_sl=t.trailing_high*(1-TRAILING_PCT/100)
+                        if new_sl>t.sl:
+                            t.sl=new_sl; msg_trailing_update(t,new_sl,gain_pct); update_sl(t,new_sl)
+                    else:
+                        if t.trailing_high==0 or px<t.trailing_high: t.trailing_high=px
+                        new_sl=t.trailing_high*(1+TRAILING_PCT/100)
+                        if new_sl<t.sl:
+                            t.sl=new_sl; msg_trailing_update(t,new_sl,gain_pct); update_sl(t,new_sl)
+            except Exception as e: log.warning(f"Trailing [{symbol}]: {e}")
+
+def _heartbeat_worker():
+    time.sleep(90)
+    while True: msg_heartbeat(); time.sleep(HEARTBEAT_MIN*60)
+
+def _daily_worker():
+    while True:
+        nu=datetime.now(timezone.utc)
+        tomorrow=(nu+timedelta(days=1)).replace(hour=0,minute=0,second=5,microsecond=0)
+        time.sleep((tomorrow-nu).total_seconds())
+        tg(f"📉 <b>RESUMEN DIARIO</b>\n"
+           f"PnL: ${st.daily_pnl:+.2f} | {st.wins}W/{st.losses}L\n"
+           f"Total: ${st.total_pnl:+.2f} | MaxDD: {st.max_dd_real:.1f}%\n{now()}")
+        with _lock: st.daily_pnl=0.0; st.daily_reset_ts=time.time()
+        save_state(); save_brain()
+
+def _autosave_worker():
+    while True: time.sleep(300); save_state(); save_brain()
+
+def _tg_commands_worker():
+    if not(TG_TOKEN and TG_CHAT_ID): return
+    log.info("Telegram polling iniciado")
+    while True:
+        try:
+            r=requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                params={"timeout":30,"offset":st.tg_offset,"allowed_updates":["message"]},timeout=40)
+            if not r.ok: time.sleep(5); continue
+            for upd in r.json().get("result",[]):
+                st.tg_offset=upd["update_id"]+1
+                m=upd.get("message",{}); cid=str(m.get("chat",{}).get("id","")); txt=m.get("text","").strip().lower()
+                if cid!=str(TG_CHAT_ID): continue
+                if txt in("/status","/s"):       msg_status()
+                elif txt in("/brain","/b"):      msg_brain_report()
+                elif txt in("/pos","/p"):        msg_positions()
+                elif txt in("/strats","/st"):    msg_strats()
+                elif txt=="/pause":
+                    with _lock: st.paused=True
+                    tg("⏸ Bot en PAUSA. /resume para reanudar.")
+                elif txt=="/resume":
+                    with _lock: st.paused=False
+                    tg("▶️ Bot REANUDADO.")
+                elif txt.startswith("/close "):
+                    raw=txt.split("/close ",1)[1].strip().upper()
+                    tg(f"Cerrando {raw}...")
+                    res=close_trade(raw,"MANUAL")
+                    tg(f"{'✅' if res.get('result')=='closed' else '❌'} PnL: ${res.get('pnl',0):+.2f}")
+                elif txt.startswith("/scan "):
+                    # Escanea un símbolo específico inmediatamente
+                    raw=txt.split("/scan ",1)[1].strip().upper()
+                    tg(f"🔍 Escaneando {raw}...")
+                    results=[]
+                    for sname,sfn in [(STRAT_DWELL,strategy_dwell_blocks),
+                                      (STRAT_BBRSI,strategy_bbrsi),
+                                      (STRAT_EMA,strategy_ema_trend),
+                                      (STRAT_UTBOT,strategy_utbot)]:
+                        try:
+                            sig=sfn(sym(raw))
+                            if sig: results.append(f"  ✅ {sname}: {sig['side'].upper()}")
+                            else: results.append(f"  ⬜ {sname}: sin señal")
+                        except Exception as se: results.append(f"  ❌ {sname}: error")
+                    tg(f"📊 <b>Scan {raw}:</b>\n"+"\n".join(results)+f"\n{now()}")
+                elif txt=="/unblock_hours":
+                    with _lock: brain.blocked_hours.clear(); brain.bad_hours.clear()
+                    tg("🧠 Horas bloqueadas liberadas.")
+                elif txt=="/help":
+                    tg(
+                        "<b>Comandos SAIYAN ELITE v6.0:</b>\n"
+                        "/status — estado\n/brain — reporte auto-aprendizaje\n"
+                        "/pos — posiciones\n/strats — estrategias\n"
+                        "/scan SYMBOL — escanear símbolo\n"
+                        "/pause /resume — pausar/reanudar\n"
+                        "/close SYMBOL — cierre manual\n"
+                        "/unblock_hours — liberar horas bloqueadas\n"
+                        "/help — esta ayuda\n\n"
+                        "<b>Webhook:</b>\n"
+                        f'<code>{{"secret":"{WEBHOOK_SECRET}","action":"long entry","symbol":"BTCUSDT"}}</code>\n'
+                        "<b>Acciones:</b> long entry|short entry|buy|sell|tp1|tp2|tp3|close|stop loss"
+                    )
+        except requests.exceptions.Timeout: pass
+        except Exception as e: log.warning(f"tg_cmd: {e}"); time.sleep(10)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEBHOOK PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+_ACTION_MAP={
+    "long entry":"long_entry","long_entry":"long_entry","buy":"long_entry","long":"long_entry",
+    "openlong":"long_entry","enter_long":"long_entry","bullish":"long_entry",
+    "short entry":"short_entry","short_entry":"short_entry","sell":"short_entry","short":"short_entry",
+    "openshort":"short_entry","enter_short":"short_entry","bearish":"short_entry",
+    "long exit":"close_long","long_exit":"close_long",
+    "short exit":"close_short","short_exit":"close_short",
+    "exit":"close","close":"close","close_trade":"close",
+    "stop loss":"stop_loss","stop_loss":"stop_loss","stoploss":"stop_loss","sl":"stop_loss","stop":"stop_loss",
+    "tp1":"tp1","tp1 hit":"tp1","take profit 1":"tp1",
+    "tp2":"tp2","tp2 hit":"tp2","take profit 2":"tp2",
+    "tp3":"tp3","tp3 hit":"tp3","take profit 3":"tp3","take profit":"tp3",
+    # Dwell blocks desde TradingView
+    "dwell long":"long_entry","dwell short":"short_entry",
+    "breakout long":"long_entry","breakout short":"short_entry",
+}
+def parse_action(raw):
+    clean=raw.strip().lower()
+    if clean in _ACTION_MAP: return _ACTION_MAP[clean]
+    for k,v in _ACTION_MAP.items():
+        if k in clean: return v
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLASK
+# ─────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/",methods=["GET"])
+def health():
+    return jsonify({
+        "status":"alive","bot":"SAIYAN ELITE v6.0","dry_run":DRY_RUN,
+        "paused":st.paused,"uptime":st.uptime(),"open_trades":st.n(),
+        "total_trades":st.total_trades,"wins":st.wins,"losses":st.losses,
+        "win_rate":round(st.wr(),1),"profit_factor":round(st.pf(),2),
+        "expectancy":round(st.expectancy(),2),"total_pnl":round(st.total_pnl,2),
+        "daily_pnl":round(st.daily_pnl,2),"circuit_breaker":st.cb(),
+        "best_strategy":brain.best_strategy(),"blocked_hours":brain.blocked_hours,
+        "time":now()
+    })
+
+@app.route("/brain",methods=["GET"])
+def brain_ep():
+    return jsonify(brain.to_dict())
+
+@app.route("/positions",methods=["GET"])
+def positions_ep():
+    result={}
+    for sym_,t in st.trades.items():
+        try: px=price(sym_); u=(px-t.entry_price)/t.entry_price*100*(1 if t.side=="long" else -1)
+        except Exception: px,u=0.0,0.0
+        result[sym_]={**t.__dict__,"current_price":px,"unrealized_pct":round(u,2)}
+    return jsonify(result)
+
+@app.route("/scan/<raw_sym>",methods=["GET"])
+def scan_ep(raw_sym):
+    symbol=sym(raw_sym.upper())
+    results={}
+    for sname,sfn in [(STRAT_DWELL,strategy_dwell_blocks),(STRAT_BBRSI,strategy_bbrsi),
+                      (STRAT_EMA,strategy_ema_trend),(STRAT_UTBOT,strategy_utbot)]:
+        try: results[sname]=sfn(symbol) or "no_signal"
+        except Exception as e: results[sname]=f"error: {e}"
+    return jsonify({"symbol":symbol,"signals":results,"time":now()})
+
+@app.route("/history",methods=["GET"])
+def history_ep():
+    return jsonify({"trades":st.closed_history[-20:]})
+
+@app.route("/dashboard",methods=["GET"])
+def dashboard():
+    try: bal=balance()
+    except Exception: bal=0.0
+    color="#00ff88" if st.total_pnl>=0 else "#ff4444"
+    rows=""
+    for t in reversed(st.closed_history[-10:]):
+        pc="#00ff88" if t["pnl"]>=0 else "#ff4444"
+        rows+=(f"<tr><td>{t['ts']}</td><td>{t['symbol']}</td><td>{t['side'].upper()}</td>"
+               f"<td style='color:{pc}'>${t['pnl']:+.2f}</td><td>{t['reason']}</td>"
+               f"<td>{t.get('strategy','?')}</td><td>{t['duration']}</td></tr>")
+    open_rows=""
+    for sym_,t in st.trades.items():
+        try: px=price(sym_); g=(px-t.entry_price)/t.entry_price*100*(1 if t.side=="long" else -1)
+        except Exception: px,g=0.0,0.0
+        gc="#00ff88" if g>=0 else "#ff4444"
+        open_rows+=(f"<tr><td>{sym_}</td><td>{t.side.upper()}</td>"
+                    f"<td>{t.entry_price:.6g}</td><td>{px:.6g}</td>"
+                    f"<td style='color:{gc}'>{g:+.2f}%</td>"
+                    f"<td>{t.strategy}</td><td>{_dur(t.entry_time)}</td></tr>")
+    strat_rows=""
+    for s in ALL_STRATEGIES:
+        sb=brain.get(s); color_s="#00ff88" if sb.is_active() else "#ff8800"
+        strat_rows+=(f"<tr><td>{s}</td>"
+                     f"<td style='color:{color_s}'>{'Activa' if sb.is_active() else 'Pausada'}</td>"
+                     f"<td>{sb.recent_wr()*100:.0f}%</td><td>{sb.pf():.2f}</td>"
+                     f"<td>{sb.weight:.2f}</td><td>${sb.total_pnl:+.2f}</td></tr>")
+    html=f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="30"><title>SAIYAN ELITE v6.0</title>
+<style>
+body{{background:#0a0a0a;color:#e0e0e0;font-family:monospace;margin:20px}}
+h1{{color:#ff6600}} h2{{color:#ff9900;margin-top:30px}}
+.card{{background:#141414;border:1px solid #333;border-radius:8px;padding:15px;
+       display:inline-block;margin:8px;min-width:130px;text-align:center}}
+.big{{font-size:1.7em;font-weight:bold}}
+.sub{{color:#888;font-size:.8em}}
+table{{width:100%;border-collapse:collapse;margin-top:8px}}
+th{{background:#1e1e1e;padding:8px;text-align:left;color:#ff9900}}
+td{{padding:6px 8px;border-bottom:1px solid #1e1e1e}}
+tr:hover{{background:#141414}}
+.badge{{background:#333;padding:2px 6px;border-radius:4px;font-size:.8em}}
+</style></head><body>
+{'<div style="background:#ff8800;color:#000;padding:10px;text-align:center;font-weight:bold">⏸ BOT EN PAUSA</div>' if st.paused else ""}
+{'<div style="background:#3366ff;color:#fff;padding:8px;text-align:center">🔸 DRY-RUN ACTIVO</div>' if DRY_RUN else ""}
+<h1>🔥 SAIYAN ELITE v6.0 — Multi-Estrategia + Auto-Mejora</h1>
+<div class="sub">Auto-refresh 30s · {now()}</div>
+<div>
+<div class="card"><div class="sub">Balance</div><div class="big">${bal:.2f}</div></div>
+<div class="card"><div class="sub">PnL Total</div><div class="big" style="color:{color}">${st.total_pnl:+.2f}</div></div>
+<div class="card"><div class="sub">Hoy</div><div class="big" style="color:{'#00ff88' if st.daily_pnl>=0 else '#ff4444'}">${st.daily_pnl:+.2f}</div></div>
+<div class="card"><div class="sub">Win Rate</div><div class="big">{st.wr():.1f}%</div><div class="sub">{st.wins}W/{st.losses}L</div></div>
+<div class="card"><div class="sub">Profit Factor</div><div class="big">{st.pf():.2f}</div></div>
+<div class="card"><div class="sub">Expectancy</div><div class="big" style="color:{'#00ff88' if st.expectancy()>=0 else '#ff4444'}">${st.expectancy():.2f}</div></div>
+<div class="card"><div class="sub">Max DD</div><div class="big" style="color:#ff4444">{st.max_dd_real:.1f}%</div></div>
+<div class="card"><div class="sub">Uptime</div><div class="big" style="font-size:1em">{st.uptime()}</div></div>
+</div>
+<h2>🧠 Estrategias (Auto-Mejora)</h2>
+<table><tr><th>Estrategia</th><th>Estado</th><th>WR Reciente</th><th>PF</th><th>Weight</th><th>PnL</th></tr>
+{strat_rows}</table>
+<p style="color:#888">Horas bloqueadas: {brain.blocked_hours or 'ninguna'} | Errores: {brain.total_errors}</p>
+<h2>📦 Posiciones ({st.n()}/{MAX_OPEN_TRADES})</h2>
+<table><tr><th>Símbolo</th><th>Lado</th><th>Entrada</th><th>Precio</th><th>PnL%</th><th>Estrategia</th><th>Tiempo</th></tr>
+{open_rows or "<tr><td colspan='7' style='color:#666;text-align:center'>Sin posiciones</td></tr>"}
+</table>
+<h2>📜 Últimas 10 operaciones</h2>
+<table><tr><th>Fecha</th><th>Símbolo</th><th>Lado</th><th>PnL</th><th>Razón</th><th>Estrategia</th><th>Duración</th></tr>
+{rows or "<tr><td colspan='7' style='color:#666;text-align:center'>Sin historial</td></tr>"}
+</table>
+<h2>🔌 Webhook TradingView</h2>
+<div style="background:#0d0d0d;padding:12px;border-radius:6px;color:#0f0">
+{{"secret": "{WEBHOOK_SECRET}", "action": "long entry", "symbol": "{{{{ticker}}}}"}}
+</div>
+<p style="color:#888">Estrategias Pine: dwell long | breakout long | breakout short</p>
+</body></html>"""
+    return Response(html, mimetype="text/html")
+
+@app.route("/webhook",methods=["POST"])
+def webhook():
+    try:
+        data=request.get_json(force=True,silent=True) or {}
+        log.info(f"Webhook: {data}")
+        incoming=str(data.get("secret",data.get("passphrase",data.get("key",""))))
+        if incoming!=WEBHOOK_SECRET:
+            log.warning(f"No autorizado: '{incoming}'"); return jsonify({"error":"unauthorized"}),401
+        action_raw=str(data.get("action",data.get("signal",data.get("order","")))).strip()
+        symbol_raw=str(data.get("symbol",data.get("ticker",data.get("pair","")))).strip()
+        if not action_raw: return jsonify({"error":"falta action"}),400
+        if not symbol_raw: return jsonify({"error":"falta symbol"}),400
+        st.reset_daily()
+        action=parse_action(action_raw)
+        if action is None:
+            tg(f"⚠️ Acción no reconocida: <code>{action_raw}</code>\n{now()}")
+            return jsonify({"error":f"unknown: {action_raw}"}),400
+        log.info(f"  action='{action}' symbol='{symbol_raw}'")
+        # Detectar si viene estrategia en el payload
+        strat=data.get("strategy", data.get("source", STRAT_WEBHOOK))
+        if action=="long_entry":        res=open_trade(symbol_raw,"long",strategy=strat)
+        elif action=="short_entry":     res=open_trade(symbol_raw,"short",strategy=strat)
+        elif action=="close_long":      res=close_trade(symbol_raw,"LONG EXIT")
+        elif action=="close_short":     res=close_trade(symbol_raw,"SHORT EXIT")
+        elif action=="close":           res=close_trade(symbol_raw,"EXIT SIGNAL")
+        elif action=="stop_loss":       res=close_trade(symbol_raw,"STOP LOSS")
+        elif action=="tp1":             res=handle_tp(symbol_raw,"TP1")
+        elif action=="tp2":             res=handle_tp(symbol_raw,"TP2")
+        elif action=="tp3":             res=handle_tp(symbol_raw,"TP3")
+        else: return jsonify({"error":f"sin handler: {action}"}),400
+        return jsonify(res),200
+    except Exception as e:
+        log.exception(f"Webhook crash: {e}")
+        msg_error(f"Webhook: {e}")
+        return jsonify({"error":str(e)}),500
+
+@app.route("/test",methods=["GET","POST"])
+def test_ep():
+    if request.method=="POST":
+        data=request.get_json(force=True,silent=True) or {}
+        ar=str(data.get("action",""))
+        return jsonify({"action_raw":ar,"action_parsed":parse_action(ar),
+                        "symbol_parsed":sym(data.get("symbol","BTCUSDT")),
+                        "secret_ok":data.get("secret","")==WEBHOOK_SECRET})
+    return jsonify({"example":{"secret":WEBHOOK_SECRET,"action":"long entry","symbol":"BTCUSDT"}})
+
+@app.route("/test_telegram",methods=["GET"])
+def test_tg():
+    try: tg(f"🧪 Test Telegram OK — SAIYAN ELITE v6.0\n{now()}"); return jsonify({"result":"ok"})
+    except Exception as e: return jsonify({"result":"error","detail":str(e)}),500
+
+@app.route("/test_exchange",methods=["GET"])
+def test_ex():
+    try: bal=balance(); return jsonify({"result":"ok","balance_usdt":bal})
+    except Exception as e: return jsonify({"result":"error","detail":str(e)}),500
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────────────────────────────────────────
+def startup():
+    load_state(); load_brain()
+    log.info("━"*65)
+    log.info("  SAIYAN ELITE BOT v6.0 — Multi-Estrategia + Auto-Mejora")
+    log.info("━"*65)
+    log.info(f"  DRY-RUN: {'YES' if DRY_RUN else 'NO'} | Scan: {'ON' if SCAN_ENABLED else 'OFF'}")
+    log.info(f"  Símbolos: {SCAN_SYMBOLS}")
+    log.info("━"*65)
+    if not(API_KEY and API_SECRET): log.warning("No API keys")
+    if not(TG_TOKEN and TG_CHAT_ID): log.warning("No Telegram")
     for attempt in range(10):
         try:
-            ex = build_exchange()
-            log.info("Exchange conectado ✓")
-            break
+            bal=balance()
+            if st.peak_equity==0: st.peak_equity=bal
+            st.daily_reset_ts=time.time()
+            log.info(f"Balance: ${bal:.2f} | Trades: {st.total_trades}")
+            msg_start(bal); break
         except Exception as e:
-            wait = min(2 ** attempt, 120)
-            log.warning(f"Conexión {attempt+1}/10: {e} — retry {wait}s")
-            time.sleep(wait)
+            wait=min(2**attempt,60)
+            log.warning(f"Startup {attempt+1}/10: {e} — retry {wait}s"); time.sleep(wait)
+    else:
+        log.error("No conecta BingX")
+        tg(f"❌ SAIYAN ELITE v6.0 ERROR\nNo conecta BingX\n{now()}")
 
-    if ex is None:
-        raise RuntimeError("No se pudo conectar al exchange")
+threading.Thread(target=startup,              daemon=True,name="startup").start()
+threading.Thread(target=_trailing_worker,     daemon=True,name="trailing").start()
+threading.Thread(target=_heartbeat_worker,    daemon=True,name="heartbeat").start()
+threading.Thread(target=_daily_worker,        daemon=True,name="daily").start()
+threading.Thread(target=_autosave_worker,     daemon=True,name="autosave").start()
+threading.Thread(target=_tg_retry_worker,     daemon=True,name="tg_retry").start()
+threading.Thread(target=_tg_commands_worker,  daemon=True,name="tg_cmd").start()
+threading.Thread(target=_scanner_worker,      daemon=True,name="scanner").start()
 
-    HEDGE_MODE = detect_hedge_mode(ex)
-    log.info(f"Modo cuenta: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'}")
-
-    balance = 0.0
-    for i in range(10):
-        try:
-            balance = get_balance(ex)
-            break
-        except Exception as e:
-            log.warning(f"get_balance {i+1}/10: {e}")
-            time.sleep(5)
-
-    state.peak_equity    = balance
-    state.daily_reset_ts = time.time()
-    log.info(f"Balance: ${balance:.2f} USDT")
-
-    symbols: List[str] = []
-    while not symbols:
-        try:
-            ex.load_markets()
-            symbols = get_symbols(ex)
-        except Exception as e:
-            log.error(f"get_symbols: {e} — reintento 60s")
-            time.sleep(60)
-
-    update_btc_bias(ex)
-    tg_startup(balance, len(symbols))
-
-    scan_count    = 0
-    REFRESH_EVERY = max(1, 3600 // max(POLL_SECS, 1))
-    BTC_REFRESH   = max(1, 900  // max(POLL_SECS, 1))
-    HB_INTERVAL   = 3600
-
-    while True:
-        ts_start = time.time()
-        try:
-            scan_count += 1
-            state.reset_daily()
-            clear_cache()
-
-            log.info(
-                f"━━━ SCAN #{scan_count} "
-                f"{datetime.now(timezone.utc):%H:%M:%S} "
-                f"| {len(symbols)} pares "
-                f"| {state.open_count()}/{MAX_OPEN_TRADES} trades "
-                f"| bases: {list(state.bases_open().keys())} ━━━"
-            )
-
-            if scan_count % REFRESH_EVERY == 0:
-                try:
-                    ex.load_markets(); symbols = get_symbols(ex)
-                except Exception as e:
-                    log.warning(f"Refresh: {e}")
-
-            if scan_count % BTC_REFRESH == 0:
-                update_btc_bias(ex)
-
-            if time.time() - state.last_heartbeat > HB_INTERVAL:
-                try:
-                    tg_heartbeat(get_balance(ex))
-                    state.last_heartbeat = time.time()
-                except Exception:
-                    pass
-
-            if state.cb_active():
-                log.warning(f"CIRCUIT BREAKER >= {CB_DD}%")
-                time.sleep(POLL_SECS); continue
-
-            if state.daily_limit_hit():
-                log.warning(f"LÍMITE DIARIO >= {DAILY_LOSS_LIMIT}%")
-                time.sleep(POLL_SECS); continue
-
-            live_positions = get_all_positions(ex)
-
-            # ── Gestionar trades de tendencia abiertos ──
-            for sym in list(state.trades.keys()):
-                try:
-                    lp  = live_positions.get(sym)
-                    lp_ = float(lp["markPrice"]) if lp else get_last_price(ex, sym)
-                    res = scan_symbol(ex, sym)
-                    ls  = res["long_score"]  if res else 0
-                    ss  = res["short_score"] if res else 0
-                    atr = res["atr"]         if res else state.trades[sym].atr_entry
-                    manage_trade(ex, sym, lp_, atr, ls, ss, lp, res)
-                except Exception as e:
-                    log.warning(f"[{sym}] manage: {e}")
-
-            # ── Gestionar grids activos (mercado lateral) ──
-            for sym in list(state.grid_trades.keys()):
-                try:
-                    lp_ = get_last_price(ex, sym)
-                    manage_grid(ex, sym, lp_)
-                except Exception as e:
-                    log.warning(f"[GRID {sym}] manage: {e}")
-
-            # ── Buscar nuevas entradas ──
-            new_signals: List[dict] = []
-
-            if state.open_count() < MAX_OPEN_TRADES:
-                bases_open = state.bases_open()
-                to_scan    = [
-                    s for s in symbols
-                    if s not in state.trades
-                    and not state.in_cooldown(s)
-                    and not brain.is_blacklisted(s)      # 🧠 Brain blacklist
-                    and s.split("/")[0] not in bases_open
-                ]
-
-                log.info(f"Escaneando {len(to_scan)} pares "
-                         f"(excluidas bases: {list(bases_open.keys())})")
-
-                with ThreadPoolExecutor(max_workers=12) as pool:
-                    futures = {pool.submit(scan_symbol, ex, s): s for s in to_scan}
-                    results = [f.result() for f in as_completed(futures)
-                               if f.result() is not None]
-
-                for res in results:
-                    base       = res["base"]
-                    best_side  = None
-                    best_score = 0
-                    uptrend    = res["uptrend"]
-
-                    can_long  = (res["long_score"]  >= MIN_SCORE and res["is_trending"])
-                    can_short = (res["short_score"] >= MIN_SCORE and res["is_trending"])
-
-                    # ── FIX #1 — MACRO OVERRIDE (el más importante) ──
-                    # Si BTC RSI > 75 = rally extremo → CERO shorts (APE/STX lección)
-                    # Si BTC RSI < 25 = crash extremo → CERO longs
-                    # Ningún score, por alto que sea, supera el contexto macro
-                    if state.btc_rsi > 75:
-                        can_short = False   # BLOQUEADO: rally extremo, no contraría
-                    if state.btc_rsi < 25:
-                        can_long  = False   # BLOQUEADO: crash extremo, no contraría
-
-                    if BTC_FILTER:
-                        if state.btc_bear: can_long  = False
-                        if state.btc_bull: can_short = False
-
-                    if state.base_has_trade(base):
-                        continue
-
-                    # ── FIX #2 — FLIP COOLDOWN: ignorar pares con score inestable ──
-                    # STX: SHORT→LONG en 1 barra = ruido puro, no operar
-                    row = res.get("row")
-                    long_s  = res["long_score"]
-                    short_s = res["short_score"]
-                    score_diff = abs(long_s - short_s)
-                    if score_diff < 5:  # FIX#2: STX L:13 S:13 → diff=0 → skip (ruido)
-                        # Scores demasiado parecidos = par indeciso = skip
-                        continue
-
-                    # ── FIX #3 — GRID MODE con RSI filter ──
-                    # FARTCOIN grid lección: no abrir grid si RSI > 70 (está subiendo, no lateral)
-                    if (row is not None
-                            and bool(row.get("regime_chop", False))
-                            and res["symbol"] not in state.grid_trades
-                            and res["symbol"] not in state.trades
-                            and len(state.grid_trades) < GRID_MAX_ACTIVE):
-                        rsi_now = float(row.get("rsi", 50))
-                        if 35 <= rsi_now <= 65:  # FIX#3: FARTCOIN RSI 85 = no lateral. Grid solo si RSI neutral real
-                            try:
-                                open_grid(ex, res["symbol"],
-                                          float(row["close"]), float(row["atr"]))
-                            except Exception as ge:
-                                log.debug(f"[GRID] {res['symbol']}: {ge}")
-                        continue  # No abrir trade de tendencia en mercado chop
-
-                    if can_long  and res["long_score"]  > best_score:
-                        best_score = res["long_score"];  best_side = "long"
-                    if can_short and res["short_score"] > best_score:
-                        best_score = res["short_score"]; best_side = "short"
-
-                    if best_side:
-                        new_signals.append({
-                            "symbol":     res["symbol"],
-                            "base":       base,
-                            "side":       best_side,
-                            "score":      best_score,
-                            "row":        res["row"],
-                            "rsi":        res["rsi"],
-                            "smi":        res["smi"],
-                            "wt":         res["wt"],
-                            "uptrend":    uptrend,
-                            "whale_desc": res.get("whale_desc", ""),
-                        })
-
-                new_signals.sort(key=lambda x: x["score"], reverse=True)
-
-                for sig in new_signals:
-                    if state.open_count() >= MAX_OPEN_TRADES: break
-                    sym  = sig["symbol"]
-                    base = sig["base"]
-                    if sym in state.trades:        continue
-                    if state.base_has_trade(base): continue
-                    if state.in_cooldown(sym):      continue
-
-                    order_side = "buy" if sig["side"] == "long" else "sell"
-                    t = open_trade(ex, sym, base, order_side,
-                                   sig["score"], sig["row"], sig["uptrend"],
-                                   whale_desc=sig.get("whale_desc", ""))
-                    if t:
-                        state.trades[sym] = t
-
-            else:
-                log.info(f"Max trades alcanzado ({MAX_OPEN_TRADES})")
-
-            elapsed = time.time() - ts_start
-            log.info(
-                f"✓ {elapsed:.1f}s | señales:{len(new_signals)} | "
-                f"{state.wins}W/{state.losses}L | "
-                f"hoy:${state.daily_pnl:+.2f} | total:${state.total_pnl:+.2f}"
-            )
-
-            if scan_count % 20 == 0:
-                tg_summary(new_signals, len(symbols))
-
-        except ccxt.NetworkError as e:
-            log.warning(f"Network: {e} — 10s")
-            time.sleep(10)
-        except ccxt.ExchangeError as e:
-            log.error(f"Exchange: {e}")
-            tg(f"❌ Exchange: <code>{str(e)[:200]}</code>")
-        except KeyboardInterrupt:
-            log.info("Detenido.")
-            tg("🛑 <b>Bot detenido.</b>")
-            break
-        except Exception as e:
-            log.exception(f"Error: {e}")
-            tg_error(str(e))
-
-        elapsed = time.time() - ts_start
-        time.sleep(max(0, POLL_SECS - elapsed))
-
-
-if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except KeyboardInterrupt:
-            log.info("Detenido por usuario.")
-            break
-        except Exception as e:
-            log.exception(f"CRASH: {e}")
-            try: tg_error(f"CRASH — reinicio en 30s:\n{e}")
-            except Exception: pass
-            log.info("Reiniciando en 30s...")
-            time.sleep(30)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=PORT,debug=False)
