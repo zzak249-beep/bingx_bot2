@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         SATY ELITE v16 — GRAIL + BRAIN + GRID                          ║
+║         SATY ELITE v17 — ANTI-LOSS EDITION                          ║
 ║         BingX Perpetual Futures · 12 Trades · 24/7             ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  NUEVO v15 — 4 Pine Scripts + Whale Signals:                         ║
@@ -93,7 +93,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("saty_v16")
+log = logging.getLogger("saty_v17")
 
 # ══════════════════════════════════════════════════════════
 # CONFIG — variables de entorno
@@ -113,13 +113,13 @@ BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 # ── Capital ──
 FIXED_USDT       = 8.0  # Fijo: 8 USDT por trade con 12× apalancamiento
 LEVERAGE         = 12   # Apalancamiento fijo 12×
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "6"))    # Máx 6 con capital pequeño
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "9"))    # 9/25 — agresivo pero selectivo
-CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "12.0")) # Circuit breaker 12% — protege capital pequeño
-DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "6.0"))  # Límite diario 6% — para antes de sangrar
-COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "10"))   # 10 min cooldown — más oportunidades
-MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "0.8"))  # Spread más estricto — evita slippage
-MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "500000")) # 500K vol mínimo — liquidez real
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "2"))    # FIX#4: Máx 2 con $50 — 6 trades = 96% capital = cuenta muerta
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "15"))   # FIX#4: 15/25 — APE con 19/25 perdió igual, necesitamos calidad no cantidad
+CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "8.0"))  # 8% — para antes de que sea tarde
+DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "4.0"))  # 4% diario máx = ~$2 con $50
+COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "30"))   # FIX#2: 30 min — STX se abrió y cerró en el mismo minuto
+MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT",   "0.8"))  # Spread estricto
+MIN_VOLUME_USDT  = float(os.environ.get("MIN_VOLUME_USDT",  "1000000")) # FIX#4: 1M vol — solo pares top líquidos
 TOP_N_SYMBOLS    = int(os.environ.get("TOP_N_SYMBOLS",      "300"))
 BTC_FILTER       = os.environ.get("BTC_FILTER", "false").lower() == "true"  # OFF — captura long y short libremente
 
@@ -171,7 +171,7 @@ RSI_OS_LOW = 78; RSI_OS_HIGH = 90
 MAX_CONSEC_LOSS = 2   # Tras 2 pérdidas seguidas → reduce tamaño a la mitad
 USE_CB          = True
 HEDGE_MODE: bool = False
-CSV_PATH = "/tmp/saty_v16_trades.csv"
+CSV_PATH = "/tmp/saty_v17_trades.csv"
 
 
 # ══════════════════════════════════════════════════════════
@@ -204,7 +204,7 @@ def clear_cache():
 # Registra cada trade cerrado y analiza patrones para mejorar
 # Sin ML, sin GPU — estadística pura sobre trades reales
 # ══════════════════════════════════════════════════════════
-BRAIN_PATH = "/tmp/saty_v16_brain.json"
+BRAIN_PATH = "/tmp/saty_v17_brain.json"
 
 class TradingBrain:
     """
@@ -591,7 +591,7 @@ def tg(msg: str):
 
 def tg_startup(balance: float, n: int):
     tg(
-        f"<b>🚀 SATY ELITE v16 — GRAIL + BRAIN + GRID</b>\n"
+        f"<b>🚀 SATY ELITE v17 — ANTI-LOSS EDITION</b>\n"
         f"══════════════════════════════\n"
         f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
         f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
@@ -2156,13 +2156,13 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
 # Cuando regime_chop=True, activa un mini-grid de 5 niveles
 # Usa ATR para espaciar niveles, leverage reducido (3×)
 # ══════════════════════════════════════════════════════════
-GRID_LEVELS       = 5      # niveles arriba y abajo del centro
-GRID_ATR_MULT     = 0.6    # separación entre niveles = 0.6 × ATR
-GRID_LEVERAGE     = 3      # leverage reducido para grid (más seguro)
-GRID_USDT         = 4.0    # capital por nivel de grid (mitad del FIXED_USDT)
-GRID_MAX_ACTIVE   = 3      # máximo de grids activos simultáneamente
-GRID_EXPIRE_H     = 6      # cerrar grid si no llega a TP en 6 horas
-GRID_MIN_VOLUME   = 1_000_000  # volumen mínimo para grid (más estricto)
+GRID_LEVELS       = 3      # REDUCIDO: 3 niveles (antes 5 = demasiada exposición)
+GRID_ATR_MULT     = 0.7    # spacing ligeramente mayor = más margen entre niveles
+GRID_LEVERAGE     = 2      # REDUCIDO: 2× (antes 3× — con $50 es demasiado)
+GRID_USDT         = 2.0    # REDUCIDO: $2 por nivel (antes $4 = 360% exposición con $50)
+GRID_MAX_ACTIVE   = 1      # REDUCIDO: máx 1 grid a la vez (antes 3 = colapsaba margen)
+GRID_EXPIRE_H     = 4      # Cierre más rápido si no funciona (antes 6h)
+GRID_MIN_VOLUME   = 1_000_000  # Volumen mínimo para grid
 
 
 def open_grid(ex: ccxt.Exchange, symbol: str, price: float, atr: float):
@@ -2297,7 +2297,7 @@ def main():
     global HEDGE_MODE
 
     log.info("=" * 65)
-    log.info("  SATY ELITE v16 — GRAIL + BRAIN + GRID · 24/7")
+    log.info("  SATY ELITE v17 — ANTI-LOSS EDITION · 24/7")
     log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI")
     log.info("=" * 65)
 
@@ -2444,6 +2444,15 @@ def main():
                     can_long  = (res["long_score"]  >= MIN_SCORE and res["is_trending"])
                     can_short = (res["short_score"] >= MIN_SCORE and res["is_trending"])
 
+                    # ── FIX #1 — MACRO OVERRIDE (el más importante) ──
+                    # Si BTC RSI > 75 = rally extremo → CERO shorts (APE/STX lección)
+                    # Si BTC RSI < 25 = crash extremo → CERO longs
+                    # Ningún score, por alto que sea, supera el contexto macro
+                    if state.btc_rsi > 75:
+                        can_short = False   # BLOQUEADO: rally extremo, no contraría
+                    if state.btc_rsi < 25:
+                        can_long  = False   # BLOQUEADO: crash extremo, no contraría
+
                     if BTC_FILTER:
                         if state.btc_bear: can_long  = False
                         if state.btc_bull: can_short = False
@@ -2451,18 +2460,30 @@ def main():
                     if state.base_has_trade(base):
                         continue
 
-                    # ── 🔲 GRID MODE: mercado lateral → ganar en el rango ──
+                    # ── FIX #2 — FLIP COOLDOWN: ignorar pares con score inestable ──
+                    # STX: SHORT→LONG en 1 barra = ruido puro, no operar
                     row = res.get("row")
+                    long_s  = res["long_score"]
+                    short_s = res["short_score"]
+                    score_diff = abs(long_s - short_s)
+                    if score_diff < 5:  # FIX#2: STX L:13 S:13 → diff=0 → skip (ruido)
+                        # Scores demasiado parecidos = par indeciso = skip
+                        continue
+
+                    # ── FIX #3 — GRID MODE con RSI filter ──
+                    # FARTCOIN grid lección: no abrir grid si RSI > 70 (está subiendo, no lateral)
                     if (row is not None
                             and bool(row.get("regime_chop", False))
                             and res["symbol"] not in state.grid_trades
                             and res["symbol"] not in state.trades
                             and len(state.grid_trades) < GRID_MAX_ACTIVE):
-                        try:
-                            open_grid(ex, res["symbol"],
-                                      float(row["close"]), float(row["atr"]))
-                        except Exception as ge:
-                            log.debug(f"[GRID] {res['symbol']}: {ge}")
+                        rsi_now = float(row.get("rsi", 50))
+                        if 35 <= rsi_now <= 65:  # FIX#3: FARTCOIN RSI 85 = no lateral. Grid solo si RSI neutral real
+                            try:
+                                open_grid(ex, res["symbol"],
+                                          float(row["close"]), float(row["atr"]))
+                            except Exception as ge:
+                                log.debug(f"[GRID] {res['symbol']}: {ge}")
                         continue  # No abrir trade de tendencia en mercado chop
 
                     if can_long  and res["long_score"]  > best_score:
