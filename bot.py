@@ -1,32 +1,34 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         SATY ELITE v14 — PRECISION EDITION                      ║
+║         SATY ELITE v13 — FULL STRATEGY EDITION                  ║
 ║         BingX Perpetual Futures · 12 Trades · 24/7             ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  v13: UTBot · WaveTrend · Bj Bot R:R · BB+RSI · SMI            ║
+║  NUEVO v13 — 4 Pine Scripts integrados:                         ║
 ║                                                                  ║
-║  NUEVO v14 — 3 indicadores adicionales de alta precisión:       ║
+║  1. UTBot (HPotter/Yo_adriiiiaan)                               ║
+║     · ATR Trailing Stop line con Key Value configurable         ║
+║     · Señal: EMA cruza ATR Trailing Stop → punto score 13       ║
+║     · UTBot trailing como 2ª capa de protección                 ║
 ║                                                                  ║
-║  5. VWAP (Volume Weighted Average Price)                        ║
-║     · Precio ponderado por volumen (referencia institucional)   ║
-║     · LONG: precio > VWAP (confluencia alcista)                 ║
-║     · SHORT: precio < VWAP (confluencia bajista)                ║
-║     · Punto score 17/19                                         ║
+║  2. Instrument-Z (OscillateMatrix)                              ║
+║     · WaveTrend (TCI) oscillator → puntos score 14             ║
+║     · Divergencias WaveTrend                                    ║
+║     · TP/SL diferenciados UpTrend vs DownTrend                  ║
+║     · Trade Expiration (cierre por barras máximas)              ║
+║     · Mínimo profit para salidas de señal                       ║
 ║                                                                  ║
-║  6. Volume Delta (Buy vs Sell pressure)                         ║
-║     · Delta acumulado = buy_vol - sell_vol (N barras)           ║
-║     · LONG: delta positivo + creciendo                          ║
-║     · SHORT: delta negativo + cayendo                           ║
-║     · Punto score 18/19                                         ║
+║  3. Bj Bot (3Commas framework)                                  ║
+║     · Stops basados en Swing H/L + ATR buffer                  ║
+║     · R:R ratio configurable (Risk to Reward)                   ║
+║     · Trail trigger a X% del reward (rrExit)                   ║
+║     · MA cross signal → punto score 15                          ║
 ║                                                                  ║
-║  7. STC — Schaff Trend Cycle                                    ║
-║     · MACD + doble estocástico = señales más suaves y precisas  ║
-║     · LONG: STC > 25 y creciendo (señal de tendencia)          ║
-║     · SHORT: STC < 75 y cayendo (señal de tendencia)           ║
-║     · Punto score 19/19                                         ║
+║  4. BB+RSI (rouxam)                                             ║
+║     · Bollinger Bands oversold/overbought                       ║
+║     · BB signal filtrada por RSI → punto score 16              ║
 ║                                                                  ║
-║  Score total: 19 puntos | Score mínimo: 7/19                    ║
-║  FIXED_USDT default: 1 USDT por trade                           ║
+║  Score total: 16 puntos (antes 12)                              ║
+║  Score mínimo recomendado: 5 (ajustar según perfil)             ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 VARIABLES OBLIGATORIAS:
@@ -34,9 +36,8 @@ VARIABLES OBLIGATORIAS:
     TELEGRAM_BOT_TOKEN  TELEGRAM_CHAT_ID
 
 VARIABLES OPCIONALES — GENERALES:
-    MAX_OPEN_TRADES   def:12    FIXED_USDT      def:1
-    LEVERAGE          def:10    (apalancamiento por trade, 1-125)
-    MIN_SCORE         def:7     MAX_DRAWDOWN    def:15
+    MAX_OPEN_TRADES   def:12    FIXED_USDT      def:8
+    MIN_SCORE         def:5     MAX_DRAWDOWN    def:15
     DAILY_LOSS_LIMIT  def:8     MIN_VOLUME_USDT def:100000
     TOP_N_SYMBOLS     def:300   POLL_SECONDS    def:60
     TIMEFRAME         def:5m    HTF1            def:15m
@@ -71,19 +72,6 @@ VARIABLES — BJ BOT (Risk Management):
     SWING_LB   def:10   Lookback swing high/low (redefinible)
     MIN_PROFIT_PCT def:0.0  Mínimo profit % para cerrar por señal
     TRADE_EXPIRE_BARS def:0 Barras máx por trade (0=desactivado)
-
-VARIABLES — VWAP (nuevo v14):
-    VWAP_LEN   def:20   Ventana rolling para VWAP (barras)
-
-VARIABLES — VOLUME DELTA (nuevo v14):
-    VDELTA_LEN def:10   Barras para acumulación delta
-
-VARIABLES — STC / Schaff Trend Cycle (nuevo v14):
-    STC_FAST   def:23   EMA rápida del MACD interno
-    STC_SLOW   def:50   EMA lenta del MACD interno
-    STC_CYCLE  def:10   Período estocástico del STC
-    STC_OB     def:75   Zona sobrecompra STC (para SHORT)
-    STC_OS     def:25   Zona sobreventa STC (para LONG)
 """
 
 import os, time, logging, csv
@@ -123,10 +111,10 @@ _bl = os.environ.get("BLACKLIST", "")
 BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 
 # ── Capital ──
-FIXED_USDT       = float(os.environ.get("FIXED_USDT",       "1.0"))
-LEVERAGE         = int(os.environ.get("LEVERAGE",           "10"))   # apalancamiento (1-125)
+FIXED_USDT       = 8.0  # Fijo: 8 USDT por trade con 12× apalancamiento
+LEVERAGE         = 12   # Apalancamiento fijo 12×
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "12"))
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "7"))
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "8.0"))
 COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "20"))
@@ -157,19 +145,6 @@ WT_OS       = float(os.environ.get("WT_OS",    "-60.0"))
 BB_PERIOD  = int(os.environ.get("BB_PERIOD", "20"))
 BB_STD     = float(os.environ.get("BB_STD",  "2.0"))
 BB_RSI_OB  = float(os.environ.get("BB_RSI_OB", "65.0"))
-
-# ── VWAP (nuevo v14) ──
-VWAP_LEN   = int(os.environ.get("VWAP_LEN", "20"))
-
-# ── Volume Delta (nuevo v14) ──
-VDELTA_LEN = int(os.environ.get("VDELTA_LEN", "10"))
-
-# ── STC — Schaff Trend Cycle (nuevo v14) ──
-STC_FAST   = int(os.environ.get("STC_FAST",  "23"))
-STC_SLOW   = int(os.environ.get("STC_SLOW",  "50"))
-STC_CYCLE  = int(os.environ.get("STC_CYCLE", "10"))
-STC_OB     = float(os.environ.get("STC_OB",  "75.0"))
-STC_OS     = float(os.environ.get("STC_OS",  "25.0"))
 
 # ── Bj Bot Risk Management ──
 RNR              = float(os.environ.get("RNR",               "2.0"))
@@ -287,7 +262,7 @@ class BotState:
         return (self.wins / t * 100) if t else 0.0
     def profit_factor(self) -> float:
         return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
-    def score_bar(self, score: int, mx: int = 19) -> str:
+    def score_bar(self, score: int, mx: int = 16) -> str:
         return "█" * min(score, mx) + "░" * (mx - min(score, mx))
     def cb_active(self) -> bool:
         if not USE_CB or self.peak_equity <= 0: return False
@@ -380,20 +355,19 @@ def tg(msg: str):
 
 def tg_startup(balance: float, n: int):
     tg(
-        f"<b>🚀 SATY ELITE v14 — PRECISION EDITION</b>\n"
+        f"<b>🚀 SATY ELITE v13 — FULL STRATEGY EDITION</b>\n"
         f"══════════════════════════════\n"
         f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
         f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
         f"⏱ {TF} · {HTF1} · {HTF2}\n"
-        f"🎯 Score min: {MIN_SCORE}/19 | Max trades: {MAX_OPEN_TRADES}\n"
-        f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.1f} × {LEVERAGE}x/trade\n"
+        f"🎯 Score min: {MIN_SCORE}/16 | Max trades: {MAX_OPEN_TRADES}\n"
+        f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.0f}/trade\n"
         f"🛡 CB: -{CB_DD}% | Límite diario: -{DAILY_LOSS_LIMIT}%\n"
         f"══════════════════════════════\n"
         f"📊 SMI({SMI_K_LEN},{SMI_D_LEN},{SMI_EMA_LEN}) OB:{SMI_OB:+.0f}/{SMI_OS:+.0f}\n"
         f"🌊 WaveTrend({WT_CHAN_LEN},{WT_AVG_LEN}) OB:{WT_OB}/{WT_OS}\n"
         f"🤖 UTBot KeyVal:{UTBOT_KEY} ATR:{UTBOT_ATR}\n"
         f"📈 BB({BB_PERIOD},{BB_STD}) | R:R={RNR} | RiskMult={RISK_MULT}\n"
-        f"📍 VWAP({VWAP_LEN}) | ΔVol({VDELTA_LEN}) | STC({STC_FAST},{STC_SLOW},{STC_CYCLE})\n"
         f"{'⏳ Expire:' + str(TRADE_EXPIRE_BARS) + 'bars' if TRADE_EXPIRE_BARS > 0 else '⏳ Expire: OFF'}\n"
         f"₿ Filtro BTC: {'✅' if BTC_FILTER else '❌'}\n"
         f"⏰ {utcnow()}"
@@ -407,14 +381,11 @@ def tg_signal(t: TradeState, row: pd.Series):
     smi_v  = float(row.get("smi", 0.0))
     wt_v   = float(row.get("wt1", 0.0))
     ut_stop= float(row.get("utbot_stop", 0.0))
-    stc_v  = float(row.get("stc", 50.0))
-    vwap_v = float(row.get("vwap", 0.0))
-    vdelta = float(row.get("cum_delta", 0.0))
     trend  = "📈 UpTrend" if t.uptrend_entry else "📉 DownTrend"
     tg(
         f"{e} <b>{'LONG' if t.side=='long' else 'SHORT'}</b> — {t.symbol}\n"
         f"══════════════════════════════\n"
-        f"🎯 Score: {t.entry_score}/19  {state.score_bar(t.entry_score)}\n"
+        f"🎯 Score: {t.entry_score}/16  {state.score_bar(t.entry_score)}\n"
         f"📊 {trend}\n"
         f"💵 Entrada: <code>{t.entry_price:.6g}</code>\n"
         f"🟡 TP1: <code>{t.tp1_price:.6g}</code> R:R 1:{rr1:.1f}\n"
@@ -423,11 +394,9 @@ def tg_signal(t: TradeState, row: pd.Series):
         f"🤖 UTBot Stop: <code>{ut_stop:.6g}</code>\n"
         f"══════════════════════════════\n"
         f"{smi_label(smi_v)} | {wt_label(wt_v)}\n"
-        f"📍 VWAP: <code>{vwap_v:.6g}</code> | STC: {stc_v:.1f}\n"
-        f"ΔVol: {'🟢 +' if vdelta >= 0 else '🔴 '}{vdelta:.2f}\n"
         f"{rsi_zone_label(float(row['rsi']))} | ADX:{row['adx']:.1f}\n"
         f"MACD:{row['macd_hist']:.5f} | Vol:{row['volume']/row['vol_ma']:.2f}x\n"
-        f"ATR:{t.atr_entry:.5f} | ${FIXED_USDT:.1f}×{LEVERAGE}x = ${FIXED_USDT*LEVERAGE:.1f} notional\n"
+        f"ATR:{t.atr_entry:.5f} | ${FIXED_USDT:.0f} fijos\n"
         f"₿{'🟢' if state.btc_bull else '🔴' if state.btc_bear else '⚪'} "
         f"RSI:{state.btc_rsi:.0f}\n"
         f"📊 {state.open_count()}/{MAX_OPEN_TRADES} trades\n"
@@ -459,7 +428,7 @@ def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
     pct = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
     tg(
         f"{e} <b>CERRADO</b> — {t.symbol}\n"
-        f"📋 {t.side.upper()} · {t.entry_score}/19 · {reason}\n"
+        f"📋 {t.side.upper()} · {t.entry_score}/16 · {reason}\n"
         f"💵 <code>{t.entry_price:.6g}</code> → <code>{exit_p:.6g}</code> ({pct:+.2f}%)\n"
         f"{'💰' if pnl>0 else '💸'} PnL: ${pnl:+.2f} | Barras: {t.bar_count}\n"
         f"📊 {state.wins}W/{state.losses}L · WR:{state.win_rate():.1f}% · PF:{state.profit_factor():.2f}\n"
@@ -475,7 +444,7 @@ def tg_rsi_alert(symbol: str, rsi: float, smi: float, wt: float,
         f"{rsi_zone_label(rsi)}\n"
         f"{smi_label(smi)} | {wt_label(wt)}\n"
         f"💵 <code>{price:.6g}</code> | {direction}\n"
-        f"Score: L:{ls}/19 S:{ss}/19\n"
+        f"Score: L:{ls}/16 S:{ss}/16\n"
         f"⏰ {utcnow()}"
     )
 
@@ -487,7 +456,7 @@ def tg_summary(signals: List[dict], n_scanned: int):
     ) or "  (ninguna)"
     top = "\n".join(
         f"  {'🟢' if s['side']=='long' else '🔴'} {s['symbol']} "
-        f"{s['score']}/19 {wt_label(s['wt'])}"
+        f"{s['score']}/16 {wt_label(s['wt'])}"
         for s in signals[:5]
     ) or "  (ninguna)"
     tg(
@@ -667,83 +636,6 @@ def calc_bb(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
 
 
 # ══════════════════════════════════════════════════════════
-# VWAP — Volume Weighted Average Price (nuevo v14)
-# ══════════════════════════════════════════════════════════
-def calc_vwap(df: pd.DataFrame) -> pd.Series:
-    """
-    VWAP rolling = sum(hlc3 * vol, N) / sum(vol, N)
-    Referencia institucional de precio justo.
-    LONG: price > VWAP (precio sobre el promedio ponderado)
-    SHORT: price < VWAP (precio bajo el promedio ponderado)
-    """
-    hlc3 = (df["high"] + df["low"] + df["close"]) / 3
-    vol  = df["volume"]
-    vwap = (hlc3 * vol).rolling(VWAP_LEN).sum() / vol.rolling(VWAP_LEN).sum()
-    return vwap
-
-
-# ══════════════════════════════════════════════════════════
-# VOLUME DELTA — Presión compradora vs vendedora (nuevo v14)
-# ══════════════════════════════════════════════════════════
-def calc_volume_delta(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    """
-    delta_bar = buy_vol - sell_vol  (estimación por precio vela)
-    buy_vol   = vol * (close - low)  / (high - low)
-    sell_vol  = vol * (high - close) / (high - low)
-    cum_delta = suma acumulada de N barras del delta
-    LONG:  cum_delta > 0 y creciendo (presión compradora dominante)
-    SHORT: cum_delta < 0 y cayendo   (presión vendedora dominante)
-    """
-    h, l, c, v = df["high"], df["low"], df["close"], df["volume"]
-    rng      = (h - l).replace(0, np.nan)
-    buy_vol  = v * (c - l) / rng
-    sell_vol = v * (h - c) / rng
-    delta    = buy_vol - sell_vol
-    cum_d    = delta.rolling(VDELTA_LEN).sum()
-    # Tendencia del delta: ¿está subiendo o bajando?
-    delta_rising  = cum_d > cum_d.shift(1)
-    delta_falling = cum_d < cum_d.shift(1)
-    return cum_d, delta_rising
-
-
-# ══════════════════════════════════════════════════════════
-# STC — Schaff Trend Cycle (nuevo v14)
-# Basado en Doug Schaff: MACD + doble estocástico
-# ══════════════════════════════════════════════════════════
-def calc_stc(df: pd.DataFrame) -> pd.Series:
-    """
-    1. Calcula MACD line = EMA(fast) - EMA(slow)
-    2. Aplica estocástico al MACD (ciclo)  → stoch1
-    3. Suaviza stoch1 con EMA(3)           → d1
-    4. Aplica estocástico a d1 (ciclo)     → stoch2
-    5. Suaviza stoch2 con EMA(3)           → STC (0-100)
-
-    Interpretación:
-    - STC > STC_OS (25) y subiendo → tendencia alcista emergente
-    - STC < STC_OB (75) y bajando  → tendencia bajista emergente
-    - STC cruza 25 hacia arriba    → señal LONG fuerte
-    - STC cruza 75 hacia abajo     → señal SHORT fuerte
-    """
-    c    = df["close"]
-    macd_line = ema(c, STC_FAST) - ema(c, STC_SLOW)
-
-    # Primera estocástica sobre el MACD
-    macd_min = macd_line.rolling(STC_CYCLE).min()
-    macd_max = macd_line.rolling(STC_CYCLE).max()
-    stoch1   = (macd_line - macd_min) / (macd_max - macd_min).replace(0, np.nan) * 100
-    stoch1   = stoch1.fillna(50.0)
-    d1       = stoch1.ewm(span=3, adjust=False).mean()
-
-    # Segunda estocástica sobre d1
-    d1_min   = d1.rolling(STC_CYCLE).min()
-    d1_max   = d1.rolling(STC_CYCLE).max()
-    stoch2   = (d1 - d1_min) / (d1_max - d1_min).replace(0, np.nan) * 100
-    stoch2   = stoch2.fillna(50.0)
-    stc      = stoch2.ewm(span=3, adjust=False).mean()
-    return stc.clip(0, 100)
-
-
-# ══════════════════════════════════════════════════════════
 # BJ BOT — R:R Targets (3Commas framework)
 # ══════════════════════════════════════════════════════════
 def calc_rr_targets(entry: float, side: str,
@@ -885,32 +777,6 @@ def compute(df: pd.DataFrame) -> pd.DataFrame:
         (h > h.shift(1)) & (h.shift(1) > h.shift(2)) &
         (rsi < rsi.shift(1)) & (rsi.shift(1) < rsi.shift(2)) & (rsi > 58)
     )
-
-    # ── VWAP (v14) ──
-    df["vwap"] = calc_vwap(df)
-    df["above_vwap"] = c > df["vwap"]
-    df["below_vwap"] = c < df["vwap"]
-
-    # ── Volume Delta (v14) ──
-    cum_delta, delta_rising = calc_volume_delta(df)
-    df["cum_delta"]      = cum_delta
-    df["delta_rising"]   = delta_rising
-    df["delta_falling"]  = ~delta_rising
-    # Bull delta: delta positivo y creciendo = presión compradora neta
-    df["delta_bull"] = (cum_delta > 0) & delta_rising
-    # Bear delta: delta negativo y cayendo = presión vendedora neta
-    df["delta_bear"] = (cum_delta < 0) & ~delta_rising
-
-    # ── STC — Schaff Trend Cycle (v14) ──
-    df["stc"] = calc_stc(df)
-    stc = df["stc"]
-    # LONG: STC supera la zona OS y sube → tendencia alcista emergente
-    df["stc_bull"]     = (stc > STC_OS) & (stc > stc.shift(1))
-    df["stc_cross_up"] = (stc > STC_OS) & (stc.shift(1) <= STC_OS)
-    # SHORT: STC cae bajo la zona OB → tendencia bajista emergente
-    df["stc_bear"]     = (stc < STC_OB) & (stc < stc.shift(1))
-    df["stc_cross_dn"] = (stc < STC_OB) & (stc.shift(1) >= STC_OB)
-
     return df
 
 
@@ -937,8 +803,8 @@ def confluence_score(row: pd.Series,
                      htf2_bull: bool, htf2_bear: bool,
                      uptrend: bool) -> Tuple[int, int]:
     """
-    19 puntos por dirección (v14):
-
+    16 puntos por dirección:
+    
     LONG:
      1. EMA trend alcista
      2. Oscilador cruza al alza
@@ -952,13 +818,10 @@ def confluence_score(row: pd.Series,
     10. SMI cross up / bull
     11. SMI en OS o saliendo
     12. Bull engulf / div RSI
-    13. UTBot BUY signal       (HPotter)
-    14. WaveTrend cross up / OS (Instrument-Z)
-    15. MA cross alcista        (Bj Bot)
-    16. BB buy signal           (rouxam BB+RSI)
-    17. Precio > VWAP           (nuevo v14)
-    18. Volume Delta positivo   (nuevo v14)
-    19. STC alcista / cross OS  (nuevo v14)
+    13. UTBot BUY signal       ← nuevo (HPotter)
+    14. WaveTrend cross up / OS ← nuevo (Instrument-Z)
+    15. MA cross alcista        ← nuevo (Bj Bot)
+    16. BB buy signal           ← nuevo (rouxam BB+RSI)
 
     SHORT: lógica espejada
     """
@@ -982,9 +845,6 @@ def confluence_score(row: pd.Series,
                (row.get("wt_bull") and not row.get("wt_ob")))
     l15 = bool(row.get("ma_cross_up"))                                    # Bj Bot MA cross
     l16 = bool(row.get("bb_buy") and not row.get("squeeze"))              # BB + RSI
-    l17 = bool(row.get("above_vwap"))                                     # VWAP (v14)
-    l18 = bool(row.get("delta_bull"))                                     # Volume Delta (v14)
-    l19 = bool(row.get("stc_bull") or row.get("stc_cross_up"))           # STC (v14)
 
     # ─── SHORT ────────────────────────────────────────────
     s1  = bool(row["close"] < row["ema48"] and row["ema8"] < row["ema21"])
@@ -1004,12 +864,9 @@ def confluence_score(row: pd.Series,
                (row.get("wt_bear") and not row.get("wt_os")))
     s15 = bool(row.get("ma_cross_down"))                                  # Bj Bot MA cross
     s16 = bool(row.get("bb_sell") and not row.get("squeeze"))             # BB + RSI
-    s17 = bool(row.get("below_vwap"))                                     # VWAP (v14)
-    s18 = bool(row.get("delta_bear"))                                     # Volume Delta (v14)
-    s19 = bool(row.get("stc_bear") or row.get("stc_cross_dn"))           # STC (v14)
 
-    return (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16,l17,l18,l19]),
-            sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19]))
+    return (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16]),
+            sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16]))
 
 
 # ══════════════════════════════════════════════════════════
@@ -1097,20 +954,6 @@ def get_min_amount(ex: ccxt.Exchange, symbol: str) -> float:
     except Exception:
         return 0.0
 
-_leverage_set: set = set()  # símbolos con leverage ya configurado
-
-def ensure_leverage(ex: ccxt.Exchange, symbol: str):
-    """Configura el leverage en BingX antes de abrir un trade.
-    Solo lo hace una vez por símbolo para no ralentizar."""
-    if symbol in _leverage_set:
-        return
-    try:
-        ex.set_leverage(LEVERAGE, symbol)
-        _leverage_set.add(symbol)
-        log.info(f"[{symbol}] Leverage {LEVERAGE}x configurado")
-    except Exception as e:
-        log.warning(f"[{symbol}] set_leverage: {e}")
-
 def entry_params(side: str) -> dict:
     if HEDGE_MODE:
         return {"positionSide": "LONG" if side == "buy" else "SHORT"}
@@ -1185,8 +1028,12 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
             log.warning(f"[{symbol}] spread {spread:.3f}% > {MAX_SPREAD_PCT}% — skip")
             return None
 
-        # ── Configurar leverage antes de cualquier orden ──
-        ensure_leverage(ex, symbol)
+        # Establecer apalancamiento 12x antes de abrir
+        try:
+            lv_params = {"hedged": True} if HEDGE_MODE else {}
+            ex.set_leverage(LEVERAGE, symbol, params=lv_params)
+        except Exception as lv_err:
+            log.warning(f"[{symbol}] set_leverage {LEVERAGE}x: {lv_err} (continuando)")
 
         price   = get_last_price(ex, symbol)
         atr     = float(row["atr"])
@@ -1194,25 +1041,25 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
         wt_v    = float(row.get("wt1", 0.0))
         ut_stop = float(row.get("utbot_stop", 0.0))
         usdt    = FIXED_USDT * state.risk_mult()
-
-        # Con leverage: el margen requerido es FIXED_USDT, pero el
-        # tamaño de posición (notional) = FIXED_USDT × LEVERAGE
-        notional = usdt * LEVERAGE
-        raw_amt  = notional / price
-        amount   = float(ex.amount_to_precision(symbol, raw_amt))
-
+        raw_amt = (usdt * LEVERAGE) / price  # 8 USDT x 12 = 96 USDT notional
         min_amt = get_min_amount(ex, symbol)
-        if amount <= 0 or amount < min_amt:
-            log.warning(f"[{symbol}] amount {amount:.6f} < min {min_amt}")
+        # Usar el máximo entre el importe calculado y el mínimo del exchange
+        raw_amt = max(raw_amt, min_amt) if min_amt > 0 else raw_amt
+        amount  = float(ex.amount_to_precision(symbol, raw_amt))
+
+        # Verificar que el notional no excede demasiado FIXED_USDT (máx 3×)
+        if amount <= 0:
+            log.warning(f"[{symbol}] amount calculado es 0")
             return None
-        # Notional mínimo BingX Perpetuals = 5 USDT
-        if amount * price < 5:
-            log.warning(f"[{symbol}] notional ${amount*price:.2f} < $5 — skip")
+        if amount * price < 3:
+            log.warning(f"[{symbol}] notional ${amount*price:.2f} < $3")
+            return None
+        if amount * price > FIXED_USDT * LEVERAGE * 3:
+            log.warning(f"[{symbol}] notional ${amount*price:.2f} excede 3× FIXED_USDT, skipping")
             return None
 
-        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/19 "
-                 f"SMI={smi_v:.1f} WT={wt_v:.1f} "
-                 f"${usdt:.2f} margin × {LEVERAGE}x = ${notional:.2f} notional @ {price:.6g}")
+        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/16 "
+                 f"SMI={smi_v:.1f} WT={wt_v:.1f} ${usdt:.1f} @ {price:.6g}")
 
         order       = ex.create_order(symbol, "market", side, amount,
                                       params=entry_params(side))
@@ -1560,7 +1407,7 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
         row = df.iloc[-2]
 
         # Validar que los indicadores están disponibles
-        for col in ["adx", "rsi", "macd_hist", "smi", "wt1", "utbot_stop", "stc", "vwap", "cum_delta"]:
+        for col in ["adx", "rsi", "macd_hist", "smi", "wt1", "utbot_stop"]:
             if pd.isna(row.get(col, np.nan)):
                 return None
 
@@ -1572,12 +1419,9 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
 
         ls, ss = confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear, uptrend)
 
-        rsi_v   = float(row["rsi"])
-        smi_v   = float(row.get("smi", 0.0))
-        wt_v    = float(row.get("wt1", 0.0))
-        stc_v   = float(row.get("stc", 50.0))
-        vwap_v  = float(row.get("vwap", 0.0))
-        delta_v = float(row.get("cum_delta", 0.0))
+        rsi_v = float(row["rsi"])
+        smi_v = float(row.get("smi", 0.0))
+        wt_v  = float(row.get("wt1", 0.0))
 
         if rsi_extreme_long(rsi_v) or rsi_extreme_short(rsi_v):
             now  = time.time()
@@ -1598,9 +1442,6 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
             "rsi":         rsi_v,
             "smi":         smi_v,
             "wt":          wt_v,
-            "stc":         stc_v,
-            "vwap":        vwap_v,
-            "delta":       delta_v,
             "uptrend":     uptrend,
         }
     except Exception as e:
@@ -1615,8 +1456,8 @@ def main():
     global HEDGE_MODE
 
     log.info("=" * 65)
-    log.info("  SATY ELITE v14 — PRECISION EDITION · 24/7")
-    log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI + VWAP + VolDelta + STC")
+    log.info("  SATY ELITE v13 — FULL STRATEGY EDITION · 24/7")
+    log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI")
     log.info("=" * 65)
 
     if not (API_KEY and API_SECRET):
