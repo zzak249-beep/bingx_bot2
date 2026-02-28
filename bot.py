@@ -36,7 +36,7 @@ VARIABLES OBLIGATORIAS:
     TELEGRAM_BOT_TOKEN  TELEGRAM_CHAT_ID
 
 VARIABLES OPCIONALES — GENERALES:
-    MAX_OPEN_TRADES   def:12    FIXED_USDT      def:8
+    MAX_OPEN_TRADES   def:5     FIXED_USDT      def:100
     MIN_SCORE         def:5     MAX_DRAWDOWN    def:15
     DAILY_LOSS_LIMIT  def:8     MIN_VOLUME_USDT def:100000
     TOP_N_SYMBOLS     def:300   POLL_SECONDS    def:60
@@ -111,9 +111,9 @@ _bl = os.environ.get("BLACKLIST", "")
 BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 
 # ── Capital ──
-FIXED_USDT       = float(os.environ.get("FIXED_USDT",       "8.0"))
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "12"))
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))
+FIXED_USDT       = float(os.environ.get("FIXED_USDT",       "100.0"))
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "5"))
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "6"))
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "8.0"))
 COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "20"))
