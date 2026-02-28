@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         SATY ELITE v13 — FULL STRATEGY EDITION                  ║
+║         SATY ELITE v14 — WHALE EDITION                          ║
 ║         BingX Perpetual Futures · 12 Trades · 24/7             ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  NUEVO v13 — 4 Pine Scripts integrados:                         ║
+║  NUEVO v14 — 4 Pine Scripts + Whale Signals:                         ║
 ║                                                                  ║
 ║  1. UTBot (HPotter/Yo_adriiiiaan)                               ║
 ║     · ATR Trailing Stop line con Key Value configurable         ║
@@ -93,7 +93,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("saty_v13")
+log = logging.getLogger("saty_v14")
 
 # ══════════════════════════════════════════════════════════
 # CONFIG — variables de entorno
@@ -114,7 +114,7 @@ BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
 FIXED_USDT       = 8.0  # Fijo: 8 USDT por trade con 12× apalancamiento
 LEVERAGE         = 12   # Apalancamiento fijo 12×
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",    "12"))
-MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "5"))
+MIN_SCORE        = int(os.environ.get("MIN_SCORE",          "8"))  # Solo señales 8/20 o superior (score máx: 20)
 CB_DD            = float(os.environ.get("MAX_DRAWDOWN",     "15.0"))
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT", "8.0"))
 COOLDOWN_MIN     = int(os.environ.get("COOLDOWN_MIN",       "20"))
@@ -171,7 +171,7 @@ RSI_OS_LOW = 78; RSI_OS_HIGH = 90
 MAX_CONSEC_LOSS = 3
 USE_CB          = True
 HEDGE_MODE: bool = False
-CSV_PATH = "/tmp/saty_v13_trades.csv"
+CSV_PATH = "/tmp/saty_v14_trades.csv"
 
 
 # ══════════════════════════════════════════════════════════
@@ -229,6 +229,7 @@ class TradeState:
     utbot_stop:       float = 0.0   # UTBot ATR trailing stop at entry
     bar_count:        int   = 0     # barras desde entrada (trade expiry)
     uptrend_entry:    bool  = True  # era uptrend en la entrada
+    whale_desc:       str   = ""    # descripción señales ballenas v14
     rr_trail_active:  bool  = False # R:R trail trigger activado (Bj Bot)
     rr_trail_stop:    float = 0.0   # nivel del trailing Bj Bot
 
@@ -262,7 +263,7 @@ class BotState:
         return (self.wins / t * 100) if t else 0.0
     def profit_factor(self) -> float:
         return (self.gross_profit / self.gross_loss) if self.gross_loss else 0.0
-    def score_bar(self, score: int, mx: int = 16) -> str:
+    def score_bar(self, score: int, mx: int = 20) -> str:
         return "█" * min(score, mx) + "░" * (mx - min(score, mx))
     def cb_active(self) -> bool:
         if not USE_CB or self.peak_equity <= 0: return False
@@ -355,12 +356,12 @@ def tg(msg: str):
 
 def tg_startup(balance: float, n: int):
     tg(
-        f"<b>🚀 SATY ELITE v13 — FULL STRATEGY EDITION</b>\n"
+        f"<b>🚀 SATY ELITE v14 — WHALE EDITION</b>\n"
         f"══════════════════════════════\n"
         f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
         f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
         f"⏱ {TF} · {HTF1} · {HTF2}\n"
-        f"🎯 Score min: {MIN_SCORE}/16 | Max trades: {MAX_OPEN_TRADES}\n"
+        f"🎯 Score min: {MIN_SCORE}/20 | Max trades: {MAX_OPEN_TRADES}\n"
         f"💰 Balance: ${balance:.2f} | ${FIXED_USDT:.0f}/trade\n"
         f"🛡 CB: -{CB_DD}% | Límite diario: -{DAILY_LOSS_LIMIT}%\n"
         f"══════════════════════════════\n"
@@ -385,7 +386,7 @@ def tg_signal(t: TradeState, row: pd.Series):
     tg(
         f"{e} <b>{'LONG' if t.side=='long' else 'SHORT'}</b> — {t.symbol}\n"
         f"══════════════════════════════\n"
-        f"🎯 Score: {t.entry_score}/16  {state.score_bar(t.entry_score)}\n"
+        f"🎯 Score: {t.entry_score}/20  {state.score_bar(t.entry_score)}\n"
         f"📊 {trend}\n"
         f"💵 Entrada: <code>{t.entry_price:.6g}</code>\n"
         f"🟡 TP1: <code>{t.tp1_price:.6g}</code> R:R 1:{rr1:.1f}\n"
@@ -397,6 +398,7 @@ def tg_signal(t: TradeState, row: pd.Series):
         f"{rsi_zone_label(float(row['rsi']))} | ADX:{row['adx']:.1f}\n"
         f"MACD:{row['macd_hist']:.5f} | Vol:{row['volume']/row['vol_ma']:.2f}x\n"
         f"ATR:{t.atr_entry:.5f} | ${FIXED_USDT:.0f} fijos\n"
+        f"🐋 {t.whale_desc}\n"
         f"₿{'🟢' if state.btc_bull else '🔴' if state.btc_bear else '⚪'} "
         f"RSI:{state.btc_rsi:.0f}\n"
         f"📊 {state.open_count()}/{MAX_OPEN_TRADES} trades\n"
@@ -428,7 +430,7 @@ def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
     pct = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
     tg(
         f"{e} <b>CERRADO</b> — {t.symbol}\n"
-        f"📋 {t.side.upper()} · {t.entry_score}/16 · {reason}\n"
+        f"📋 {t.side.upper()} · {t.entry_score}/20 · {reason}\n"
         f"💵 <code>{t.entry_price:.6g}</code> → <code>{exit_p:.6g}</code> ({pct:+.2f}%)\n"
         f"{'💰' if pnl>0 else '💸'} PnL: ${pnl:+.2f} | Barras: {t.bar_count}\n"
         f"📊 {state.wins}W/{state.losses}L · WR:{state.win_rate():.1f}% · PF:{state.profit_factor():.2f}\n"
@@ -444,7 +446,7 @@ def tg_rsi_alert(symbol: str, rsi: float, smi: float, wt: float,
         f"{rsi_zone_label(rsi)}\n"
         f"{smi_label(smi)} | {wt_label(wt)}\n"
         f"💵 <code>{price:.6g}</code> | {direction}\n"
-        f"Score: L:{ls}/16 S:{ss}/16\n"
+        f"Score: L:{ls}/20 S:{ss}/20\n"
         f"⏰ {utcnow()}"
     )
 
@@ -456,7 +458,7 @@ def tg_summary(signals: List[dict], n_scanned: int):
     ) or "  (ninguna)"
     top = "\n".join(
         f"  {'🟢' if s['side']=='long' else '🔴'} {s['symbol']} "
-        f"{s['score']}/16 {wt_label(s['wt'])}"
+        f"{s['score']}/20 {wt_label(s['wt'])}"
         for s in signals[:5]
     ) or "  (ninguna)"
     tg(
@@ -483,6 +485,31 @@ def tg_heartbeat(balance: float):
 
 def tg_error(msg: str):
     tg(f"🔥 <b>ERROR:</b> <code>{msg[:300]}</code>\n⏰ {utcnow()}")
+
+def tg_manual_signal(symbol: str, side: str, score: int,
+                     entry: float, tp1: float, tp2: float, sl: float,
+                     atr: float, whale_desc: str, reason: str):
+    """Alerta de operación manual cuando el bot no puede abrir por fondos insuficientes."""
+    e = "🟢" if side == "long" else "🔴"
+    sl_dist = abs(entry - sl)
+    rr1 = abs(tp1 - entry) / max(sl_dist, 1e-9)
+    rr2 = abs(tp2 - entry) / max(sl_dist, 1e-9)
+    tg(
+        f"👤 <b>SEÑAL MANUAL — {side.upper()}</b> {e} — {symbol}\n"
+        f"══════════════════════════════\n"
+        f"⚠️ <i>Bot no pudo abrir: {reason[:80]}</i>\n"
+        f"══════════════════════════════\n"
+        f"🎯 Score: {score}/20  |  12× apalancamiento\n"
+        f"💵 Entrada: <code>{entry:.6g}</code>\n"
+        f"🟡 TP1: <code>{tp1:.6g}</code>  (R:R 1:{rr1:.1f})\n"
+        f"🟢 TP2: <code>{tp2:.6g}</code>  (R:R 1:{rr2:.1f})\n"
+        f"🛑 SL:  <code>{sl:.6g}</code>\n"
+        f"══════════════════════════════\n"
+        f"📐 Margen necesario: ~${FIXED_USDT:.0f} USDT\n"
+        f"📊 Contratos aprox: {(FIXED_USDT * LEVERAGE / entry):.4f}\n"
+        f"🐋 {whale_desc}\n"
+        f"⏰ {utcnow()}"
+    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -634,6 +661,180 @@ def calc_bb(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series, pd.Series]:
     lower = basis - BB_STD * dev
     return upper, lower, basis
 
+
+# ══════════════════════════════════════════════════════════
+# WHALE & INSTITUTIONAL INDICATORS — v14
+# ══════════════════════════════════════════════════════════
+
+# Cache para datos de derivados (funding, OI, L/S ratio)
+_deriv_cache: Dict[str, Tuple[float, dict]] = {}
+DERIV_TTL = 300  # 5 minutos (estos datos cambian lento)
+
+def fetch_funding_rate(ex: ccxt.Exchange, symbol: str) -> float:
+    """Devuelve funding rate actual. Positivo = longs pagan (mercado alcista/sobrepoblado)."""
+    key = f"fr|{symbol}"
+    now = time.time()
+    if key in _deriv_cache:
+        ts, val = _deriv_cache[key]
+        if now - ts < DERIV_TTL:
+            return val.get("rate", 0.0)
+    try:
+        fr = ex.fetch_funding_rate(symbol)
+        rate = float(fr.get("fundingRate") or fr.get("nextFundingRate") or 0.0)
+        _deriv_cache[key] = (now, {"rate": rate})
+        return rate
+    except Exception:
+        return 0.0
+
+def fetch_open_interest(ex: ccxt.Exchange, symbol: str) -> Tuple[float, float]:
+    """Devuelve (OI_actual, OI_anterior). OI creciente = ballenas entrando."""
+    key = f"oi|{symbol}"
+    now = time.time()
+    if key in _deriv_cache:
+        ts, val = _deriv_cache[key]
+        if now - ts < DERIV_TTL:
+            return val.get("oi_now", 0.0), val.get("oi_prev", 0.0)
+    try:
+        hist = ex.fetch_open_interest_history(symbol, timeframe="5m", limit=3)
+        if hist and len(hist) >= 2:
+            oi_now  = float(hist[-1].get("openInterestAmount") or hist[-1].get("openInterest") or 0)
+            oi_prev = float(hist[-2].get("openInterestAmount") or hist[-2].get("openInterest") or 0)
+            _deriv_cache[key] = (now, {"oi_now": oi_now, "oi_prev": oi_prev})
+            return oi_now, oi_prev
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+def fetch_long_short_ratio(ex: ccxt.Exchange, symbol: str) -> float:
+    """Devuelve ratio L/S global. >1 = mayoría long, <1 = mayoría short."""
+    key = f"ls|{symbol}"
+    now = time.time()
+    if key in _deriv_cache:
+        ts, val = _deriv_cache[key]
+        if now - ts < DERIV_TTL:
+            return val.get("ratio", 1.0)
+    try:
+        # Intentar via ccxt unificado primero
+        hist = ex.fetch_long_short_ratio_history(symbol, timeframe="5m", limit=2)
+        if hist and len(hist) >= 1:
+            ls = hist[-1]
+            ratio = float(ls.get("longShortRatio") or ls.get("ratio") or 1.0)
+            _deriv_cache[key] = (now, {"ratio": ratio})
+            return ratio
+    except Exception:
+        pass
+    # Fallback: BingX API directa
+    try:
+        base = symbol.split("/")[0].replace(":USDT", "")
+        url  = f"https://open-api.bingx.com/openApi/swap/v2/quote/longShortRatio"
+        params = {"symbol": f"{base}-USDT", "period": "5m", "limit": 2}
+        resp = requests.get(url, params=params, timeout=5)
+        data = resp.json().get("data", [])
+        if data:
+            ratio = float(data[-1].get("longShortRatio", 1.0))
+            _deriv_cache[key] = (now, {"ratio": ratio})
+            return ratio
+    except Exception:
+        pass
+    return 1.0  # neutral si falla
+
+def is_institutional_session() -> bool:
+    """
+    True si estamos en horario de alta liquidez institucional.
+    Basado en investigación: ballenas reales operan en sesión London-NY overlap (13-16 UTC)
+    y durante las sesiones principales. Evitar 23:00-06:00 UTC (bots dominan, señales falsas).
+    """
+    hour = datetime.now(timezone.utc).hour
+    # Horario institucional activo: Asia tarde (06-08), London (08-16), NY (13-22)
+    # Evitar: 23:00-05:59 UTC = madrugada US/Europa, solo bots asiáticos de baja calidad
+    return 6 <= hour <= 22
+
+def whale_score_bonus(ex: ccxt.Exchange, symbol: str, side: str) -> Tuple[int, int, str]:
+    """
+    Calcula puntos adicionales (0-4) basados en señales de ballenas/institucionales.
+    Retorna (puntos_long, puntos_short, descripcion)
+    
+    Puntos posibles:
+    +1 P17: Funding rate favorable (contrarian — mercado no sobrepoblado en tu dirección)
+    +1 P18: Open Interest creciente (dinero nuevo entrando, confirma movimiento)
+    +1 P19: Long/Short ratio a favor (posicionamiento institucional correcto)
+    +1 P20: Sesión institucional activa (London/NY = ballenas reales operando)
+    """
+    long_pts = 0
+    short_pts = 0
+    desc_parts = []
+
+    try:
+        fr = fetch_funding_rate(ex, symbol)
+        fr_pct = fr * 100
+
+        # P17: Funding rate — contrarian es mejor
+        # FR muy positivo = longs masivos = peligroso para LONG, bueno para SHORT
+        # FR negativo = shorts masivos = bueno para LONG
+        # FR neutral (-0.03% a +0.03%) = ok para ambos
+        FR_EXTREME = 0.05   # >0.05% cada 8h = mercado sobrepoblado (bloquear esa dirección)
+        FR_FAVORABLE = -0.01  # FR negativo = beneficioso para LONG (shorts pagando)
+
+        if fr < FR_FAVORABLE:    # FR negativo: favorable para LONG
+            long_pts += 1
+            desc_parts.append(f"FR:{fr_pct:.3f}%🟢L")
+        elif fr > FR_EXTREME:    # FR muy positivo: favorable para SHORT (longs sobrecargados)
+            short_pts += 1
+            desc_parts.append(f"FR:{fr_pct:.3f}%🔴S")
+        elif -FR_EXTREME < fr < FR_EXTREME:  # FR neutral: punto para ambos (mercado equilibrado)
+            long_pts += 1
+            short_pts += 1
+            desc_parts.append(f"FR:{fr_pct:.3f}%⚪")
+    except Exception:
+        long_pts += 1; short_pts += 1  # neutral si falla
+
+    try:
+        oi_now, oi_prev = fetch_open_interest(ex, symbol)
+        if oi_now > 0 and oi_prev > 0:
+            oi_change_pct = (oi_now - oi_prev) / oi_prev * 100
+            # OI creciente con precio subiendo = ballenas comprando (LONG)
+            # OI creciente con precio bajando = ballenas vendiendo (SHORT)
+            if oi_change_pct > 0.5:  # OI crece >0.5%
+                long_pts += 1   # dinero nuevo entrando, puede ser en cualquier dirección
+                short_pts += 1  # ambos se benefician del aumento de OI
+                desc_parts.append(f"OI:+{oi_change_pct:.1f}%📈")
+            else:
+                desc_parts.append(f"OI:{oi_change_pct:+.1f}%")
+        else:
+            long_pts += 1; short_pts += 1
+    except Exception:
+        long_pts += 1; short_pts += 1
+
+    try:
+        ls_ratio = fetch_long_short_ratio(ex, symbol)
+        # L/S ratio: si mayoría está LONG (>1.3), seguir a las ballenas para LONG
+        # Si mayoría está SHORT (<0.7), seguir para SHORT
+        # Si ratio extremo (>2.0 o <0.5) = trampa, contrarian
+        if 1.1 <= ls_ratio <= 1.8:      # mayoría institucional en LONG moderado
+            long_pts += 1
+            desc_parts.append(f"L/S:{ls_ratio:.2f}🟢")
+        elif 0.6 <= ls_ratio < 0.9:     # mayoría en SHORT moderado
+            short_pts += 1
+            desc_parts.append(f"L/S:{ls_ratio:.2f}🔴")
+        elif 0.9 <= ls_ratio < 1.1:     # equilibrado = neutral
+            long_pts += 1; short_pts += 1
+            desc_parts.append(f"L/S:{ls_ratio:.2f}⚪")
+        else:                            # extremo = trampa, no puntúa
+            desc_parts.append(f"L/S:{ls_ratio:.2f}⚠️")
+    except Exception:
+        long_pts += 1; short_pts += 1
+
+    # P20: Sesión institucional
+    if is_institutional_session():
+        long_pts += 1
+        short_pts += 1
+        hour = datetime.now(timezone.utc).hour
+        session = "🏦London" if 8 <= hour < 13 else "🗽NY" if 13 <= hour < 22 else "🌏Asia"
+        desc_parts.append(f"Sesión:{session}")
+    else:
+        desc_parts.append("Sesión:🌙OFF-hrs")
+
+    return long_pts, short_pts, " | ".join(desc_parts)
 
 # ══════════════════════════════════════════════════════════
 # BJ BOT — R:R Targets (3Commas framework)
@@ -796,14 +997,15 @@ def htf2_macro(df: pd.DataFrame) -> Tuple[bool, bool]:
 
 
 # ══════════════════════════════════════════════════════════
-# SCORE 16 PUNTOS — v13 integración completa
+# SCORE 20 PUNTOS — v14 Whale Edition
 # ══════════════════════════════════════════════════════════
 def confluence_score(row: pd.Series,
                      htf1_bull: bool, htf1_bear: bool,
                      htf2_bull: bool, htf2_bear: bool,
-                     uptrend: bool) -> Tuple[int, int]:
+                     uptrend: bool,
+                     whale_long: int = 0, whale_short: int = 0) -> Tuple[int, int]:
     """
-    16 puntos por dirección:
+    20 puntos por dirección (v14 Whale Edition):
     
     LONG:
      1. EMA trend alcista
@@ -818,10 +1020,14 @@ def confluence_score(row: pd.Series,
     10. SMI cross up / bull
     11. SMI en OS o saliendo
     12. Bull engulf / div RSI
-    13. UTBot BUY signal       ← nuevo (HPotter)
-    14. WaveTrend cross up / OS ← nuevo (Instrument-Z)
-    15. MA cross alcista        ← nuevo (Bj Bot)
-    16. BB buy signal           ← nuevo (rouxam BB+RSI)
+    13. UTBot BUY signal       ← Pine (HPotter)
+    14. WaveTrend cross up / OS ← Pine (Instrument-Z)
+    15. MA cross alcista        ← Pine (Bj Bot)
+    16. BB buy signal           ← Pine (rouxam BB+RSI)
+    17. Funding Rate favorable  ← WHALE v14
+    18. Open Interest creciente ← WHALE v14
+    19. Long/Short ratio a favor← WHALE v14
+    20. Sesión institucional    ← WHALE v14
 
     SHORT: lógica espejada
     """
@@ -845,6 +1051,8 @@ def confluence_score(row: pd.Series,
                (row.get("wt_bull") and not row.get("wt_ob")))
     l15 = bool(row.get("ma_cross_up"))                                    # Bj Bot MA cross
     l16 = bool(row.get("bb_buy") and not row.get("squeeze"))              # BB + RSI
+    # Whale points (P17-P20) vienen precalculados
+    whale_l_pts = min(whale_long, 4)   # máx 4 puntos whale para LONG
 
     # ─── SHORT ────────────────────────────────────────────
     s1  = bool(row["close"] < row["ema48"] and row["ema8"] < row["ema21"])
@@ -864,9 +1072,11 @@ def confluence_score(row: pd.Series,
                (row.get("wt_bear") and not row.get("wt_os")))
     s15 = bool(row.get("ma_cross_down"))                                  # Bj Bot MA cross
     s16 = bool(row.get("bb_sell") and not row.get("squeeze"))             # BB + RSI
+    whale_s_pts = min(whale_short, 4)  # máx 4 puntos whale para SHORT
 
-    return (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16]),
-            sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16]))
+    return (sum([l1,l2,l3,l4,l5,l6,l7,l8,l9,l10,l11,l12,l13,l14,l15,l16]) + whale_l_pts,
+            sum([s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16]) + whale_s_pts)
+
 
 
 # ══════════════════════════════════════════════════════════
@@ -1021,7 +1231,7 @@ def get_symbols(ex: ccxt.Exchange) -> List[str]:
 # ══════════════════════════════════════════════════════════
 def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
                side: str, score: int, row: pd.Series,
-               uptrend: bool) -> Optional[TradeState]:
+               uptrend: bool, whale_desc: str = "") -> Optional[TradeState]:
     try:
         spread = get_spread_pct(ex, symbol)
         if spread > MAX_SPREAD_PCT:
@@ -1058,7 +1268,7 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
             log.warning(f"[{symbol}] notional ${amount*price:.2f} excede 3× FIXED_USDT, skipping")
             return None
 
-        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/16 "
+        log.info(f"[OPEN] {symbol} {side.upper()} score={score}/20 "
                  f"SMI={smi_v:.1f} WT={wt_v:.1f} ${usdt:.1f} @ {price:.6g}")
 
         order       = ex.create_order(symbol, "market", side, amount,
@@ -1109,6 +1319,7 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
             smi_entry=smi_v,     wt_entry=wt_v,
             utbot_stop=ut_stop,
             uptrend_entry=uptrend,
+            whale_desc=whale_desc,
             rr_trail_stop=rr_trigger,
         )
         if side == "buy":
@@ -1123,8 +1334,31 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
         return t
 
     except Exception as e:
+        err_str = str(e).lower()
         log.error(f"[{symbol}] open_trade: {e}")
-        tg_error(f"open_trade {symbol}: {e}")
+        # Detectar error de margen insuficiente → enviar señal manual
+        if any(k in err_str for k in ["insufficient margin", "insufficient balance",
+                                       "not enough", "margin", "balance"]):
+            try:
+                # Calcular targets para el trader manual
+                _price = get_last_price(ex, symbol)
+                _atr   = float(row["atr"])
+                _side  = "long" if side == "buy" else "short"
+                _tp1, _tp2, _sl = calc_rr_targets(
+                    _price, _side,
+                    float(row["swing_low"]), float(row["swing_high"]), _atr
+                )
+                tg_manual_signal(
+                    symbol=symbol, side=_side, score=score,
+                    entry=_price, tp1=_tp1, tp2=_tp2, sl=_sl,
+                    atr=_atr, whale_desc=whale_desc,
+                    reason=str(e)[:120]
+                )
+            except Exception as me:
+                log.warning(f"[{symbol}] no pude enviar señal manual: {me}")
+                tg_error(f"open_trade {symbol}: {e}")
+        else:
+            tg_error(f"open_trade {symbol}: {e}")
         return None
 
 
@@ -1185,7 +1419,7 @@ def close_trade(ex: ccxt.Exchange, symbol: str, reason: str, price: float):
 
 
 # ══════════════════════════════════════════════════════════
-# GESTIÓN DEL TRADE — v13 con todas las capas de salida
+# GESTIÓN DEL TRADE — v14 con todas las capas de salida
 # ══════════════════════════════════════════════════════════
 def manage_trade(ex: ccxt.Exchange, symbol: str,
                  live_price: float, atr: float,
@@ -1417,7 +1651,10 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
         # UpTrend: precio sobre EMA200
         uptrend = bool(row["close"] > row["ema200"])
 
-        ls, ss = confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear, uptrend)
+        # ── Whale & Institutional signals (v14) ──
+        wl, ws, whale_desc = whale_score_bonus(ex, symbol, "both")
+        ls, ss = confluence_score(row, htf1_bull, htf1_bear, htf2_bull, htf2_bear,
+                                  uptrend, whale_long=wl, whale_short=ws)
 
         rsi_v = float(row["rsi"])
         smi_v = float(row.get("smi", 0.0))
@@ -1443,6 +1680,7 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
             "smi":         smi_v,
             "wt":          wt_v,
             "uptrend":     uptrend,
+            "whale_desc":  whale_desc,
         }
     except Exception as e:
         log.debug(f"[{symbol}] scan: {e}")
@@ -1456,7 +1694,7 @@ def main():
     global HEDGE_MODE
 
     log.info("=" * 65)
-    log.info("  SATY ELITE v13 — FULL STRATEGY EDITION · 24/7")
+    log.info("  SATY ELITE v14 — WHALE EDITION · 24/7")
     log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI")
     log.info("=" * 65)
 
@@ -1631,7 +1869,8 @@ def main():
 
                     order_side = "buy" if sig["side"] == "long" else "sell"
                     t = open_trade(ex, sym, base, order_side,
-                                   sig["score"], sig["row"], sig["uptrend"])
+                                   sig["score"], sig["row"], sig["uptrend"],
+                                   whale_desc=sig.get("whale_desc", ""))
                     if t:
                         state.trades[sym] = t
 
