@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         SATY ELITE v17 — ANTI-LOSS EDITION                          ║
+║         SATY ELITE v18 — DCA + ANTI-LOSS                          ║
 ║         BingX Perpetual Futures · 12 Trades · 24/7             ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  NUEVO v15 — 4 Pine Scripts + Whale Signals:                         ║
@@ -93,7 +93,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("saty_v17")
+log = logging.getLogger("saty_v18")
 
 # ══════════════════════════════════════════════════════════
 # CONFIG — variables de entorno
@@ -171,7 +171,7 @@ RSI_OS_LOW = 78; RSI_OS_HIGH = 90
 MAX_CONSEC_LOSS = 2   # Tras 2 pérdidas seguidas → reduce tamaño a la mitad
 USE_CB          = True
 HEDGE_MODE: bool = False
-CSV_PATH = "/tmp/saty_v17_trades.csv"
+CSV_PATH = "/tmp/saty_v18_trades.csv"
 
 
 # ══════════════════════════════════════════════════════════
@@ -204,7 +204,7 @@ def clear_cache():
 # Registra cada trade cerrado y analiza patrones para mejorar
 # Sin ML, sin GPU — estadística pura sobre trades reales
 # ══════════════════════════════════════════════════════════
-BRAIN_PATH = "/tmp/saty_v17_brain.json"
+BRAIN_PATH = "/tmp/saty_v18_brain.json"
 
 class TradingBrain:
     """
@@ -465,6 +465,13 @@ class TradeState:
     whale_desc:       str   = ""    # whale + saint grail signals v15
     rr_trail_active:  bool  = False # R:R trail trigger activado (Bj Bot)
     rr_trail_stop:    float = 0.0   # nivel del trailing Bj Bot
+    # ── DCA Averaging (v18) ──────────────────────────────────
+    dca_count:        int   = 0     # cuántas órdenes DCA ejecutadas
+    dca_avg_price:    float = 0.0   # precio promedio ponderado tras DCA
+    dca_total_usdt:   float = 0.0   # capital total comprometido (base + DCAs)
+    dca_total_contr:  float = 0.0   # contratos totales acumulados
+    dca_next_price:   float = 0.0   # precio al que se dispara la próxima orden DCA
+    dca_sl_price:     float = 0.0   # SL duro tras el último DCA
 
 
 @dataclass
@@ -591,7 +598,7 @@ def tg(msg: str):
 
 def tg_startup(balance: float, n: int):
     tg(
-        f"<b>🚀 SATY ELITE v17 — ANTI-LOSS EDITION</b>\n"
+        f"<b>🚀 SATY ELITE v18 — DCA + ANTI-LOSS</b>\n"
         f"══════════════════════════════\n"
         f"🌍 Universo: {n} pares | Vol≥${MIN_VOLUME_USDT/1000:.0f}K\n"
         f"⚙️ Modo: {'HEDGE' if HEDGE_MODE else 'ONE-WAY'} | 24/7\n"
@@ -605,6 +612,8 @@ def tg_startup(balance: float, n: int):
         f"🐋 Whale: FR + OI + L/S ratio + Sesión\n"
         f"⚜️ Saint Grail: VWAP + Supertrend + CVD + SMC + Regime\n"
         f"🚫 Regime Chop Filter: activo (bloquea mercados laterales)\n"
+        f"📉 DCA Averaging: {'✅' if DCA_ENABLED else '❌'} | Máx {DCA_MAX_ORDERS} órdenes | Paso {DCA_STEP_PCT}% | TP +{DCA_TP_PCT}%\n"
+        f"🚫 Macro Override: BTC RSI>75=no shorts | RSI<25=no longs\n"
         f"══════════════════════════════\n"
         f"⏰ {utcnow()}"
     )
@@ -668,10 +677,12 @@ def tg_trail_phase(t: TradeState, phase: str, price: float,
 def tg_close(reason: str, t: TradeState, exit_p: float, pnl: float):
     e   = "✅" if pnl > 0 else "❌"
     pct = (pnl / (t.entry_price * t.contracts) * 100) if t.contracts > 0 else 0
+    dca_line = f"📉 DCA usado: {t.dca_count}× | Avg precio: {t.dca_avg_price:.6g}\n" if t.dca_count > 0 else ""
     tg(
         f"{e} <b>CERRADO</b> — {t.symbol}\n"
         f"📋 {t.side.upper()} · {t.entry_score}/25 · {reason}\n"
         f"💵 <code>{t.entry_price:.6g}</code> → <code>{exit_p:.6g}</code> ({pct:+.2f}%)\n"
+        f"{dca_line}"
         f"{'💰' if pnl>0 else '💸'} PnL: ${pnl:+.2f} | Barras: {t.bar_count}\n"
         f"📊 {state.wins}W/{state.losses}L · WR:{state.win_rate():.1f}% · PF:{state.profit_factor():.2f}\n"
         f"💹 Hoy:${state.daily_pnl:+.2f} · Total:${state.total_pnl:+.2f}\n"
@@ -1791,6 +1802,18 @@ def open_trade(ex: ccxt.Exchange, symbol: str, base: str,
             t.trail_low  = entry_price
             t.rr_trail_stop = rr_trigger
 
+        # ── Inicializar DCA (v18) ──
+        if DCA_ENABLED and DCA_MAX_ORDERS > 0:
+            t.dca_avg_price  = entry_price
+            t.dca_total_usdt = usdt
+            t.dca_total_contr = amount
+            # Precio que dispara la 1ª orden DCA
+            if trade_side == "long":
+                t.dca_next_price = entry_price * (1 - DCA_STEP_PCT / 100)
+            else:
+                t.dca_next_price = entry_price * (1 + DCA_STEP_PCT / 100)
+            t.dca_sl_price = sl_p  # SL inicial (se actualiza tras cada DCA)
+
         log_csv("OPEN", t, entry_price)
         tg_signal(t, row)
         return t
@@ -1884,6 +1907,120 @@ def close_trade(ex: ccxt.Exchange, symbol: str, reason: str, price: float):
 # ══════════════════════════════════════════════════════════
 # GESTIÓN DEL TRADE — v14 con todas las capas de salida
 # ══════════════════════════════════════════════════════════
+def execute_dca_order(ex: ccxt.Exchange, symbol: str, live_price: float, atr: float):
+    """
+    DCA Averaging — modelo 3Commas/Bitsgap.
+    Cuando el precio va -DCA_STEP_PCT% contra la posición:
+      1. Abre una nueva orden market al precio actual (tamaño escalonado)
+      2. Recalcula el precio promedio ponderado
+      3. Actualiza el TP al nuevo precio promedio + DCA_TP_PCT%
+      4. Actualiza el SL duro a avg_price - DCA_SL_ATR_MULT × ATR
+      5. Programa el próximo nivel DCA
+    Máximo DCA_MAX_ORDERS niveles para evitar sobre-exposición.
+    """
+    if symbol not in state.trades:
+        return
+    t = state.trades[symbol]
+
+    if not DCA_ENABLED or t.dca_count >= DCA_MAX_ORDERS:
+        return
+
+    try:
+        # Calcular tamaño de la orden DCA (escalonado × DCA_SIZE_MULT)
+        usdt_base  = FIXED_USDT * state.risk_mult()
+        dca_usdt   = usdt_base * (DCA_SIZE_MULT ** t.dca_count)  # 1ª: 8×1.2=9.6, 2ª: 9.6×1.2=11.52
+        raw_amt    = (dca_usdt * LEVERAGE) / live_price
+        min_amt    = get_min_amount(ex, symbol)
+        raw_amt    = max(raw_amt, min_amt) if min_amt > 0 else raw_amt
+        dca_amount = float(ex.amount_to_precision(symbol, raw_amt))
+
+        if dca_amount <= 0:
+            return
+
+        # Verificar margen disponible antes de abrir
+        try:
+            bal = get_balance(ex)
+            if bal < dca_usdt * 0.8:
+                log.warning(f"[DCA] {symbol}: sin margen suficiente (${bal:.2f} < ${dca_usdt:.2f})")
+                return
+        except Exception:
+            pass
+
+        side_order = "buy" if t.side == "long" else "sell"
+        order = ex.create_order(symbol, "market", side_order, dca_amount,
+                                params=entry_params(side_order))
+        fill_price = float(order.get("average") or live_price)
+
+        # Recalcular precio promedio ponderado
+        total_cost   = t.dca_avg_price * t.dca_total_contr + fill_price * dca_amount
+        t.dca_total_contr += dca_amount
+        t.dca_total_usdt  += dca_usdt
+        t.dca_avg_price    = total_cost / t.dca_total_contr
+        t.dca_count       += 1
+
+        # Nuevo TP al precio promedio + DCA_TP_PCT%
+        if t.side == "long":
+            new_tp2 = t.dca_avg_price * (1 + DCA_TP_PCT / 100)
+            new_tp1 = t.dca_avg_price * (1 + DCA_TP_PCT / 200)  # TP1 = mitad del camino
+            # Nuevo SL duro debajo del promedio
+            new_sl  = t.dca_avg_price - atr * DCA_SL_ATR_MULT
+            # Siguiente nivel DCA más abajo (distancia × DCA_STEP_MULT)
+            step_pct = DCA_STEP_PCT * (DCA_STEP_MULT ** t.dca_count)
+            t.dca_next_price = t.dca_avg_price * (1 - step_pct / 100)
+        else:
+            new_tp2 = t.dca_avg_price * (1 - DCA_TP_PCT / 100)
+            new_tp1 = t.dca_avg_price * (1 - DCA_TP_PCT / 200)
+            new_sl  = t.dca_avg_price + atr * DCA_SL_ATR_MULT
+            step_pct = DCA_STEP_PCT * (DCA_STEP_MULT ** t.dca_count)
+            t.dca_next_price = t.dca_avg_price * (1 + step_pct / 100)
+
+        new_tp2   = float(ex.price_to_precision(symbol, new_tp2))
+        new_tp1   = float(ex.price_to_precision(symbol, new_tp1))
+        new_sl    = float(ex.price_to_precision(symbol, new_sl))
+
+        t.tp2_price   = new_tp2
+        t.tp1_price   = new_tp1
+        t.dca_sl_price = new_sl
+        t.sl_price     = new_sl   # el SL del estado se actualiza
+        t.contracts    = t.dca_total_contr  # para cálculo de PnL correcto
+
+        # Cancelar TP/SL anteriores y colocar los nuevos
+        close_side = "sell" if t.side == "long" else "buy"
+        ep = exit_params(t.side)
+        try:
+            ex.cancel_all_orders(symbol)
+        except Exception:
+            pass
+        half = float(ex.amount_to_precision(symbol, t.dca_total_contr * 0.5))
+        for lbl, qty, px in [("TP1", half, new_tp1), ("TP2", half, new_tp2)]:
+            try:
+                ex.create_order(symbol, "limit", close_side, qty, px, ep)
+            except Exception as e:
+                log.warning(f"[DCA-TP] {symbol} {lbl}: {e}")
+        try:
+            sl_ep = {**ep, "stopPrice": new_sl}
+            ex.create_order(symbol, "stop_market", close_side, t.dca_total_contr, None, sl_ep)
+        except Exception as e:
+            log.warning(f"[DCA-SL] {symbol}: {e}")
+
+        log.info(f"[DCA #{t.dca_count}] {symbol} fill={fill_price:.6g} "
+                 f"avg={t.dca_avg_price:.6g} TP2={new_tp2:.6g} SL={new_sl:.6g}")
+
+        pnl_est = ((t.dca_avg_price - live_price) if t.side == "long"
+                   else (live_price - t.dca_avg_price)) * t.dca_total_contr
+
+        tg(f"📉 DCA #{t.dca_count} — {symbol}\n"
+           f"{'LONG' if t.side=='long' else 'SHORT'} · Orden {t.dca_count}/{DCA_MAX_ORDERS}\n"
+           f"💵 Fill: {fill_price:.6g} | Prom: {t.dca_avg_price:.6g}\n"
+           f"🟢 Nuevo TP2: {new_tp2:.6g} (+{DCA_TP_PCT:.1f}%)\n"
+           f"🛑 Nuevo SL:  {new_sl:.6g}\n"
+           f"📊 Capital DCA: ${t.dca_total_usdt:.2f} | Contratos: {t.dca_total_contr:.4f}\n"
+           f"⏰ {utcnow()}")
+
+    except Exception as e:
+        log.error(f"[DCA] {symbol}: {e}")
+
+
 def manage_trade(ex: ccxt.Exchange, symbol: str,
                  live_price: float, atr: float,
                  long_score: int, short_score: int,
@@ -1919,6 +2056,16 @@ def manage_trade(ex: ccxt.Exchange, symbol: str,
         close_trade(ex, symbol, f"EXPIRADO ({t.bar_count} barras)", live_price)
         return
 
+    # ── DCA SL DURO: si precio supera el SL del promedio → cierre inmediato ──
+    if t.dca_count > 0 and t.dca_sl_price > 0:
+        sl_hit = (
+            (t.side == "long"  and live_price <= t.dca_sl_price) or
+            (t.side == "short" and live_price >= t.dca_sl_price)
+        )
+        if sl_hit:
+            close_trade(ex, symbol, f"DCA SL DURO (tras {t.dca_count} avg)", live_price)
+            return
+
     # ── UTBot trailing stop como 2ª línea de defensa ──
     # Si el precio cruza la línea UTBot en dirección contraria → cierre
     if result is not None and symbol in state.trades:
@@ -1942,7 +2089,18 @@ def manage_trade(ex: ccxt.Exchange, symbol: str,
         atr_now   = atr if atr > 0 else t.atr_entry
         loss_dist = (t.entry_price - live_price if t.side == "long"
                      else live_price - t.entry_price)
-        if loss_dist >= atr_now * 1.0:  # 1.0× ATR — no cerrar antes del SL real del exchange
+        if loss_dist >= atr_now * 1.0:
+            # ── DCA AVERAGING (v18): antes de cerrar, intentar promediar ──
+            if (DCA_ENABLED and t.dca_count < DCA_MAX_ORDERS
+                    and t.dca_next_price > 0):
+                trigger_hit = (
+                    (t.side == "long"  and live_price <= t.dca_next_price) or
+                    (t.side == "short" and live_price >= t.dca_next_price)
+                )
+                if trigger_hit:
+                    execute_dca_order(ex, symbol, live_price, atr_now)
+                    return  # No cerrar — promediamos
+            # Sin DCA disponible → cerrar
             close_trade(ex, symbol, "PÉRDIDA DINÁMICA", live_price)
             return
 
@@ -2156,6 +2314,19 @@ def scan_symbol(ex: ccxt.Exchange, symbol: str) -> Optional[dict]:
 # Cuando regime_chop=True, activa un mini-grid de 5 niveles
 # Usa ATR para espaciar niveles, leverage reducido (3×)
 # ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# DCA AVERAGING (v18) — Modelo 3Commas/Bitsgap
+# En vez de SL inmediato, promedia cuando el precio va en contra.
+# Solo activa si el trade está en -1.5% y hay presupuesto disponible.
+# ══════════════════════════════════════════════════════════════
+DCA_ENABLED       = os.environ.get("DCA_ENABLED", "true").lower() == "true"
+DCA_MAX_ORDERS    = int(os.environ.get("DCA_MAX_ORDERS",   "2"))    # máx 2 órdenes de promediado (seguro con $50)
+DCA_STEP_PCT      = float(os.environ.get("DCA_STEP_PCT",   "1.5"))  # 1ª orden DCA si precio baja 1.5%
+DCA_STEP_MULT     = float(os.environ.get("DCA_STEP_MULT",  "1.5"))  # cada paso multiplica distancia × 1.5 (3Commas default)
+DCA_SIZE_MULT     = float(os.environ.get("DCA_SIZE_MULT",  "1.2"))  # cada orden DCA es 1.2× la anterior
+DCA_SL_ATR_MULT   = float(os.environ.get("DCA_SL_ATR_MULT","3.0"))  # SL duro tras último DCA = 3× ATR del promedio
+DCA_TP_PCT        = float(os.environ.get("DCA_TP_PCT",     "1.0"))  # TP cuando el precio vuelve al avg_entry + 1%
+
 GRID_LEVELS       = 3      # REDUCIDO: 3 niveles (antes 5 = demasiada exposición)
 GRID_ATR_MULT     = 0.7    # spacing ligeramente mayor = más margen entre niveles
 GRID_LEVERAGE     = 2      # REDUCIDO: 2× (antes 3× — con $50 es demasiado)
@@ -2297,7 +2468,7 @@ def main():
     global HEDGE_MODE
 
     log.info("=" * 65)
-    log.info("  SATY ELITE v17 — ANTI-LOSS EDITION · 24/7")
+    log.info("  SATY ELITE v18 — DCA + ANTI-LOSS · 24/7")
     log.info("  UTBot + WaveTrend + Bj Bot R:R + BB+RSI + SMI")
     log.info("=" * 65)
 
