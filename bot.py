@@ -38,7 +38,7 @@ VARIABLES OBLIGATORIAS:
 VARIABLES OPCIONALES — GENERALES:
     MAX_OPEN_TRADES   def:12    FIXED_USDT      def:8
     MIN_SCORE         def:5     MAX_DRAWDOWN    def:15
-    DAILY_LOSS_LIMIT  def:8     MIN_VOLUME_USDT def:100000
+    DAILY_LOSS_LIMIT  def:10     MIN_VOLUME_USDT def:100000
     TOP_N_SYMBOLS     def:300   POLL_SECONDS    def:60
     TIMEFRAME         def:5m    HTF1            def:15m
     HTF2              def:1h    BTC_FILTER      def:true
