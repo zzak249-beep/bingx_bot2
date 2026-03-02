@@ -111,6 +111,7 @@ COOLDOWN_MIN   = int(os.environ.get("COOLDOWN_MIN",  "45"))
 DAILY_DD_PCT   = float(os.environ.get("DAILY_DD_PCT","5.0"))
 MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD",  "0.3"))
 DRY_RUN        = os.environ.get("DRY_RUN", "false").lower() == "true"
+HEDGE_MODE     = os.environ.get("HEDGE_MODE", "true").lower() == "true"  # BingX por defecto es Hedge
 
 _bl = os.environ.get("BLACKLIST", "")
 BLACKLIST: List[str] = [s.strip() for s in _bl.split(",") if s.strip()]
@@ -734,6 +735,54 @@ def get_symbols(ex: ccxt.Exchange) -> List[str]:
 
 
 # ══════════════════════════════════════════════════════════
+# HEDGE MODE HELPERS
+# ══════════════════════════════════════════════════════════
+def entry_params(side: str) -> dict:
+    if HEDGE_MODE:
+        return {"positionSide": "LONG" if side == "long" else "SHORT"}
+    return {}
+
+def exit_params(side: str) -> dict:
+    if HEDGE_MODE:
+        return {"positionSide": "LONG" if side == "long" else "SHORT",
+                "reduceOnly": True}
+    return {"reduceOnly": True}
+
+
+def tg_manual_alert(symbol, side, score, price, sl, tp1, tp2,
+                    atr, contracts, risk_usdt, signals, reason=""):
+    """Alerta manual cuando el bot detecta señal pero no puede ejecutar."""
+    e    = "🟢" if side == "long" else "🔴"
+    sl_d = abs(price - sl)
+    rr   = abs(tp2 - price) / max(sl_d, 1e-9)
+    lines = [
+        f"{e} <b>⚡ SEÑAL MANUAL — {side.upper()}</b>",
+        f"📌 <b>{symbol}</b>",
+        "══════════════════════════════",
+        f"🎯 Score: {score}/5  {score_bar(score)}",
+        f"💵 Entrada ahora: <code>{price:.6g}</code>",
+        f"🟡 TP1: <code>{tp1:.6g}</code>",
+        f"🟢 TP2: <code>{tp2:.6g}</code>  R:R 1:{rr:.1f}",
+        f"🛑 SL:  <code>{sl:.6g}</code>",
+        "══════════════════════════════",
+        "📊 Señales:",
+        f"  {'✅' if signals.get('st')  else '❌'} Supertrend",
+        f"  {'✅' if signals.get('ema') else '❌'} EMA estructura",
+        f"  {'✅' if signals.get('rsi') else '❌'} RSI zona sana",
+        f"  {'✅' if signals.get('adx') else '❌'} ADX fuerza",
+        f"  {'✅' if signals.get('vol') else '❌'} Volumen",
+        "══════════════════════════════",
+        f"📦 Contratos sugeridos: {contracts:.4f}",
+        f"⚖️ Riesgo: ${risk_usdt:.2f} | Leverage: {LEVERAGE}x",
+        f"📐 ATR: {atr:.5f}",
+        f"⏰ {utcnow()}",
+    ]
+    if reason:
+        lines.insert(-1, f"⚠️ {reason[:100]}")
+    tg("\n".join(lines))
+
+
+# ══════════════════════════════════════════════════════════
 # CÁLCULO DE TAMAÑO DE POSICIÓN — Kelly conservador (1% riesgo)
 # ══════════════════════════════════════════════════════════
 def calc_position_size(balance: float, price: float,
@@ -828,14 +877,16 @@ def open_trade(ex: ccxt.Exchange,
         )
 
         if not DRY_RUN:
-            # Establecer leverage
+            # Establecer leverage (con soporte Hedge Mode)
             try:
-                ex.set_leverage(LEVERAGE, symbol)
+                lv_p = {"hedged": True} if HEDGE_MODE else {}
+                ex.set_leverage(LEVERAGE, symbol, params=lv_p)
             except Exception as lv_err:
                 log.warning(f"[{symbol}] set_leverage: {lv_err}")
 
-            # Orden de entrada
-            order = ex.create_order(symbol, "market", order_side, contracts)
+            # Orden de entrada con positionSide correcto para Hedge Mode
+            ep = entry_params(side)
+            order = ex.create_order(symbol, "market", order_side, contracts, params=ep)
             entry_price = float(order.get("average") or price)
 
             # Recalcular niveles con el precio real de entrada
@@ -848,18 +899,19 @@ def open_trade(ex: ccxt.Exchange,
                 tp1_price = float(ex.price_to_precision(symbol, entry_price - TP1_ATR_MULT * atr))
                 tp2_price = float(ex.price_to_precision(symbol, entry_price - TP2_ATR_MULT * atr))
 
+            xp = exit_params(side)
+
             # TP2 con límite (mitad de contratos)
             half = float(ex.amount_to_precision(symbol, contracts * 0.5))
             try:
-                ex.create_order(symbol, "limit", close_side, half, tp2_price,
-                                params={"reduceOnly": True})
+                ex.create_order(symbol, "limit", close_side, half, tp2_price, params=xp)
             except Exception as e:
                 log.warning(f"[{symbol}] TP2 limit: {e}")
 
             # SL stop-market
             try:
-                ex.create_order(symbol, "stop_market", close_side, contracts, None,
-                                params={"stopPrice": sl_price, "reduceOnly": True})
+                sl_ep = {**xp, "stopPrice": sl_price}
+                ex.create_order(symbol, "stop_market", close_side, contracts, None, params=sl_ep)
             except Exception as e:
                 log.warning(f"[{symbol}] SL stop: {e}")
 
@@ -893,7 +945,17 @@ def open_trade(ex: ccxt.Exchange,
 
     except Exception as e:
         log.error(f"[{symbol}] open_trade: {e}")
-        tg_error(f"open {symbol}: {str(e)[:150]}")
+        # En vez de solo mandar error, mandamos SEÑAL MANUAL
+        # para que el trader pueda abrir manualmente si quiere
+        try:
+            tg_manual_alert(
+                symbol=symbol, side=side, score=score,
+                price=price, sl=sl_price, tp1=tp1_price, tp2=tp2_price,
+                atr=atr, contracts=contracts, risk_usdt=risk_usdt,
+                signals=signals, reason=str(e)[:100]
+            )
+        except Exception:
+            tg_error(f"open {symbol}: {str(e)[:150]}")
         return None
 
 
@@ -920,7 +982,7 @@ def close_trade(ex: ccxt.Exchange,
             close_side = "sell" if t.side == "long" else "buy"
             try:
                 ex.create_order(symbol, "market", close_side, qty,
-                                params={"reduceOnly": True})
+                                params=exit_params(t.side))
             except Exception as e:
                 log.error(f"[{symbol}] close market: {e}")
                 tg_error(f"close {symbol}: {e}")
@@ -973,11 +1035,12 @@ def move_be(ex: ccxt.Exchange, symbol: str):
         except Exception as e:
             log.warning(f"[{symbol}] cancel for BE: {e}")
 
-        be        = float(ex.price_to_precision(symbol, t.entry_price))
+        be         = float(ex.price_to_precision(symbol, t.entry_price))
         close_side = "sell" if t.side == "long" else "buy"
+        be_ep      = {**exit_params(t.side), "stopPrice": be}
         try:
             ex.create_order(symbol, "stop_market", close_side, t.contracts, None,
-                            params={"stopPrice": be, "reduceOnly": True})
+                            params=be_ep)
         except Exception as e:
             log.warning(f"[{symbol}] BE order: {e}")
             return
