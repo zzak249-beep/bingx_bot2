@@ -1,0 +1,62 @@
+# ══════════════════════════════════════════════════════════
+# SATY ELITE v19 — CONFIGURACIÓN
+# Copia este archivo como .env y rellena tus valores
+# Luego ejecuta: source .env && python saty_v19.py
+# ══════════════════════════════════════════════════════════
+
+# ── OBLIGATORIAS ──────────────────────────────────────────
+export BINGX_API_KEY="tu_api_key_aqui"
+export BINGX_API_SECRET="tu_api_secret_aqui"
+export TELEGRAM_BOT_TOKEN="tu_bot_token_aqui"
+export TELEGRAM_CHAT_ID="tu_chat_id_aqui"
+
+# ── MODO DE OPERACIÓN ─────────────────────────────────────
+# true = simulación sin órdenes reales (EMPIEZA AQUÍ 30 DÍAS)
+# false = live trading con dinero real
+export DRY_RUN="true"
+
+# ── CAPITAL Y RIESGO ──────────────────────────────────────
+# Riesgo por trade como % del balance total
+# 1.0% es conservador. NUNCA subas de 2%.
+export RISK_PCT="1.0"
+
+# Apalancamiento. MÁXIMO 5×. Con cuenta pequeña usa 3×.
+export LEVERAGE="3"
+
+# Máximo de trades simultáneos abiertos
+export MAX_TRADES="3"
+
+# ── FILTROS DE SEÑAL ──────────────────────────────────────
+# Señales mínimas de 5 para entrar. 4 es exigente (recomendado).
+# Con 5/5 habrá muy pocas entradas pero serán las mejores.
+export MIN_SCORE="4"
+
+# ── TIMEFRAMES ────────────────────────────────────────────
+export TIMEFRAME="15m"
+export HTF1="1h"
+export HTF2="4h"
+
+# ── FILTROS DE MERCADO ────────────────────────────────────
+# Volumen mínimo 24h en USDT (5M = solo pares top líquidos)
+export MIN_VOLUME="5000000"
+
+# Número máximo de pares a escanear (top N por volumen)
+export TOP_N="100"
+
+# Spread máximo permitido (0.3% es estricto y correcto)
+export MAX_SPREAD="0.3"
+
+# Minutos de cooldown tras cerrar un trade en ese par
+export COOLDOWN_MIN="45"
+
+# ── PROTECCIÓN ────────────────────────────────────────────
+# Circuit breaker: para el bot si pierdes este % en un día
+export DAILY_DD_PCT="5.0"
+
+# ── PARES PROHIBIDOS ──────────────────────────────────────
+# Separados por coma, sin espacios
+export BLACKLIST=""
+
+# ── VELOCIDAD ─────────────────────────────────────────────
+# Segundos entre cada ciclo de escaneo
+export POLL_SECS="60"
