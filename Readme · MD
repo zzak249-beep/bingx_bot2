@@ -1,0 +1,324 @@
+# SATY ELITE v19 — CLEAN TREND FOLLOWER
+## Guía completa de instalación y uso
+
+---
+
+## ⚠️ ADVERTENCIA IMPORTANTE
+
+El trading con futuros conlleva riesgo de pérdida **total** del capital.
+Este bot no garantiza ganancias. Úsalo solo con dinero que puedas
+permitirte perder completamente.
+
+**Empieza siempre con DRY_RUN=true durante al menos 30 días.**
+
+---
+
+## ¿Por qué v19 es diferente del v18?
+
+| Aspecto | v18 (el viejo) | v19 (este) |
+|---|---|---|
+| Señales | 25 indicadores colineales | 5 señales independientes |
+| Apalancamiento | 12× (peligroso) | 3× (controlado) |
+| DCA | Sí (promedia perdedores) | No (SL limpio) |
+| Timeframe | 5m (mucho ruido) | 15m (señal clara) |
+| Gestión riesgo | % fijo por trade | 1% del balance por trade |
+| SL | 1× ATR (muy ajustado) | 2× ATR (respeta ruido) |
+| R:R | Variable | Fijo 1:1.5 siempre |
+
+---
+
+## Las 5 señales (por qué estas y no otras)
+
+Cada señal mide algo **fundamentalmente distinto**. No hay redundancia.
+
+### 1. Supertrend (10, 3.0)
+**¿Qué mide?** Si hay una tendencia real sostenida.  
+**¿Por qué?** Es el mejor filtro de tendencia single-indicator probado.
+Usa ATR para adaptarse a la volatilidad. Cuando marca alcista,
+el precio lleva tiempo subiendo con estructura.
+
+### 2. EMA 8/48 + HTF bias
+**¿Qué mide?** La estructura de precios en múltiples timeframes.  
+**¿Por qué?** La EMA rápida (8) vs lenta (48) confirma momentum local.
+El HTF (1h/4h) confirma que no estamos contra la tendencia mayor.
+Sin este filtro, entrarías en pullbacks de tendencias bajistas.
+
+### 3. RSI(14) zona sana
+**¿Qué mide?** Que el momentum no está en extremo.  
+**¿Por qué?** Entrar con RSI > 62 en long es comprar sobrecalentado.
+Entrar con RSI < 40 en long es comprar sin momentum.
+La zona 40-62 es donde los trades tienen más espacio para moverse.
+
+### 4. ADX > 22 con DI correcto
+**¿Qué mide?** La fuerza de la tendencia, no solo su dirección.  
+**¿Por qué?** El ADX mide la fuerza. ADX < 22 = mercado lateral = trampa.
+DI+ > DI- + 3 puntos confirma que los compradores tienen ventaja real.
+
+### 5. Volumen > media 20 barras × 1.1
+**¿Qué mide?** Si hay dinero real detrás del movimiento.  
+**¿Por qué?** Los movimientos sin volumen son trampas. El volumen
+por encima de la media indica que hay jugadores institucionales
+participando, no solo robots de bajo capital.
+
+---
+
+## Gestión de riesgo (lo más importante)
+
+### Cálculo del tamaño de posición
+```
+riesgo_usdt  = balance × 1%
+sl_distancia = 2 × ATR
+contratos    = riesgo_usdt / sl_distancia
+```
+
+**Ejemplo con $100 de balance:**
+- Riesgo por trade: $1.00
+- ATR de BTC en 15m: ~$200
+- SL distance: $400
+- Contratos: $1 / $400 = 0.0025 BTC
+- Notional: 0.0025 × $50,000 = $125
+- Margen con 3×: $125 / 3 = $41.67
+
+Si el SL se activa, pierdes exactamente $1 (1% del balance).
+Si el TP2 se alcanza, ganas ~$1.50 (R:R 1:1.5).
+
+### Niveles de salida
+```
+SL  = entrada - 2.0 × ATR  (perdida máx: 1% balance)
+TP1 = entrada + 1.5 × ATR  → mover SL a break-even
+TP2 = entrada + 3.0 × ATR  (ganancia: ~1.5% balance)
+```
+
+### Circuit breaker
+Si pierdes 5% del balance en un día, el bot se detiene automáticamente.
+Con 1% de riesgo por trade, necesitas 5 stops consecutivos para activarlo.
+
+---
+
+## Instalación
+
+### Requisitos
+```bash
+Python 3.10+
+pip install ccxt pandas numpy requests
+```
+
+### Setup en servidor (recomendado: VPS con Ubuntu)
+```bash
+# 1. Clonar o copiar los archivos
+mkdir saty_v19 && cd saty_v19
+cp saty_v19.py .
+cp .env.example .env
+
+# 2. Editar configuración
+nano .env
+# Cambiar: API keys, Telegram, DRY_RUN=true inicialmente
+
+# 3. Cargar variables y ejecutar
+source .env && python saty_v19.py
+
+# 4. Para ejecutar en segundo plano con reinicio automático
+nohup source .env && python saty_v19.py >> saty.log 2>&1 &
+
+# O con tmux (recomendado)
+tmux new -s saty
+source .env && python saty_v19.py
+# Ctrl+B, D para desconectar sin cerrar
+```
+
+### Con Docker (más fácil para mantener corriendo)
+```dockerfile
+FROM python:3.12-slim
+RUN pip install ccxt pandas numpy requests
+COPY saty_v19.py /app/
+WORKDIR /app
+CMD ["python", "saty_v19.py"]
+```
+
+```bash
+docker build -t saty_v19 .
+docker run -d \
+  -e BINGX_API_KEY="..." \
+  -e BINGX_API_SECRET="..." \
+  -e TELEGRAM_BOT_TOKEN="..." \
+  -e TELEGRAM_CHAT_ID="..." \
+  -e DRY_RUN="true" \
+  --name saty_v19 \
+  saty_v19
+```
+
+---
+
+## Configuración de la API de BingX
+
+1. Ir a BingX → Perfil → API Management
+2. Crear nueva API Key
+3. Permisos necesarios:
+   - ✅ Read (leer saldo y posiciones)
+   - ✅ Perpetual Futures Trading
+   - ❌ NO marcar Withdraw (no necesario y es un riesgo)
+4. Añadir la IP de tu servidor a la whitelist
+5. Copiar API Key y Secret al .env
+
+### Importante en BingX
+- Ir a Perpetual Futures → Settings
+- Seleccionar modo **One-Way** (no Hedge Mode)
+- El bot está diseñado para One-Way
+
+---
+
+## Parámetros recomendados según el capital
+
+### Con $50-200 USDT
+```bash
+RISK_PCT="1.0"
+LEVERAGE="3"
+MAX_TRADES="2"
+MIN_SCORE="4"
+MIN_VOLUME="5000000"
+```
+
+### Con $200-1000 USDT
+```bash
+RISK_PCT="1.0"
+LEVERAGE="3"
+MAX_TRADES="3"
+MIN_SCORE="4"
+MIN_VOLUME="10000000"
+```
+
+### Con $1000+ USDT
+```bash
+RISK_PCT="0.75"
+LEVERAGE="3"
+MAX_TRADES="4"
+MIN_SCORE="4"
+MIN_VOLUME="20000000"
+```
+
+---
+
+## Logs y seguimiento
+
+### CSV de trades
+Todos los trades se guardan en `/tmp/saty_v19_trades.csv`:
+```
+ts, action, symbol, side, score, entry, exit, sl, tp1, tp2,
+contracts, risk_usdt, pnl, bars, rsi_entry, adx_entry
+```
+
+### Stats en JSON
+Stats persistentes en `/tmp/saty_v19_stats.json`:
+```json
+{
+  "wins": 12,
+  "losses": 8,
+  "gross_profit": 45.23,
+  "gross_loss": 18.40,
+  "total_pnl": 26.83,
+  "peak_balance": 126.83
+}
+```
+
+---
+
+## Señales de Telegram que recibirás
+
+### Al iniciar
+Resumen completo de configuración y balance.
+
+### Al abrir trade
+```
+🟢 LONG — SOL/USDT:USDT
+Score: 4/5  ████░
+Entrada: 142.35
+TP1:    145.50
+TP2:    148.65  R:R 1:1.5
+SL:     139.20
+Señales activas:
+  ✅ Supertrend
+  ✅ EMA estructura
+  ✅ RSI zona sana (52.3)
+  ✅ ADX fuerza (28.4)
+  ❌ Volumen
+Riesgo: $1.23 (1% balance)
+```
+
+### Al llegar a TP1
+```
+🟡 TP1 + BREAK-EVEN — SOL/USDT
+SL movido a entrada: 142.35
+Siguiente: TP2 148.65
+```
+
+### Al cerrar
+```
+✅ CERRADO — SOL/USDT
+LONG · 4/5 · TP2 ✅
+142.35 → 148.65
+💰 PnL: $1.84 (+149.6% del riesgo)
+📈 12W/8L WR:60.0% PF:2.46
+```
+
+---
+
+## Errores comunes y soluciones
+
+### "Insufficient margin"
+El balance es demasiado bajo para el contrato mínimo del exchange.
+**Solución:** Subir RISK_PCT a 2% o reducir MIN_VOLUME para ir a pares con precio bajo.
+
+### "Invalid leverage"
+BingX no permite ese leverage para ese par.
+**Solución:** Reducir LEVERAGE a 2.
+
+### Bot no abre trades
+Puede ser que el mercado esté lateral (ADX < 22 en todos los pares).
+Esto es correcto — el bot espera tendencias reales.
+**Verificar:** El log mostrará "Escaneando X pares" pero sin candidatos.
+
+### TP1 alcanzado pero el bot sigue en el trade
+Normal. Tras TP1, la mitad de la posición sigue abierta con SL en BE,
+buscando TP2 o siendo cerrada por trailing stop.
+
+---
+
+## Expectativas realistas
+
+Con esta estrategia, en condiciones normales de mercado:
+- **Win rate esperado:** 45-55% (el R:R de 1.5 hace que sea rentable con WR < 50%)
+- **Profit factor esperado:** 1.3-1.8
+- **Rendimiento mensual esperado:** 3-8% del capital (no garantizado)
+- **Máximo drawdown esperado:** 10-15% (con circuit breaker activo)
+
+**Un mes malo puede ser -5% con el circuit breaker.**
+**Un mes bueno puede ser +15%.**
+
+El trading no es un ingreso lineal. Hay meses de pérdidas seguidos
+de meses de ganancias. La gestión del capital (1% de riesgo) asegura
+que sobrevives los malos períodos.
+
+---
+
+## Lo que este bot NO hace
+
+- ❌ No garantiza ganancias
+- ❌ No opera en mercados laterales (y eso es correcto)
+- ❌ No promedia perdedores (DCA con leverage = cuenta muerta)
+- ❌ No usa señales de "whale" no verificables
+- ❌ No usa 25 indicadores colineales
+
+## Lo que este bot SÍ hace
+
+- ✅ Controla el riesgo al 1% por trade
+- ✅ Solo opera con tendencias reales (ADX > 22)
+- ✅ Mueve SL a BE cuando hay ganancia parcial
+- ✅ Usa trailing stop para proteger ganancias
+- ✅ Para automáticamente si el día es muy malo
+- ✅ Registra todos los trades para análisis posterior
+- ✅ Modo DRY-RUN para probar sin dinero real
+
+---
+
+*SATY ELITE v19 — Simplicidad con disciplina.*
+*Escrito con honestidad sobre lo que el trading algorítmico puede y no puede hacer.*
