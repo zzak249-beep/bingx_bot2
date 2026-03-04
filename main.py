@@ -9,12 +9,10 @@ import risk_manager as rm
 import telegram_notifier as tg
 
 # ══════════════════════════════════════════════════════
-# main.py — Loop principal v12.3
-# Integra: circuit breaker, multi-TF, re-entry,
-#          trailing dinámico, dashboard web, comandos TG
+# main.py v12.4 — Loop principal con diagnóstico
 # ══════════════════════════════════════════════════════
 
-HEARTBEAT_EVERY = 6   # ciclos (~6h con velas 1h)
+HEARTBEAT_EVERY = 6
 
 
 def run_cycle(cycle: int):
@@ -22,7 +20,6 @@ def run_cycle(cycle: int):
     rm.reset_daily_if_needed(balance)
     rm.update_peak(balance)
 
-    # ── Circuit breaker global ─────────────────────────
     blocked, reason = rm.check_circuit_breaker(balance)
     if blocked:
         print(f"\n  ⛔ CIRCUIT BREAKER: {reason}")
@@ -30,86 +27,91 @@ def run_cycle(cycle: int):
         return
 
     if rm.is_manually_paused():
-        print(f"\n  ⏸  Bot pausado manualmente")
+        print(f"\n  ⏸  Bot pausado manualmente — usa /resume")
         return
 
+    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     print(f"\n{'='*56}")
-    print(f"  CICLO #{cycle}  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  CICLO #{cycle}  {now_str}")
     print(f"  Balance: ${balance:.2f}  Modo: {TRADE_MODE.upper()}")
+    print(f"  Posiciones abiertas: {len(trader.get_positions())}")
     print(f"{'='*56}")
+
+    signals_found = 0
 
     for sym in SYMBOLS:
         try:
             df = data_feed.get_df(sym, interval="1h", limit=300)
             if df.empty:
-                print(f"  {sym}: sin datos")
+                print(f"  {sym}: ⚠️  sin datos de BingX")
                 continue
 
             current_price = float(df["close"].iloc[-1])
-            print(f"  {sym}  precio={current_price:.6g}", end="")
+            print(f"  {sym}  P={current_price:.6g}", end="  ")
 
             # ── Gestionar posición abierta ─────────────
             if sym in trader.get_positions():
                 trader.check_exits(sym, current_price)
                 pos = trader.get_positions().get(sym)
                 if pos:
-                    sl = pos["sl"]
-                    print(f"  → abierta ({pos['side']})  SL:{sl:.5g}")
+                    print(f"🔓 abierta {pos['side'].upper()}  SL={pos['sl']:.5g}  TP={pos['tp']:.5g}")
                 else:
-                    print(f"  → cerrada en este ciclo")
+                    print(f"🔒 cerrada en este ciclo")
                 continue
 
-            # ── Comprobar re-entry disponible ──────────
-            reentry_info = trader.get_reentry_info(sym)
-
             # ── Buscar señal ───────────────────────────
+            reentry_info = trader.get_reentry_info(sym)
             sig = strategy.get_signal(df, symbol=sym, reentry_info=reentry_info)
 
             if sig:
-                is_reentry = sig.get("reentry", False)
-                tag = " [RE-ENTRY]" if is_reentry else ""
-                print(f"  → SEÑAL {sig['side'].upper()} score={sig['score']} rsi={sig['rsi']} 4h={sig['bias_4h']}{tag}")
-                if is_reentry:
+                signals_found += 1
+                tag = " [RE-ENTRY]" if sig.get("reentry") else ""
+                print(f"🚀 SEÑAL {sig['side'].upper()} score={sig['score']} rsi={sig['rsi']} 4h={sig['bias_4h']}{tag}")
+                if sig.get("reentry"):
                     tg.notify_reentry(sym, sig["side"], sig["score"])
                 opened = trader.open_trade(sym, sig, balance)
                 if opened:
                     balance = trader.get_balance()
             else:
-                print(f"  → sin señal")
+                print(f"— sin señal")
 
         except Exception as e:
             msg = f"{sym}: {e}\n{traceback.format_exc()}"
-            print(f"  ERROR {msg[:200]}")
+            print(f"  ERROR {msg[:300]}")
             tg.notify_error(msg)
 
-        time.sleep(0.4)
+        time.sleep(0.5)
 
-    # ── Heartbeat ──────────────────────────────────────
+    print(f"\n  Ciclo #{cycle} finalizado — {signals_found} señal(es) encontrada(s)")
+
+    # ── Heartbeat cada 6 ciclos (~6h) ─────────────────
     if cycle % HEARTBEAT_EVERY == 0:
-        open_pos = len(trader.get_positions())
-        stats    = rm.get_stats(balance)
-        tg.notify_heartbeat(VERSION, cycle, balance, open_pos, TRADE_MODE, stats)
+        stats = rm.get_stats(balance)
+        tg.notify_heartbeat(VERSION, cycle, balance, len(trader.get_positions()), TRADE_MODE, stats)
 
 
 def main():
     balance = trader.get_balance()
+
     print(f"\n{'='*56}")
-    print(f"  BOT {VERSION}  —  {TRADE_MODE.upper()}")
+    print(f"  BB+RSI ELITE {VERSION}  —  {TRADE_MODE.upper()}")
     print(f"  Balance: ${balance:.2f}")
     print(f"  Pares: {len(SYMBOLS)}")
-    print(f"  Nuevas funciones:")
-    print(f"    ✅ Trailing SL dinámico desde apertura")
-    print(f"    ✅ Multi-timeframe 4h confirmación")
-    print(f"    ✅ Circuit breaker & drawdown guard")
-    print(f"    ✅ Sizing dinámico por ATR")
-    print(f"    ✅ Re-entry inteligente")
-    print(f"    ✅ Filtro de volumen")
-    print(f"    ✅ Scoring con momentum")
-    print(f"    ✅ Comandos Telegram bidireccionales")
-    print(f"    ✅ Dashboard web tiempo real")
+    print(f"  Intervalo: {POLL_INTERVAL//60}min")
+    print(f"{'='*56}")
+    print(f"  Filtros activos:")
+    from config import (MTF_ENABLED, VOLUME_FILTER, REENTRY_ENABLED,
+                        TRAIL_FROM_START, MAX_DAILY_LOSS_PCT, MAX_DRAWDOWN_PCT,
+                        SCORE_MIN, MIN_RR, RSI_LONG, RSI_SHORT)
+    print(f"    RSI LONG < {RSI_LONG}  |  RSI SHORT > {RSI_SHORT}")
+    print(f"    Score mínimo: {SCORE_MIN}  |  R:R mínimo: {MIN_RR}")
+    print(f"    MTF 4h: {'✅' if MTF_ENABLED else '❌'}")
+    print(f"    Volumen: {'✅' if VOLUME_FILTER else '❌'}")
+    print(f"    Re-entry: {'✅' if REENTRY_ENABLED else '❌'}")
+    print(f"    Trailing desde apertura: {'✅' if TRAIL_FROM_START else '❌'}")
+    print(f"    Circuit breaker: pérdida diaria>{MAX_DAILY_LOSS_PCT*100:.0f}%  drawdown>{MAX_DRAWDOWN_PCT*100:.0f}%")
     print(f"{'='*56}\n")
 
-    # Iniciar dashboard web
     if DASHBOARD_ENABLED:
         try:
             from dashboard import start_dashboard
@@ -117,9 +119,7 @@ def main():
         except Exception as e:
             print(f"  [WEB] Dashboard no disponible: {e}")
 
-    # Iniciar listener de comandos Telegram
     tg.start_command_listener()
-
     tg.notify_start(VERSION, SYMBOLS, TRADE_MODE, balance)
 
     cycle = 1
@@ -132,7 +132,7 @@ def main():
             tg.notify_error(msg)
 
         cycle += 1
-        print(f"\n  Próximo ciclo en {POLL_INTERVAL//60}min...")
+        print(f"\n  ⏰ Próximo ciclo en {POLL_INTERVAL//60}min  ({datetime.now(timezone.utc).strftime('%H:%M UTC')})\n")
         time.sleep(POLL_INTERVAL)
 
 
