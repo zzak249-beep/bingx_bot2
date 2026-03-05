@@ -230,8 +230,9 @@ def health():
 
 
 def start_dashboard():
+    from waitress import serve
     t = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=False, use_reloader=False),
+        target=lambda: serve(app, host="0.0.0.0", port=DASHBOARD_PORT, threads=4),
         daemon=True
     )
     t.start()
