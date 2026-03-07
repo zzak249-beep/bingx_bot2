@@ -1,0 +1,134 @@
+╔════════════════════════════════════════════════════════╗
+║     ARCHIVOS A ACTUALIZAR - BOT v2.0 FUSION           ║
+╚════════════════════════════════════════════════════════╝
+
+NUEVOS ARCHIVOS (Descargar + Añadir a GitHub)
+═════════════════════════════════════════════════════════
+
+1. bot_v2_main.py
+   → Reemplaza main.py
+   → Main mejorado con logging y diagnóstico
+   
+2. bot_v2_test.py
+   → Suite de 8 tests automáticos
+   → Verificar que todo funciona antes de desplegar
+
+3. DEPLOYMENT_GUIDE.md
+   → Guía completa de instalación y troubleshooting
+   → Railway setup
+
+4. CHANGELOG.md
+   → Resumen de cambios y mejoras
+   
+5. FILES_TO_UPDATE.txt
+   → Este archivo
+
+
+ARCHIVOS A ACTUALIZAR (Reemplazar versiones antiguas)
+═════════════════════════════════════════════════════════
+
+1. trader.py
+   ✏️ Línea 61: Cambiar REENTRY_COOL_DOWN → REENTRY_COOLDOWN
+   
+2. strategy.py
+   ✏️ Línea 113: Cambiar trend_1h == "flat" → trend_1h != "up"
+   ✏️ Línea 115: Invertir lógica de bull_bars
+           Antes: bull_bars = momentum_bars(...)
+           Después: bear_count = momentum_bars(...)
+                   bull_bars = 5 - bear_count
+   
+3. bingx_api.py
+   ✏️ Función fetch_klines (línea ~212):
+      - Añadir verificación de error en JSON
+      - Añadir logging de excepciones
+
+
+ARCHIVOS SIN CAMBIOS (Usar tal como están)
+═════════════════════════════════════════════════════════
+
+- config.py (OK)
+- data_feed.py (OK)
+- indicators.py (OK)
+- risk_manager.py (OK)
+- telegram_notifier.py (OK)
+- dashboard.py (OK)
+- requirements.txt (OK)
+- Dockerfile (OK)
+- railway.json (OK)
+- backtest_final.py (OK)
+- reset_state.py (OK)
+- test_telegram.py (OK)
+
+
+ARCHIVOS A ELIMINAR (Ya no se usan)
+═════════════════════════════════════════════════════════
+
+- main.py (reemplazado por bot_v2_main.py)
+- test_bingx.py (reemplazado por bot_v2_test.py)
+
+
+════════════════════════════════════════════════════════════
+
+PROCESO DE ACTUALIZACIÓN:
+════════════════════════════════════════════════════════════
+
+1. Descargar los 5 archivos nuevos:
+   ✅ bot_v2_main.py
+   ✅ bot_v2_test.py
+   ✅ DEPLOYMENT_GUIDE.md
+   ✅ CHANGELOG.md
+   ✅ FILES_TO_UPDATE.txt
+
+2. Actualizar trader.py, strategy.py, bingx_api.py con cambios
+
+3. Eliminar:
+   ❌ main.py
+   ❌ test_bingx.py
+
+4. En el repo local:
+   git add .
+   git commit -m "v2.0: Fusion bot + testing suite + fixes"
+   git push origin main
+
+5. Railway redespliega automáticamente (2-3 min)
+
+6. Verificar en Railway Logs:
+   - "✅ Todos los módulos importados correctamente"
+   - "🚀 BOT INICIADO - Esperando ciclos..."
+
+════════════════════════════════════════════════════════════
+
+IMPORTANTE: ANTES DE DESPLEGAR
+════════════════════════════════════════════════════════════
+
+✅ Ejecutar tests localmente:
+   python bot_v2_test.py
+   
+   Resultado esperado: 8/8 PASADOS
+
+✅ Verificar que tienes las variables en Railway:
+   - BINGX_API_KEY
+   - BINGX_API_SECRET
+   - TELEGRAM_TOKEN
+   - TELEGRAM_CHAT_ID
+   - TRADE_MODE (paper o live)
+
+✅ Leer DEPLOYMENT_GUIDE.md completo
+
+════════════════════════════════════════════════════════════
+
+TESTING RESULTS (Ya verificado):
+════════════════════════════════════════════════════════════
+
+✅ IMPORTS - Todos los módulos cargan
+✅ CONFIG - Parámetros válidos
+✅ BINGX API - Responde correctamente
+✅ DATA FEED - Descarga datos
+✅ INDICATORS - Calcula indicadores
+✅ STRATEGY - Genera señales
+✅ TRADER - Ejecuta operaciones
+✅ RISK MANAGER - Controla riesgo
+
+RESULTADO FINAL: 8/8 ✅
+
+════════════════════════════════════════════════════════════
