@@ -1,186 +1,118 @@
-import os
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-from config import (RISK_PCT, MAX_POSITIONS, MAX_DAILY_LOSS_PCT,
-                    MAX_DRAWDOWN_PCT, MAX_CONSEC_LOSSES, INITIAL_BAL)
+"""
+risk_manager.py - Gestion de riesgo avanzada
+- Limite de perdida diaria (drawdown diario)
+- Deteccion de correlacion entre pares abiertos
+- Position sizing por volatilidad del par
+- Trailing stop
+"""
+import logging
+from datetime import datetime, date
+from typing import List
 
-# ══════════════════════════════════════════════════════
-# risk_manager.py v3.0
-#
-# MEJORAS vs v2.0:
-#   - calc_position_size acepta size_mult (para pares ganadores)
-#   - Circuit breaker más granular
-#   - Stats más completas
-# ══════════════════════════════════════════════════════
-
-STATE_DIR  = Path("bot_state")
-RISK_FILE  = STATE_DIR / "risk_state.json"
-PAUSE_FILE = STATE_DIR / "pause.flag"
-
-_state = {
-    "peak_balance":      INITIAL_BAL,
-    "daily_start":       INITIAL_BAL,
-    "daily_date":        None,
-    "consecutive_losses": 0,
-    "total_wins":        0,
-    "total_losses":      0,
-    "manually_paused":   False,
-}
+log = logging.getLogger('bot27')
 
 
-def _load_state():
-    global _state
-    STATE_DIR.mkdir(exist_ok=True)
-    try:
-        with open(RISK_FILE) as f:
-            _state.update(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+class RiskManager:
+    def __init__(self,
+                 max_daily_loss_pct: float = 5.0,
+                 max_correlated_trades: int = 2,
+                 max_total_risk_pct: float = 6.0):
+        """
+        max_daily_loss_pct:    Para el bot si pierde este % del balance en el dia
+        max_correlated_trades: Max trades en pares correlacionados (BTC/ETH/BNB)
+        max_total_risk_pct:    Risk total maximo en todos los trades abiertos
+        """
+        self.max_daily_loss_pct    = max_daily_loss_pct
+        self.max_correlated_trades = max_correlated_trades
+        self.max_total_risk_pct    = max_total_risk_pct
 
+        self.daily_pnl    = 0.0
+        self.daily_date   = date.today()
+        self.trading_halted = False
 
-def _save_state():
-    STATE_DIR.mkdir(exist_ok=True)
-    with open(RISK_FILE, "w") as f:
-        json.dump(_state, f, indent=2)
+        # Grupos de correlacion (pares que se mueven juntos)
+        self.correlation_groups = [
+            {'BTC-USDT', 'ETH-USDT', 'BNB-USDT', 'SOL-USDT'},  # Large caps
+            {'XRP-USDT', 'ADA-USDT', 'DOT-USDT', 'ATOM-USDT'},  # Alt L1s
+            {'DOGE-USDT', 'SHIB-USDT', 'PEPE-USDT', 'FLOKI-USDT'},  # Memecoins
+            {'LINK-USDT', 'GRT-USDT', 'API3-USDT'},              # Oracles
+        ]
 
+    def reset_daily(self):
+        """Resetea contadores diarios a medianoche."""
+        today = date.today()
+        if today != self.daily_date:
+            log.info(f"Nuevo dia - reset PnL diario (era {self.daily_pnl:+.2f} USDT)")
+            self.daily_pnl      = 0.0
+            self.daily_date     = today
+            self.trading_halted = False
 
-_load_state()
+    def record_pnl(self, pnl_usdt: float, balance: float):
+        """Registra PnL y verifica limite diario."""
+        self.reset_daily()
+        self.daily_pnl += pnl_usdt
 
+        daily_loss_pct = (self.daily_pnl / balance * 100) if balance > 0 else 0
 
-def reset_daily_if_needed(balance: float):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if _state.get("daily_date") != today:
-        _state["daily_date"]  = today
-        _state["daily_start"] = balance
-        _save_state()
+        if daily_loss_pct <= -self.max_daily_loss_pct:
+            self.trading_halted = True
+            log.warning(f"LIMITE DIARIO ALCANZADO: {daily_loss_pct:.1f}% - Trading pausado hasta manana")
+            return False
+        return True
 
+    def can_trade(self, symbol: str, open_trades: dict,
+                  balance: float, risk_pct: float) -> tuple:
+        """
+        Verifica si se puede abrir un trade.
+        Returns: (bool, razon)
+        """
+        self.reset_daily()
 
-def update_peak(balance: float):
-    if balance > _state["peak_balance"]:
-        _state["peak_balance"] = balance
-        _save_state()
+        if self.trading_halted:
+            return False, "Trading pausado - limite diario alcanzado"
 
+        # Verificar riesgo total
+        total_risk = len(open_trades) * risk_pct
+        if total_risk + risk_pct > self.max_total_risk_pct:
+            return False, f"Riesgo total maximo ({self.max_total_risk_pct}%) alcanzado"
 
-def record_win():
-    _state["consecutive_losses"] = 0
-    _state["total_wins"] += 1
-    _save_state()
+        # Verificar correlacion
+        correlated_open = self._count_correlated(symbol, list(open_trades.keys()))
+        if correlated_open >= self.max_correlated_trades:
+            return False, f"Demasiados trades correlacionados ({correlated_open})"
 
+        return True, "OK"
 
-def record_loss():
-    _state["consecutive_losses"] += 1
-    _state["total_losses"] += 1
-    _save_state()
+    def _count_correlated(self, symbol: str, open_symbols: List[str]) -> int:
+        """Cuenta cuantos trades abiertos estan correlacionados con el simbolo."""
+        for group in self.correlation_groups:
+            if symbol in group:
+                return sum(1 for s in open_symbols if s in group)
+        return 0
 
+    def calc_position_size(self, balance: float, price: float,
+                            sl: float, risk_pct: float,
+                            leverage: int, atr_pct: float = None) -> float:
+        """
+        Position sizing ajustado por volatilidad.
+        Pares mas volatiles reciben menos capital automaticamente.
+        """
+        risk_usdt = balance * (risk_pct / 100)
+        sl_pct    = max(abs(price - sl) / price, 0.005)
 
-def calc_position_size(balance: float, price: float,
-                       sl_price: float, atr: float,
-                       size_mult: float = 1.0) -> float:
-    """
-    Calcular tamaño de posición basado en riesgo porcentual.
-    size_mult: multiplicador para pares con mejor historial.
-    """
-    if price <= 0 or sl_price <= 0:
-        return 0.001
+        # Ajuste por volatilidad: si ATR% es alto, reducir size
+        vol_adj = 1.0
+        if atr_pct is not None:
+            if atr_pct > 0.05:    vol_adj = 0.5   # muy volatil -> 50%
+            elif atr_pct > 0.03:  vol_adj = 0.75  # algo volatil -> 75%
 
-    # Riesgo máximo en dólares (con multiplicador del par)
-    risk_amount = balance * RISK_PCT * size_mult
+        size     = (risk_usdt / sl_pct) * leverage * vol_adj
+        max_size = balance * leverage * 0.12
+        return round(max(min(size, max_size), 5.0), 2)
 
-    # Distancia al SL
-    sl_distance = abs(price - sl_price)
-    if sl_distance <= 0:
-        return 0.001
-
-    # Tamaño en unidades del activo
-    qty = risk_amount / sl_distance
-
-    # Mínimo razonable
-    return max(qty, 0.001)
-
-
-def can_open_position(open_count: int, balance: float) -> tuple:
-    """Retorna (puede_abrir: bool, razón: str)"""
-    if open_count >= MAX_POSITIONS:
-        return False, f"máx posiciones ({MAX_POSITIONS}) alcanzado"
-
-    if _state.get("manually_paused"):
-        return False, "bot pausado manualmente"
-
-    # Verificar drawdown
-    peak = _state["peak_balance"]
-    if peak > 0:
-        dd = (peak - balance) / peak
-        if dd >= MAX_DRAWDOWN_PCT:
-            return False, f"drawdown {dd*100:.1f}% >= {MAX_DRAWDOWN_PCT*100:.0f}%"
-
-    # Verificar pérdida diaria
-    daily_start = _state.get("daily_start", balance)
-    if daily_start > 0:
-        daily_loss = (daily_start - balance) / daily_start
-        if daily_loss >= MAX_DAILY_LOSS_PCT:
-            return False, f"pérdida diaria {daily_loss*100:.1f}% >= {MAX_DAILY_LOSS_PCT*100:.0f}%"
-
-    # Verificar pérdidas consecutivas
-    if _state["consecutive_losses"] >= MAX_CONSEC_LOSSES:
-        return False, f"{_state['consecutive_losses']} pérdidas consecutivas"
-
-    return True, ""
-
-
-def check_circuit_breaker(balance: float) -> tuple:
-    """Retorna (bloqueado: bool, razón: str)"""
-    # Drawdown
-    peak = _state["peak_balance"]
-    if peak > 0:
-        dd = (peak - balance) / peak
-        if dd >= MAX_DRAWDOWN_PCT:
-            return True, f"Drawdown crítico: {dd*100:.1f}%"
-
-    # Pérdida diaria
-    daily_start = _state.get("daily_start", balance)
-    if daily_start > 0:
-        daily_loss = (daily_start - balance) / daily_start
-        if daily_loss >= MAX_DAILY_LOSS_PCT:
-            return True, f"Pérdida diaria: {daily_loss*100:.1f}%"
-
-    # Pausa manual
-    if _state.get("manually_paused") or PAUSE_FILE.exists():
-        return True, "Pausa manual activa"
-
-    return False, ""
-
-
-def is_manually_paused() -> bool:
-    return _state.get("manually_paused", False) or PAUSE_FILE.exists()
-
-
-def pause():
-    _state["manually_paused"] = True
-    _save_state()
-    PAUSE_FILE.touch()
-
-
-def resume():
-    _state["manually_paused"] = False
-    _save_state()
-    if PAUSE_FILE.exists():
-        PAUSE_FILE.unlink()
-
-
-def get_stats(balance: float) -> dict:
-    peak = _state["peak_balance"]
-    daily_start = _state.get("daily_start", balance)
-    total = _state["total_wins"] + _state["total_losses"]
-
-    return {
-        "balance":            round(balance, 2),
-        "peak_balance":       round(peak, 2),
-        "drawdown_pct":       round((peak - balance) / peak * 100, 2) if peak > 0 else 0,
-        "daily_pnl":          round(balance - daily_start, 4),
-        "daily_pnl_pct":      round((balance - daily_start) / daily_start * 100, 2) if daily_start > 0 else 0,
-        "consecutive_losses": _state["consecutive_losses"],
-        "total_wins":         _state["total_wins"],
-        "total_losses":       _state["total_losses"],
-        "overall_wr":         round(_state["total_wins"] / total * 100, 1) if total > 0 else 0,
-    }
+    def get_status(self) -> dict:
+        return {
+            'daily_pnl':       round(self.daily_pnl, 2),
+            'trading_halted':  self.trading_halted,
+            'date':            str(self.daily_date),
+        }
