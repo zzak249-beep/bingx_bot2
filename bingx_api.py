@@ -7,15 +7,14 @@ import requests
 from urllib.parse import urlencode
 
 # ══════════════════════════════════════════════════════
-# bingx_api.py v13.2 — FIX DEFINITIVO error 100001
+# bingx_api.py v13.3 — FIX DEFINITIVO error 109400
 #
-# Firma correcta para BingX Perpetual Swap:
-# https://bingx-api.github.io/docs/#/en-us/swapV2/base-info.html
+# BUG v13.2: La firma se calculaba sobre el JSON sin encodear,
+# pero requests enviaba la URL con JSON URL-encoded.
+# BingX verificaba la firma contra la URL real → MISMATCH → 109400.
 #
-# Regla exacta de BingX:
-#   payload = todos los params + timestamp (como query string)
-#   signature = HMAC_SHA256(secretKey, payload)
-#   La signature se añade SEPARADA al final de la URL
+# FIX v13.3: Firmar el query string ya URL-encoded (urlencode),
+# que es exactamente lo que BingX recibe en la URL.
 # ══════════════════════════════════════════════════════
 
 BASE = "https://open-api.bingx.com"
@@ -33,11 +32,15 @@ def _lev():
 
 def _sign(params: dict) -> str:
     """
-    BingX firma: construir query string con todos los params
-    (incluido timestamp), luego HMAC-SHA256.
-    NO ordenar — mantener orden de inserción.
+    FIX v13.3: Firmar el query string URL-encoded.
+
+    BingX verifica la firma contra la URL que recibe.
+    requests usa URL-encoding al enviar params= ('{' -> '%7B').
+    Si firmamos sin encodear, la firma no coincide -> error 109400.
+
+    Solucion: usar urlencode() identico a lo que llega en la URL.
     """
-    payload = "&".join(f"{k}={v}" for k, v in params.items())
+    payload = urlencode(params)
     return hmac.new(
         _secret().encode("utf-8"),
         payload.encode("utf-8"),
