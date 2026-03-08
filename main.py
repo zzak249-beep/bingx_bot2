@@ -114,7 +114,7 @@ def run_cycle(cycle: int):
     """Ejecuta un ciclo completo de trading"""
     try:
         balance = trader.get_balance()
-        if hasattr(rm, "reset_daily_if_needed"): rm.reset_daily_if_needed(balance)
+        rm.reset_daily_if_needed(balance)
         rm.update_peak(balance)
         
         # Circuit breaker
