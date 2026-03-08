@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-🤖 BOT TRADING v3.0 - OPTIMIZADO MÁXIMA RENTABILIDAD
-Estrategia: BB+RSI con TP:SL 3:1 + Learner + Selector dinámico
+🤖 BOT FUSIONADO v2.0 - Main mejorado
+Combina BB+RSI Elite + Learning + Análisis
+Con testing, logging y debugging integrado
 """
 
 import time
@@ -12,14 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════
-# LOGGING
+# CONFIGURACIÓN DE LOGGING
 # ═══════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
     handlers=[
-        logging.FileHandler("bot.log"),
+        logging.FileHandler('bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -38,7 +39,7 @@ try:
     import risk_manager as rm
     import telegram_notifier as tg
     import bingx_api as api
-    log.info("✅ Todos los módulos importados")
+    log.info("✅ Todos los módulos importados correctamente")
 except ImportError as e:
     log.error(f"❌ Error importando módulo: {e}")
     raise
@@ -47,257 +48,199 @@ except ImportError as e:
 # CONSTANTES
 # ═══════════════════════════════════════════════════════
 
-VERSION       = config.VERSION
-HEARTBEAT_N   = 6   # Heartbeat cada N ciclos
-STATE_DIR     = Path("bot_state")
+VERSION = "v2.0-FUSION"
+HEARTBEAT_EVERY = 6
+STATE_DIR = Path("bot_state")
 STATE_DIR.mkdir(exist_ok=True)
 
-
 # ═══════════════════════════════════════════════════════
-# SELECTOR Y LEARNER
-# ═══════════════════════════════════════════════════════
-
-_selector = None
-_learner  = None
-
-def _init_selector():
-    global _selector
-    if not config.SELECTOR_ENABLED:
-        return
-    try:
-        from selector import PairSelector
-        _selector = PairSelector()
-        active = _selector.update_active_pairs(config.SYMBOLS, n_top=config.SELECTOR_TOP_N)
-        log.info(f"✅ Selector activo: {len(active)} pares seleccionados")
-    except Exception as e:
-        log.warning(f"⚠️  Selector no disponible: {e}")
-
-def _init_learner():
-    global _learner
-    if not config.LEARNER_ENABLED:
-        return
-    try:
-        from learner import Learner
-        _learner = Learner()
-        summary = _learner.get_summary()
-        log.info(f"✅ Learner activo: {summary['total_trades']} trades analizados")
-        if summary.get("top_pairs"):
-            log.info(f"   TOP pares: {', '.join(summary['top_pairs'][:5])}")
-    except Exception as e:
-        log.warning(f"⚠️  Learner no disponible: {e}")
-
-def _get_active_symbols() -> list:
-    """Retorna lista de símbolos activos (filtrados por selector si disponible)."""
-    symbols = [s for s in config.SYMBOLS if s not in config.BLACKLIST]
-
-    if _selector and config.SELECTOR_ENABLED:
-        try:
-            active = _selector.state.get("active_pairs", [])
-            if active:
-                # Operar solo pares en la lista activa
-                symbols = [s for s in symbols if s in active]
-        except Exception:
-            pass
-
-    return symbols
-
-
-# ═══════════════════════════════════════════════════════
-# DIAGNÓSTICO
+# DIAGNÓSTICO DE CONEXIÓN
 # ═══════════════════════════════════════════════════════
 
-def diagnose_connections() -> dict:
-    diag = {"bingx_api": False, "telegram": False, "data_feed": False, "balance": 0}
-
-    # BingX
+def diagnose_connections():
+    """Verificar que todo está conectado correctamente"""
+    log.info("🔍 Iniciando diagnóstico...")
+    
+    diagnostics = {
+        "bingx_api": False,
+        "telegram": False,
+        "data_feed": False,
+        "balance": 0,
+    }
+    
+    # Test BingX
     try:
         balance = api.get_balance()
-        diag["bingx_api"] = balance >= 0
-        diag["balance"] = balance
-        log.info(f"  ✅ BingX API — Balance: ${balance:.2f}")
+        diagnostics["bingx_api"] = balance >= 0
+        diagnostics["balance"] = balance
+        if balance >= 0:
+            log.info(f"  ✅ BingX API OK - Balance: ${balance:.2f}")
+        else:
+            log.warning(f"  ⚠️  BingX retorna balance negativo: {balance}")
     except Exception as e:
-        log.error(f"  ❌ BingX API: {e}")
-
-    # Telegram
+        log.error(f"  ❌ BingX API FALLA: {e}")
+    
+    # Test Telegram
     try:
-        if config.TELEGRAM_TOKEN and config.TELEGRAM_CHAT_ID:
-            diag["telegram"] = True
-            log.info("  ✅ Telegram configurado")
+        token = config.TELEGRAM_TOKEN
+        chat_id = config.TELEGRAM_CHAT_ID
+        if token and chat_id:
+            diagnostics["telegram"] = True
+            log.info(f"  ✅ Telegram configurado (chat: {str(chat_id)[:10]}...)")
         else:
             log.warning("  ⚠️  Telegram no configurado (opcional)")
     except Exception as e:
-        log.warning(f"  ⚠️  Telegram: {e}")
-
-    # Data feed
+        log.warning(f"  ⚠️  Telegram error: {e}")
+    
+    # Test data feed
     try:
-        test_sym = config.SYMBOLS[0] if config.SYMBOLS else "LINK-USDT"
-        df = data_feed.get_df(test_sym, interval="1h", limit=50)
+        test_symbol = config.SYMBOLS[0] if config.SYMBOLS else "BTCUSDT"
+        df = data_feed.get_df(test_symbol, interval="1h", limit=50)
         if not df.empty:
-            diag["data_feed"] = True
-            log.info(f"  ✅ Data feed — {len(df)} velas de {test_sym}")
+            diagnostics["data_feed"] = True
+            log.info(f"  ✅ Data feed OK - {len(df)} velas descargadas de {test_symbol}")
         else:
-            log.error(f"  ❌ Data feed vacío para {test_sym}")
+            log.error(f"  ❌ Data feed vacío para {test_symbol}")
     except Exception as e:
-        log.error(f"  ❌ Data feed: {e}")
-
-    return diag
-
+        log.error(f"  ❌ Data feed FALLA: {e}")
+    
+    return diagnostics
 
 # ═══════════════════════════════════════════════════════
-# CICLO PRINCIPAL
+# PROCESAMIENTO DE CICLO
 # ═══════════════════════════════════════════════════════
 
-def run_cycle(cycle: int) -> tuple:
-    """Ejecuta un ciclo completo de trading."""
+def run_cycle(cycle: int):
+    """Ejecuta un ciclo completo de trading"""
     try:
         balance = trader.get_balance()
         rm.reset_daily_if_needed(balance)
         rm.update_peak(balance)
-
+        
         # Circuit breaker
         blocked, reason = rm.check_circuit_breaker(balance)
         if blocked:
-            log.warning(f"⛔ CIRCUIT BREAKER: {reason}")
+            log.warning(f"⛔ CIRCUIT BREAKER ACTIVADO: {reason}")
             tg.notify_circuit_breaker(reason)
             return 0, 0
-
+        
+        # Pausa manual
         if rm.is_manually_paused():
-            log.info("⏸️  Bot pausado (/resume para reactivar)")
+            log.info("⏸️  Bot pausado manualmente (/resume para reactivar)")
             return 0, 0
-
-        # Header
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        log.info("=" * 65)
+        
+        # Header de ciclo
+        now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        log.info("=" * 60)
         log.info(f"CICLO #{cycle}  |  {now_str}  |  Balance: ${balance:.2f}")
-        log.info("=" * 65)
-
+        log.info("=" * 60)
+        
         signals_found = 0
         trades_opened = 0
-
-        # Símbolos activos (filtrados)
-        active_symbols = _get_active_symbols()
-        log.info(f"📋 Procesando {len(active_symbols)} pares activos")
-
-        for sym in active_symbols:
+        
+        # Procesar cada símbolo
+        for sym in config.SYMBOLS:
             try:
                 # Descargar datos
-                df = data_feed.get_df(sym, interval=config.CANDLE_TF, limit=300)
+                df = data_feed.get_df(sym, interval="1h", limit=300)
                 if df.empty:
+                    log.debug(f"{sym}: sin datos disponibles")
                     continue
-
+                
                 current_price = float(df["close"].iloc[-1])
-
+                
                 # Gestionar posición abierta
                 if sym in trader.get_positions():
+                    pos = trader.get_positions()[sym]
                     trader.check_exits(sym, current_price)
+                    if sym in trader.get_positions():
+                        log.debug(f"{sym}: 🔓 posición abierta {pos['side'].upper()}")
+                    else:
+                        log.info(f"{sym}: 🔒 posición cerrada en este ciclo")
                     continue
-
+                
                 # Buscar señal
                 reentry_info = trader.get_reentry_info(sym)
                 signal = strategy.get_signal(df, symbol=sym, reentry_info=reentry_info)
-
+                
                 if signal:
                     signals_found += 1
                     tag = " [RE-ENTRY]" if signal.get("reentry") else ""
                     log.info(
-                        f"{sym}: 🚀 {signal['side'].upper()} | "
-                        f"score={signal['score']} rsi={signal['rsi']} "
-                        f"rr={((signal['tp']-signal['price'])/abs(signal['price']-signal['sl'])):.2f} "
+                        f"{sym}: 🚀 SEÑAL {signal['side'].upper()} | "
+                        f"score={signal['score']} | rsi={signal['rsi']} | "
                         f"4h={signal['bias_4h']}{tag}"
                     )
-
+                    
+                    if signal.get("reentry"):
+                        tg.notify_reentry(sym, signal["side"], signal["score"])
+                    
                     opened = trader.open_trade(sym, signal, balance)
                     if opened:
                         trades_opened += 1
                         balance = trader.get_balance()
-
-                time.sleep(0.25)
-
+                
+                time.sleep(0.3)
+            
             except Exception as e:
-                log.error(f"{sym}: ERROR — {str(e)[:200]}")
+                log.error(f"{sym}: ERROR - {str(e)[:200]}", exc_info=False)
                 tg.notify_error(f"{sym}: {str(e)[:150]}")
-
-        # Heartbeat
-        if cycle % HEARTBEAT_N == 0:
+        
+        # Heartbeat cada N ciclos
+        if cycle % HEARTBEAT_EVERY == 0:
             stats = rm.get_stats(balance)
-            summary = trader.get_summary()
-            log.info(
-                f"💓 HEARTBEAT ciclo={cycle} señales={signals_found} "
-                f"trades={trades_opened} wr={summary.get('wr', 0)}% "
-                f"pf={summary.get('pf', 0)}"
-            )
-            tg.notify_heartbeat(VERSION, cycle, balance,
-                                len(trader.get_positions()), config.TRADE_MODE, stats)
-
-        # Actualizar learner cada 50 ciclos
-        if cycle % 50 == 0 and _learner:
-            try:
-                _learner.update()
-                log.info("🧠 Learner actualizado")
-            except Exception:
-                pass
-
-        # Rotar selector cada SELECTOR_ROTATE_H horas
-        rotate_cycles = config.SELECTOR_ROTATE_H * 3600 // config.POLL_INTERVAL
-        if cycle % max(rotate_cycles, 1) == 0 and _selector:
-            try:
-                active = _selector.update_active_pairs(
-                    config.SYMBOLS, n_top=config.SELECTOR_TOP_N
-                )
-                log.info(f"🔄 Selector rotado: {len(active)} pares activos")
-            except Exception:
-                pass
-
-        log.info(f"✅ Ciclo #{cycle} — {signals_found} señal(es) | {trades_opened} trade(s)\n")
+            log.info(f"💓 HEARTBEAT: {signals_found} señales | {trades_opened} trades abiertos")
+            tg.notify_heartbeat(VERSION, cycle, balance, len(trader.get_positions()), 
+                               config.TRADE_MODE, stats)
+        
+        log.info(f"✅ Ciclo #{cycle} completado - {signals_found} señal(es) | {trades_opened} trade(s) abierto(s)\n")
+        
         return signals_found, trades_opened
-
+    
     except Exception as e:
-        log.error(f"ERROR FATAL ciclo #{cycle}: {str(e)}", exc_info=True)
+        log.error(f"ERROR FATAL en ciclo #{cycle}: {str(e)}", exc_info=True)
         tg.notify_error(f"Ciclo #{cycle}: {str(e)[:200]}")
         return 0, 0
-
 
 # ═══════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════
 
 def main():
-    log.info("=" * 65)
-    log.info(f"🤖 BOT TRADING {VERSION}")
+    """Función principal con diagnóstico e inicialización"""
+    
+    log.info("=" * 60)
+    log.info(f"🤖 BOT FUSIONADO {VERSION}")
     log.info(f"📊 Modo: {config.TRADE_MODE.upper()}")
-    log.info(f"📈 Pares config: {len(config.SYMBOLS)}")
-    log.info(f"⚡ Leverage: {config.LEVERAGE}x")
-    log.info(f"🎯 TP:SL ratio: {config.TP_ATR_MULT}:{config.SL_ATR_MULT} ATR")
+    log.info(f"📈 Pares: {len(config.SYMBOLS)}")
     log.info(f"⏱️  Intervalo: {config.POLL_INTERVAL // 60} min")
-    log.info("=" * 65)
-
+    log.info("=" * 60)
+    
     # Diagnóstico
     log.info("\n🔍 DIAGNÓSTICO DE SISTEMA:")
     diag = diagnose_connections()
-
+    
     if not diag["bingx_api"]:
-        log.error("❌ BingX API no disponible. Verifica BINGX_API_KEY y BINGX_API_SECRET")
+        log.error("❌ ERROR CRÍTICO: No hay conexión a BingX API")
+        log.error("   Verifica:")
+        log.error("   1. BINGX_API_KEY en variables")
+        log.error("   2. BINGX_API_SECRET en variables")
+        log.error("   3. API key tiene permiso 'Read' en BingX")
         raise RuntimeError("BingX API no disponible")
-
+    
     if not diag["data_feed"]:
-        log.error("❌ Data feed no disponible. Verifica los símbolos en SYMBOLS")
+        log.error("❌ ERROR CRÍTICO: No hay datos de BingX")
+        log.error("   Verifica que los símbolos en config.SYMBOLS existen")
         raise RuntimeError("Data feed no disponible")
-
-    # Inicializar módulos inteligentes
-    log.info("\n🧠 INICIALIZANDO MÓDULOS:")
-    _init_learner()
-    _init_selector()
-
-    active = _get_active_symbols()
-    log.info(f"✅ {len(active)} pares activos tras filtros")
-
-    # Configuración activa
-    log.info("\n📋 CONFIGURACIÓN ACTIVA:")
-    log.info(f"  TP: {config.TP_ATR_MULT}x ATR | SL: {config.SL_ATR_MULT}x ATR | Ratio: ~{config.TP_ATR_MULT/config.SL_ATR_MULT:.1f}:1")
-    log.info(f"  Score MIN: {config.SCORE_MIN} | RSI LONG < {config.RSI_LONG} | RSI SHORT > {config.RSI_SHORT}")
-    log.info(f"  Max posiciones: {config.MAX_POSITIONS} | Risk/trade: {config.RISK_PCT*100:.0f}%")
-    log.info(f"  MTF 4h: {'✅' if config.MTF_ENABLED else '❌'} | Selector: {'✅' if config.SELECTOR_ENABLED else '❌'} | Learner: {'✅' if config.LEARNER_ENABLED else '❌'}")
-
+    
+    log.info("\n📋 FILTROS ACTIVOS:")
+    log.info(f"  RSI LONG < {config.RSI_LONG} | RSI SHORT > {config.RSI_SHORT}")
+    log.info(f"  Score mínimo: {config.SCORE_MIN} | R:R mínimo: {config.MIN_RR}")
+    log.info(f"  MTF 4h: {'✅' if config.MTF_ENABLED else '❌'}")
+    log.info(f"  Volumen: {'✅' if config.VOLUME_FILTER else '❌'}")
+    log.info(f"  Re-entry: {'✅' if config.REENTRY_ENABLED else '❌'}")
+    log.info(f"  Trailing desde apertura: {'✅' if config.TRAIL_FROM_START else '❌'}")
+    
     # Dashboard
     if config.DASHBOARD_ENABLED:
         try:
@@ -306,55 +249,57 @@ def main():
             log.info(f"\n📊 Dashboard en puerto {config.DASHBOARD_PORT}")
         except Exception as e:
             log.warning(f"⚠️  Dashboard no disponible: {e}")
-
+    
     # Telegram
     try:
         tg.start_command_listener()
-        tg.notify_start(VERSION, active, config.TRADE_MODE, diag["balance"])
-        log.info("✅ Telegram activo")
+        tg.notify_start(VERSION, config.SYMBOLS, config.TRADE_MODE, diag["balance"])
+        log.info("✅ Telegram listener activo")
     except Exception as e:
-        log.warning(f"⚠️  Telegram: {e}")
-
-    log.info(f"\n{'='*65}")
-    log.info("🚀 BOT INICIADO — Esperando ciclos...")
-    log.info(f"{'='*65}\n")
-
+        log.warning(f"⚠️  Telegram no disponible: {e}")
+    
+    log.info(f"\n{'='*60}")
+    log.info("🚀 BOT INICIADO - Esperando ciclos...")
+    log.info(f"{'='*60}\n")
+    
     # Loop principal
-    cycle     = 1
+    cycle = 1
     stats_log = []
-
+    
     while True:
         try:
             signals, trades = run_cycle(cycle)
-
+            
+            # Guardar estadísticas
             stats_log.append({
-                "cycle":     cycle,
+                "cycle": cycle,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "signals":   signals,
-                "trades":    trades,
-                "balance":   trader.get_balance(),
+                "signals": signals,
+                "trades": trades,
+                "balance": trader.get_balance(),
             })
-
+            
+            # Guardar cada 10 ciclos
             if cycle % 10 == 0:
                 try:
                     with open(STATE_DIR / "stats.json", "w") as f:
                         json.dump(stats_log[-100:], f, indent=2)
-                except Exception:
-                    pass
-
+                except Exception as e:
+                    log.warning(f"No se guardaron stats: {e}")
+            
             cycle += 1
-            log.info(f"⏰ Próximo ciclo en {config.POLL_INTERVAL // 60}min")
-            time.sleep(config.POLL_INTERVAL)
-
+            next_in_sec = config.POLL_INTERVAL
+            log.info(f"⏰ Próximo ciclo en {next_in_sec//60}min ({config.POLL_INTERVAL}s)")
+            time.sleep(next_in_sec)
+        
         except KeyboardInterrupt:
-            log.info("\n⏹️  Bot detenido (Ctrl+C)")
+            log.info("\n⏹️  Bot detenido por usuario (Ctrl+C)")
             break
         except Exception as e:
             log.error(f"ERROR FATAL: {str(e)}", exc_info=True)
             tg.notify_error(f"Error fatal: {str(e)[:150]}")
             time.sleep(60)
             cycle += 1
-
 
 if __name__ == "__main__":
     main()
