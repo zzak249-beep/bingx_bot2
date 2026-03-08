@@ -35,6 +35,7 @@ RSI_SHORT     = int(os.getenv("RSI_SHORT",   "55"))   # casi neutral
 MIN_RR        = float(os.getenv("MIN_RR",    "1.0"))
 VOLUME_FILTER = False
 MTF_ENABLED       = False
+MTF_INTERVAL      = "4h"
 MTF_BLOCK_COUNTER = False
 
 # ─── TP:SL 4:1 ───────────────────────────────────────
