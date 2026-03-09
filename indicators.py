@@ -1,91 +1,79 @@
 #!/usr/bin/env python3
 """
-indicators.py v4.0 — Indicadores técnicos completos
-BB, RSI, SMA, MACD, Stochastic, ATR, Divergencias, Score
+indicators.py v3.0 - Indicadores tecnicos para estrategia BB+RSI
 """
 
 import numpy as np
 import pandas as pd
-from config import (BB_PERIOD, BB_STD, SMA_PERIOD, RSI_PERIOD,
-                    ATR_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-                    STOCH_K, STOCH_D, TREND_LOOKBACK, TREND_THRESH)
-
-
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    avg_g = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_l = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs    = avg_g / avg_l.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def _atr(high, low, close, period: int = 14) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-
-def _stoch(high, low, close, k=14, d=3) -> pd.Series:
-    lo  = low.rolling(k).min()
-    hi  = high.rolling(k).max()
-    raw = (close - lo) / (hi - lo + 1e-10) * 100
-    return raw.rolling(d).mean()
-
-
-def _bollinger(close, period=20, std=2.0):
-    basis = close.rolling(period).mean()
-    s     = close.rolling(period).std()
-    return basis, basis + std * s, basis - std * s
+from config import (BB_PERIOD, BB_STD, SMA_PERIOD, RSI_PERIOD, ATR_PERIOD,
+                    MACD_FAST, MACD_SLOW, MACD_SIGNAL, STOCH_K, STOCH_D,
+                    TREND_LOOKBACK, TREND_THRESH, VOLUME_FILTER)
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Añade todos los indicadores al DataFrame."""
-    c, h, l = df["close"], df["high"], df["low"]
+    df = df.copy()
+    c = df["close"]
+    h = df["high"]
+    lo = df["low"]
 
-    basis, upper, lower = _bollinger(c, BB_PERIOD, BB_STD)
-    df["basis"] = basis
-    df["upper"] = upper
-    df["lower"] = lower
+    # Bollinger Bands
+    roll = c.rolling(BB_PERIOD)
+    df["basis"] = roll.mean()
+    std = roll.std()
+    df["upper"] = df["basis"] + BB_STD * std
+    df["lower"] = df["basis"] - BB_STD * std
 
+    # SMA50
     df["sma50"] = c.rolling(SMA_PERIOD).mean()
-    df["rsi"]   = _rsi(c, RSI_PERIOD)
-    df["atr"]   = _atr(h, l, c, ATR_PERIOD)
 
-    ema_fast = _ema(c, MACD_FAST)
-    ema_slow = _ema(c, MACD_SLOW)
-    macd_line  = ema_fast - ema_slow
-    signal_line = _ema(macd_line, MACD_SIGNAL)
-    df["macd"]        = macd_line
-    df["macd_signal"] = signal_line
-    df["macd_hist"]   = macd_line - signal_line
+    # RSI
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
+    loss = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    df["stoch"] = _stoch(h, l, c, STOCH_K, STOCH_D)
+    # ATR
+    tr = pd.concat([
+        h - lo,
+        (h - c.shift()).abs(),
+        (lo - c.shift()).abs()
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(ATR_PERIOD).mean()
 
-    df["volume_ma"] = df["volume"].rolling(20).mean() if "volume" in df.columns else 1
+    # MACD
+    ema_fast = c.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_slow = c.ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=MACD_SIGNAL, adjust=False).mean()
+    df["macd"] = macd_line - signal_line  # histogram
+
+    # Stochastic
+    low_k  = lo.rolling(STOCH_K).min()
+    high_k = h.rolling(STOCH_K).max()
+    pct_k  = 100 * (c - low_k) / (high_k - low_k).replace(0, np.nan)
+    df["stoch"] = pct_k.rolling(STOCH_D).mean()
+
+    # Volume MA
+    if "volume" in df.columns:
+        df["vol_ma"] = df["volume"].rolling(20).mean()
 
     return df
 
 
-def get_trend(basis: pd.Series, idx: int, lookback: int = None) -> str:
-    """Detecta tendencia: 'up', 'down', 'flat'."""
-    lb = lookback or TREND_LOOKBACK
-    if idx < lb:
+def get_trend(basis: pd.Series, idx: int) -> str:
+    """
+    Calcula la tendencia del precio usando la BB basis (SMA).
+    Retorna: "up" | "down" | "flat"
+    """
+    if idx < TREND_LOOKBACK:
         return "flat"
     try:
-        recent = float(basis.iloc[idx])
-        past   = float(basis.iloc[idx - lb])
-        if past == 0:
+        old = float(basis.iloc[idx - TREND_LOOKBACK])
+        cur = float(basis.iloc[idx])
+        if old == 0:
             return "flat"
-        change = (recent - past) / past
+        change = (cur - old) / old
         if change > TREND_THRESH:
             return "up"
         if change < -TREND_THRESH:
@@ -95,124 +83,105 @@ def get_trend(basis: pd.Series, idx: int, lookback: int = None) -> str:
         return "flat"
 
 
-def divergence(close: pd.Series, rsi: pd.Series) -> str:
+def divergence(closes: pd.Series, rsis: pd.Series) -> str:
     """
-    Detecta divergencia entre precio y RSI.
-    Returns: 'bull', 'bear', o 'none'
+    Detecta divergencias entre precio y RSI.
+    Retorna: "bull" | "bear" | "none"
     """
     try:
-        if len(close) < 6:
+        if len(closes) < 5 or len(rsis) < 5:
             return "none"
-        c = close.dropna().values
-        r = rsi.dropna().values
-        n = min(len(c), len(r))
-        if n < 6:
+        closes = closes.dropna()
+        rsis   = rsis.dropna()
+        if len(closes) < 4 or len(rsis) < 4:
             return "none"
-        c, r = c[-n:], r[-n:]
-        # Últimos 2 valles (LONG) o picos (SHORT)
-        c_low1, c_low2 = min(c[-6:-3]), min(c[-3:])
-        r_low1, r_low2 = min(r[-6:-3]), min(r[-3:])
-        if c_low2 < c_low1 and r_low2 > r_low1:
+
+        c_old, c_new = float(closes.iloc[-4]), float(closes.iloc[-1])
+        r_old, r_new = float(rsis.iloc[-4]),   float(rsis.iloc[-1])
+
+        # Divergencia alcista: precio baja pero RSI sube
+        if c_new < c_old and r_new > r_old + 2:
             return "bull"
-        c_hi1, c_hi2 = max(c[-6:-3]), max(c[-3:])
-        r_hi1, r_hi2 = max(r[-6:-3]), max(r[-3:])
-        if c_hi2 > c_hi1 and r_hi2 < r_hi1:
+        # Divergencia bajista: precio sube pero RSI baja
+        if c_new > c_old and r_new < r_old - 2:
             return "bear"
     except Exception:
         pass
     return "none"
 
 
+def calc_score_long(rsi: float, div: str, macd_bull: bool,
+                    stoch: float, bear_bars: int) -> int:
+    """Puntuacion para señal LONG (0-100)."""
+    score = 0
+    # RSI oversold
+    if rsi < 30:    score += 30
+    elif rsi < 35:  score += 25
+    elif rsi < 40:  score += 20
+    elif rsi < 45:  score += 15
+    else:           score += 5
+    # Divergencia
+    if div == "bull":   score += 25
+    elif div == "none": score += 10
+    # MACD
+    if macd_bull:   score += 20
+    # Stoch
+    if stoch < 25:  score += 15
+    elif stoch < 35: score += 10
+    elif stoch < 50: score += 5
+    # Momentum (velas bajistas = mas probable rebote)
+    if bear_bars >= 4:   score += 10
+    elif bear_bars >= 3: score += 5
+    return score
+
+
+def calc_score_short(rsi: float, div: str, macd_bull: bool,
+                     stoch: float, bull_bars: int) -> int:
+    """Puntuacion para señal SHORT (0-100)."""
+    score = 0
+    # RSI overbought
+    if rsi > 70:    score += 30
+    elif rsi > 65:  score += 25
+    elif rsi > 60:  score += 20
+    elif rsi > 55:  score += 15
+    else:           score += 5
+    # Divergencia
+    if div == "bear":   score += 25
+    elif div == "none": score += 10
+    # MACD
+    if not macd_bull:   score += 20
+    # Stoch
+    if stoch > 75:   score += 15
+    elif stoch > 65: score += 10
+    elif stoch > 50: score += 5
+    # Momentum
+    if bull_bars >= 4:   score += 10
+    elif bull_bars >= 3: score += 5
+    return score
+
+
 def volume_ok(df: pd.DataFrame, idx: int, mult: float = 1.2) -> bool:
-    """True si volumen actual > 1.2x media 20 velas."""
+    """True si el volumen actual es mayor que la media."""
+    if not VOLUME_FILTER:
+        return True
     try:
-        if "volume" not in df.columns or "volume_ma" not in df.columns:
+        if "vol_ma" not in df.columns or "volume" not in df.columns:
             return True
-        vol    = float(df["volume"].iloc[idx])
-        vol_ma = float(df["volume_ma"].iloc[idx])
-        if vol_ma <= 0 or np.isnan(vol_ma):
-            return True
-        return vol >= vol_ma * mult
+        vol = float(df["volume"].iloc[idx])
+        vma = float(df["vol_ma"].iloc[idx])
+        return vol > vma * mult
     except Exception:
         return True
 
 
-def momentum_bars(close: pd.Series, idx: int, lookback: int = 5) -> int:
-    """
-    Cuenta velas bajistas en las últimas N velas.
-    Returns: número de velas bajistas (cierre < apertura).
-    Nota: necesita la serie completa con columna 'open'.
-    """
-    # Versión simplificada: cuenta velas donde close < close anterior
+def momentum_bars(closes: pd.Series, idx: int, lookback: int = 5) -> int:
+    """Cuenta velas bajistas en los ultimos N periodos."""
+    count = 0
     try:
-        n = min(lookback, idx)
-        if n < 1:
-            return 0
-        closes = close.iloc[idx - n: idx + 1].values
-        bear_count = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i-1])
-        return bear_count
+        start = max(0, idx - lookback + 1)
+        for i in range(start, idx + 1):
+            if i > 0 and float(closes.iloc[i]) < float(closes.iloc[i - 1]):
+                count += 1
     except Exception:
-        return 0
-
-
-def calc_score_long(rsi: float, dv: str, macd_pos: bool,
-                    stoch: float, bear_bars: int) -> int:
-    """
-    Score para señal LONG. Máximo ~100.
-    Mayor score = señal más fuerte.
-    """
-    score = 0
-
-    # RSI oversold
-    if rsi < 25:   score += 35
-    elif rsi < 30: score += 28
-    elif rsi < 35: score += 20
-    elif rsi < 40: score += 12
-
-    # Divergencia
-    if dv == "bull": score += 20
-    elif dv == "none": score += 0
-
-    # MACD positivo
-    if macd_pos: score += 15
-
-    # Stochastic oversold
-    if stoch < 20:   score += 15
-    elif stoch < 30: score += 8
-
-    # Momentum: muchas velas bajistas = rebote inminente
-    if bear_bars >= 4: score += 15
-    elif bear_bars >= 3: score += 8
-
-    return score
-
-
-def calc_score_short(rsi: float, dv: str, macd_pos: bool,
-                     stoch: float, bull_bars: int) -> int:
-    """
-    Score para señal SHORT. Máximo ~100.
-    """
-    score = 0
-
-    # RSI overbought
-    if rsi > 75:   score += 35
-    elif rsi > 70: score += 28
-    elif rsi > 65: score += 20
-    elif rsi > 60: score += 12
-
-    # Divergencia
-    if dv == "bear": score += 20
-    elif dv == "none": score += 0
-
-    # MACD negativo
-    if not macd_pos: score += 15
-
-    # Stochastic overbought
-    if stoch > 80:   score += 15
-    elif stoch > 70: score += 8
-
-    # Momentum: muchas velas alcistas = caída inminente
-    if bull_bars >= 4: score += 15
-    elif bull_bars >= 3: score += 8
-
-    return score
+        pass
+    return count
