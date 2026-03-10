@@ -1,23 +1,18 @@
-# API BINGX
-BINGX_API_KEY=tu_api_key
-BINGX_SECRET_KEY=tu_secret_key
-
-# TELEGRAM
-TELEGRAM_TOKEN=tu_bot_token
+# CREDENCIALES
+BINGX_API_KEY=tu_key_aqui
+BINGX_SECRET_KEY=tu_secret_aqui
+TELEGRAM_TOKEN=tu_token_aqui
 TELEGRAM_CHAT_ID=tu_chat_id
 
-# GESTIÓN DE CAPITAL [cite: 1, 3]
-MODO_DEMO=true
-LEVERAGE=7
-MARGEN_USDT=10
-MAX_POS=3
+# GESTIÓN DE RIESGO AGRESIVA
+MODO_DEMO=true          # Ponlo en false cuando estés listo
+LEVERAGE=10             # Subimos a 10x
+MARGEN_USDT=15          # Más USDT por operación
+MAX_POS=5               # Hasta 5 operaciones a la vez
+LOOP_SECONDS=30         # Revisión cada 30 segundos
 
-# ESTRATEGIA (Múltiplos ATR) [cite: 1, 3]
-SL_ATR_MULT=1.5
-TP1_ATR_MULT=2.0
-TP_ATR_MULT=4.0
-TRAIL_ACTIVAR=2.0
-TRAIL_DIST=1.0
-
-# SISTEMA
-LOOP_SECONDS=60
+# SENSIBILIDAD
+VWAP_STD_ENTRY=1.5      # Entra antes
+SL_ATR_MULT=1.2         # Stop ajustado
+TP1_ATR_MULT=1.2        # Salida parcial rápida
+TRAIL_DIST=0.8          # Trailing stop asfixiante
