@@ -1,65 +1,41 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║   BingX FUTURES — VWAP + EMA9 Bot v1.1 (Optimizado)              ║
-║   Mejoras: Gestión de errores, validación de datos y logs        ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
 import os, sys, time, traceback, hmac, hashlib, json
 import numpy as np
 import requests
-from datetime import datetime, date, timezone
+from datetime import datetime
 from dotenv import load_dotenv
 import logging
 
-# Configuración de Logs Profesional
+# Configuración de Logs
 load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("bot_log.log")]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-log = logging.getLogger("vwap_bot")
+log = logging.getLogger("AggressiveBot")
 
-# ═══════════════════════════════════════════════════════
-# CONFIGURACIÓN (Cargada desde .env) [cite: 1, 3]
-# ═══════════════════════════════════════════════════════
+# --- CONFIGURACIÓN ---
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_SECRET_KEY", "")
 TG_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT    = os.getenv("TELEGRAM_CHAT_ID", "")
 BASE_URL   = "https://open-api.bingx.com"
 
+# --- PARÁMETROS AGRESIVOS ---
 MODO_DEMO      = os.getenv("MODO_DEMO", "false").lower() == "true"
-LEVERAGE       = int(os.getenv("LEVERAGE", "7"))
-MARGEN_USDT    = float(os.getenv("MARGEN_USDT", "8"))
-MAX_POS        = int(os.getenv("MAX_POS", "3"))
-LOOP_SECONDS   = int(os.getenv("LOOP_SECONDS", "60"))
+LEVERAGE       = int(os.getenv("LEVERAGE", "10"))
+MARGEN_USDT    = float(os.getenv("MARGEN_USDT", "15")) # Más capital por trade
+MAX_POS        = int(os.getenv("MAX_POS", "5"))        # Más trades abiertos
+LOOP_SECONDS   = 30 # Escaneo más rápido (cada 30s)
 
-# Parámetros de Estrategia 
-VWAP_PERIODO   = int(os.getenv("VWAP_PERIODO", "20"))
-VWAP_STD1      = float(os.getenv("VWAP_STD1", "1.0"))
-VWAP_STD2      = float(os.getenv("VWAP_STD2", "2.0"))
-EMA_PERIODO    = int(os.getenv("EMA_PERIODO", "9"))
-ATR_PERIODO    = int(os.getenv("ATR_PERIODO", "14"))
-
-# Gestión de Riesgo [cite: 1, 3]
-SL_ATR_MULT    = float(os.getenv("SL_ATR_MULT", "1.5"))
-TP1_ATR_MULT   = float(os.getenv("TP1_ATR_MULT", "2.0"))
-TP_ATR_MULT    = float(os.getenv("TP_ATR_MULT", "4.0"))
-TRAIL_ACTIVAR  = float(os.getenv("TRAIL_ACTIVAR", "2.0"))
-TRAIL_DIST     = float(os.getenv("TRAIL_DIST", "1.0"))
-TIME_EXIT_H    = int(os.getenv("TIME_EXIT_H", "10"))
-SCORE_MIN      = int(os.getenv("SCORE_MIN", "60"))
-
-VERSION = "BingX-VWAP+EMA9-v1.1"
-PARES = [
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "AVAX-USDT", 
-    "LINK-USDT", "NEAR-USDT", "OP-USDT", "ARB-USDT"
-]
-
-# ═══════════════════════════════════════════════════════
-# FUNCIONES DE API (BingX) 
-# ═══════════════════════════════════════════════════════
+# --- ESTRATEGIA SENSITIVA ---
+VWAP_STD_ENTRY = 1.5  # Entrada más agresiva que 2.0
+EMA_PERIODO    = 9
+ATR_PERIODO    = 14
+SL_ATR_MULT    = 1.2  # Stop más ajustado
+TP1_ATR_MULT   = 1.2  # TP rápido para asegurar
+TP2_ATR_MULT   = 4.5  # Dejar correr el resto al máximo
+TRAIL_DIST     = 0.8  # Trailing muy pegado al precio
 
 def _sign(params):
     query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -69,106 +45,70 @@ def _request(method, path, params=None):
     p = params or {}
     p["timestamp"] = int(time.time() * 1000)
     p["signature"] = _sign(p)
-    url = f"{BASE_URL}{path}"
     headers = {"X-BX-APIKEY": API_KEY}
-    
     try:
-        if method == "GET":
-            r = requests.get(url, params=p, headers=headers, timeout=15)
-        else:
-            r = requests.post(url, params=p, headers=headers, timeout=15)
+        r = requests.request(method, f"{BASE_URL}{path}", params=p, headers=headers, timeout=10)
         return r.json()
     except Exception as e:
-        log.error(f"Error en {method} {path}: {e}")
+        log.error(f"Error API: {e}")
         return {}
 
-def get_balance():
-    if MODO_DEMO: return 1000.0
-    res = _request("GET", "/openApi/swap/v2/user/balance", {"currency": "USDT"})
-    try:
-        data = res.get("data", [])
-        if isinstance(data, list): data = data[0]
-        return float(data.get("availableMargin", 0))
-    except: return 0.0
+def get_klines(symbol):
+    params = {"symbol": symbol, "interval": "15m", "limit": 50}
+    res = _request("GET", "/openApi/swap/v3/quote/klines", params)
+    return res.get("data", [])
 
-def get_klines(symbol, interval="15m", limit=100):
-    url = f"{BASE_URL}/openApi/swap/v3/quote/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        return r.json().get("data", [])
-    except: return []
-
-# ═══════════════════════════════════════════════════════
-# INDICADORES TÉCNICOS 
-# ═══════════════════════════════════════════════════════
-
-def calc_indicators(klines):
-    # Parseo de datos
-    c = np.array([float(k[4]) for k in klines]) # Closes
-    h = np.array([float(k[2]) for k in klines]) # Highs
-    l = np.array([float(k[3]) for k in klines]) # Lows
-    v = np.array([float(k[5]) for k in klines]) # Volumes
+def get_indicators(klines):
+    # klines: [time, open, high, low, close, vol...]
+    c = np.array([float(k[4]) for k in klines])
+    h = np.array([float(k[2]) for k in klines])
+    l = np.array([float(k[3]) for k in klines])
+    v = np.array([float(k[5]) for k in klines])
     
-    # EMA 9
-    alpha = 2 / (EMA_PERIODO + 1)
-    ema = [c[0]]
-    for price in c[1:]:
-        ema.append(price * alpha + ema[-1] * (1 - alpha))
-    ema = np.array(ema)
-
+    # VWAP con Bandas
+    tp = (h + l + c) / 3
+    vwap = np.sum(tp[-20:] * v[-20:]) / np.sum(v[-20:])
+    std = np.std(tp[-20:])
+    
+    # EMA 9 (Filtro de impulso)
+    ema = c[-1] * (2/10) + (c[-2] * (1 - 2/10))
+    
     # ATR
     tr = np.maximum(h[1:] - l[1:], np.maximum(abs(h[1:] - c[:-1]), abs(l[1:] - c[:-1])))
     atr = np.mean(tr[-ATR_PERIODO:])
-
-    # VWAP (Rolling) 
-    tp = (h + l + c) / 3
-    v_sum = np.sum(v[-VWAP_PERIODO:])
-    vwap = np.sum(tp[-VWAP_PERIODO:] * v[-VWAP_PERIODO:]) / v_sum
-    
-    std = np.std(tp[-VWAP_PERIODO:])
     
     return {
-        "price": c[-1],
-        "ema": ema[-1],
-        "ema_prev": ema[-3],
-        "atr": atr,
-        "vwap": vwap,
-        "inf2": vwap - (VWAP_STD2 * std),
-        "sup2": vwap + (VWAP_STD2 * std),
-        "std": std
+        "price": c[-1], "vwap": vwap, "std": std, "ema": ema, "atr": atr,
+        "lower": vwap - (VWAP_STD_ENTRY * std),
+        "upper": vwap + (VWAP_STD_ENTRY * std)
     }
 
-# ═══════════════════════════════════════════════════════
-# LÓGICA DE TRADING 
-# ═══════════════════════════════════════════════════════
-
-def analizar_par(par):
-    klines = get_klines(par)
-    if len(klines) < 50: return {"señal": False}
+def main():
+    log.info(f"🔥 Bot AGRESIVO iniciado (Leverage {LEVERAGE}x)")
+    pares = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "AVAX-USDT", "LINK-USDT", "NEAR-USDT"]
     
-    ind = calc_indicators(klines)
-    precio = ind["price"]
-    
-    # Filtros de entrada 
-    ema_alcista = ind["ema"] > ind["ema_prev"]
-    ema_bajista = ind["ema"] < ind["ema_prev"]
-    
-    # LONG: Toca banda inferior + EMA subiendo
-    if precio <= ind["inf2"] and ema_alcista:
-        return {
-            "señal": True, "lado": "LONG", "precio": precio, "atr": ind["atr"],
-            "score": 80, "motivo": "Rebote VWAP Inf + EMA9 Up"
-        }
-    
-    # SHORT: Toca banda superior + EMA bajando
-    if precio >= ind["sup2"] and ema_bajista:
-        return {
-            "señal": True, "lado": "SHORT", "precio": precio, "atr": ind["atr"],
-            "score": 80, "motivo": "Rechazo VWAP Sup + EMA9 Down"
-        }
+    while True:
+        for par in pares:
+            try:
+                data = get_klines(par)
+                if not data: continue
+                ind = get_indicators(data)
+                
+                # Lógica de entrada agresiva
+                # LONG si precio < banda inferior y EMA9 confirma rebote
+                if ind["price"] <= ind["lower"] and ind["price"] > ind["ema"]:
+                    log.info(f"🚀 SEÑAL LONG AGRESIVA: {par} a {ind['price']}")
+                    # Aquí iría la función de abrir_orden()
+                
+                # SHORT si precio > banda superior y EMA9 confirma caída
+                elif ind["price"] >= ind["upper"] and ind["price"] < ind["ema"]:
+                    log.info(f"📉 SEÑAL SHORT AGRESIVA: {par} a {ind['price']}")
+                    # Aquí iría la función de abrir_orden()
+                    
+            except Exception as e:
+                log.error(f"Error procesando {par}: {e}")
         
-    return {"señal": False}
+        time.sleep(LOOP_SECONDS)
 
-# (El resto de la lógica de gestión de posiciones y main() se mantiene similar, 
-# pero con mejores logs y manejo de errores en las peticiones POST)
+if __name__ == "__main__":
+    main()
