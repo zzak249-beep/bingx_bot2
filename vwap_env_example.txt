@@ -1,55 +1,23 @@
-# ══════════════════════════════════════════════════════
-#   BingX VWAP+EMA9 Bot v1.0
-#   LOCAL: renombra este archivo a .env
-#   RAILWAY: copia cada variable en la pestaña Variables
-# ══════════════════════════════════════════════════════
+# API BINGX
+BINGX_API_KEY=tu_api_key
+BINGX_SECRET_KEY=tu_secret_key
 
-# ─── BINGX API (FUTURES PERPETUOS) ───────────────────
-# https://bingx.com → cuenta → Gestión API
-# Permisos necesarios: ✅ Perpetual Futures Trading
-# ❌ NO activar retiros
-BINGX_API_KEY=pon_tu_api_key_aqui
-BINGX_SECRET_KEY=pon_tu_secret_key_aqui
+# TELEGRAM
+TELEGRAM_TOKEN=tu_bot_token
+TELEGRAM_CHAT_ID=tu_chat_id
 
-# ─── TELEGRAM ─────────────────────────────────────────
-# 1. Habla con @BotFather → /newbot → copia el token
-# 2. Envía un mensaje a tu bot
-# 3. Abre: https://api.telegram.org/bot<TOKEN>/getUpdates
-# 4. Copia el número de "id" dentro de "chat"
-TELEGRAM_TOKEN=pon_tu_token_aqui
-TELEGRAM_CHAT_ID=pon_tu_chat_id_aqui
+# GESTIÓN DE CAPITAL [cite: 1, 3]
+MODO_DEMO=true
+LEVERAGE=7
+MARGEN_USDT=10
+MAX_POS=3
 
-# ─── MODO ─────────────────────────────────────────────
-MODO_DEMO=false         # true=simulación sin dinero | false=REAL ⚠️
+# ESTRATEGIA (Múltiplos ATR) [cite: 1, 3]
+SL_ATR_MULT=1.5
+TP1_ATR_MULT=2.0
+TP_ATR_MULT=4.0
+TRAIL_ACTIVAR=2.0
+TRAIL_DIST=1.0
 
-# ─── CAPITAL ──────────────────────────────────────────
-LEVERAGE=7              # apalancamiento (recomendado 5-10)
-MARGEN_USDT=8           # USDT de margen por trade
-MAX_POS=3               # máximo posiciones abiertas simultáneas
-
-# ─── VWAP ─────────────────────────────────────────────
-VWAP_PERIODO=20         # número de velas para calcular el VWAP
-VWAP_STD1=1.0           # banda interna ±1σ
-VWAP_STD2=2.0           # banda externa ±2σ (señal más fuerte)
-
-# ─── EMA ──────────────────────────────────────────────
-EMA_PERIODO=9           # EMA rápida para tendencia y confirmación
-
-# ─── SL / TP ──────────────────────────────────────────
-SL_ATR_MULT=1.5         # Stop Loss a 1.5 × ATR
-TP1_ATR_MULT=2.0        # Take Profit 1 (50%) a 2 × ATR → SL a breakeven
-TP_ATR_MULT=4.0         # Take Profit 2 (resto) a 4 × ATR — extendido
-
-# ─── FILTROS ──────────────────────────────────────────
-VOLUMEN_MIN=500000      # volumen mínimo 24h en USDT
-SCORE_MIN=60            # puntuación mínima de la señal (0-100)
-
-# ─── TRAILING STOP ────────────────────────────────────
-TRAIL_ACTIVAR=2.0       # activar trailing cuando la posición gana 2×ATR
-TRAIL_DIST=1.0          # el trailing sigue el precio a 1×ATR de distancia
-
-# ─── TIME EXIT ────────────────────────────────────────
-TIME_EXIT_H=10          # cerrar posición si lleva más de 10h abierta
-
-# ─── CICLO ────────────────────────────────────────────
-LOOP_SECONDS=60         # segundos entre cada escaneo de mercado
+# SISTEMA
+LOOP_SECONDS=60
