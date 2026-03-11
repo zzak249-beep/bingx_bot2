@@ -610,7 +610,7 @@ def analizar_par(par: str):
 
         if lado is None:
             # ✅ DEBUG: visible en Railway logs — muestra por qué no hay señal
-            if sl_long >= 3 or sl_short >= 3:
+            if sl_long >= 1 or sl_short >= 1:
                 log.debug(
                     f"[NO-SEÑAL] {par} | "
                     f"L:{sl_long}pts({','.join(ml_long) or '-'}) "
