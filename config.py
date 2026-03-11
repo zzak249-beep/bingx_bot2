@@ -68,7 +68,7 @@ TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)
 MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 25.0)
 
 # ── Score / Señales ───────────────────────────────────────────
-SCORE_MIN    = _int("SCORE_MIN",     5)    # sobre 12 máximo en v3
+SCORE_MIN    = _int("SCORE_MIN",     4)    # ✅ FIX: era 5, bajado a 4 (base ya exige FVG+KZ+zona)
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",  50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",0.1)
@@ -89,7 +89,7 @@ RSI_PERIOD     = _int("RSI_PERIOD",    14)
 RSI_BUY_MAX    = _float("RSI_BUY_MAX",  50.0)
 RSI_SELL_MIN   = _float("RSI_SELL_MIN", 50.0)
 ATR_PERIOD     = _int("ATR_PERIOD",    14)
-PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT",0.20)
+PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT",0.80)  # ✅ FIX: era 0.20 (demasiado estrecho)
 
 # ── Timeframe ─────────────────────────────────────────────────
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m").strip()
