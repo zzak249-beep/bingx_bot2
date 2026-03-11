@@ -573,21 +573,38 @@ def analizar_par(par: str):
             ml_short.append("VELA")
 
         # ── Condiciones base obligatorias ──
-        zona_long  = near_s1 or near_s2 or eq["is_eql"] or near_asia_low  or ob["bull_ob"]
-        zona_short = near_r1 or near_r2 or eq["is_eqh"] or near_asia_high or ob["bear_ob"]
-        base_long  = fvg["bull_fvg"] and kz["in_kz"] and zona_long
-        base_short = fvg["bear_fvg"] and kz["in_kz"] and zona_short
+        # ✅ FIX v3.2: zona ampliada con PP, S1-wide y rango Asia breakout
+        near_pp       = pivotes and abs(precio - pivotes["PP"]) / precio < (config.PIVOT_NEAR_PCT * 1.5) / 100
+        near_s1_wide  = pivotes and abs(precio - pivotes["S1"]) / precio < (config.PIVOT_NEAR_PCT * 1.5) / 100
+        near_r1_wide  = pivotes and abs(precio - pivotes["R1"]) / precio < (config.PIVOT_NEAR_PCT * 1.5) / 100
+        asia_break_low  = asia["valido"] and precio < asia["low"]  * 1.005
+        asia_break_high = asia["valido"] and precio > asia["high"] * 0.995
+
+        zona_long  = (near_s1 or near_s2 or near_s1_wide or near_pp
+                      or eq["is_eql"] or near_asia_low or asia_break_low or ob["bull_ob"])
+        zona_short = (near_r1 or near_r2 or near_r1_wide or near_pp
+                      or eq["is_eqh"] or near_asia_high or asia_break_high or ob["bear_ob"])
+
+        # ✅ FIX v3.2: KZ ya NO es requisito de base — es solo +1 de score.
+        # Antes: base = fvg AND kz AND zona → solo 7h de 24h podían generar señal.
+        # Ahora: base = fvg AND zona → opera 24h.
+        # Compensación: fuera de KZ se exige score_min + 1 para mayor seguridad.
+        base_long  = fvg["bull_fvg"] and zona_long
+        base_short = fvg["bear_fvg"] and zona_short
+
+        # Score mínimo dinámico: KZ activa → SCORE_MIN; fuera de KZ → SCORE_MIN + 1
+        score_min_eff = config.SCORE_MIN if kz["in_kz"] else config.SCORE_MIN + 1
 
         # ── Decidir dirección ──
         lado = score = None
         motivos = []
 
         if not config.SOLO_LONG:
-            if base_short and sl_short >= config.SCORE_MIN and trend_ok_short:
+            if base_short and sl_short >= score_min_eff and trend_ok_short:
                 if sl_short > sl_long:
                     lado, score, motivos = "SHORT", sl_short, ml_short
 
-        if base_long and sl_long >= config.SCORE_MIN and trend_ok_long:
+        if base_long and sl_long >= score_min_eff and trend_ok_long:
             if lado is None or sl_long >= sl_short:
                 lado, score, motivos = "LONG", sl_long, ml_long
 
@@ -598,11 +615,12 @@ def analizar_par(par: str):
                     f"[NO-SEÑAL] {par} | "
                     f"L:{sl_long}pts({','.join(ml_long) or '-'}) "
                     f"S:{sl_short}pts({','.join(ml_short) or '-'}) | "
-                    f"base_L={base_long}(fvg={fvg['bull_fvg']},kz={kz['in_kz']},zona={zona_long}) "
-                    f"base_S={base_short} | "
+                    f"base_L={base_long}(fvg={fvg['bull_fvg']},zona={zona_long}) "
+                    f"base_S={base_short}(fvg={fvg['bear_fvg']},zona={zona_short}) | "
                     f"trend_L={trend_ok_long}(5m={bull_trend_5m},htf={htf}) "
                     f"trend_S={trend_ok_short}(5m={bear_trend_5m}) | "
-                    f"nearS1={near_s1},nearS2={near_s2},nearR1={near_r1},"
+                    f"scoreMin={score_min_eff}(kz={kz['in_kz']}) | "
+                    f"nearS1={near_s1},nearS2={near_s2},nearR1={near_r1},nearPP={near_pp},"
                     f"ob+={ob['bull_ob']},ob-={ob['bear_ob']},kz={kz['nombre']}"
                 )
             return None

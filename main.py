@@ -24,7 +24,7 @@ if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
     logging.getLogger().setLevel(logging.DEBUG)
 
 log = logging.getLogger("main")
-log.info("=== ARRANQUE SMC BOT v3.1 ===")
+log.info("=== ARRANQUE SMC BOT v3.2 ===")
 
 try:
     import config, exchange, analizar, memoria, scanner_pares

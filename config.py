@@ -9,7 +9,7 @@ Fixes aplicados vs v3.0:
 """
 import os
 
-VERSION = "SMC-Bot v3.1 [MTF+OB+BOS+ASIA+CORRELACION]"
+VERSION = "SMC-Bot v3.2 [FIX-SEÑALES+KZ-OPCIONAL]"
 
 # ── Helpers para leer env vars de forma robusta ──────────────
 
@@ -93,10 +93,10 @@ RSI_BUY_MAX    = _float("RSI_BUY_MAX",  55.0)   # ✅ Subido de 50 → 55 (más 
 RSI_SELL_MIN   = _float("RSI_SELL_MIN", 45.0)   # ✅ Bajado de 50 → 45 (más permisivo)
 ATR_PERIOD     = _int("ATR_PERIOD",    14)
 
-# ✅ FIX CRÍTICO: era 0.20 (demasiado estrecho, casi nunca activaba)
-# Para BTC@80k con 0.20% = solo ±$160 de margen
-# Con 0.80% = ±$640 → señales reales
-PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 0.80)
+# ✅ FIX v3.2: subido de 0.80 → 1.50 para detectar zonas con precio más alejado.
+# 0.80% en BTC@80k = solo ±$640 → raramente se activaba.
+# 1.50% en BTC@80k = ±$1200 → detecta zonas reales de mercado.
+PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 1.50)
 
 # ── Timeframe ─────────────────────────────────────────────────
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m").strip()
@@ -155,6 +155,6 @@ def validar():
         errores.append(f"SCORE_MIN={SCORE_MIN} debe estar entre 1 y 12")
     if MIN_RR < 1.0:
         errores.append(f"MIN_RR={MIN_RR} demasiado bajo, mínimo recomendado 1.0")
-    if PIVOT_NEAR_PCT < 0.1:
-        errores.append(f"PIVOT_NEAR_PCT={PIVOT_NEAR_PCT} demasiado estrecho (mín 0.1)")
+    if PIVOT_NEAR_PCT < 0.3:
+        errores.append(f"PIVOT_NEAR_PCT={PIVOT_NEAR_PCT} demasiado estrecho (mín 0.3, recomendado 1.5)")
     return errores
