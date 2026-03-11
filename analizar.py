@@ -476,8 +476,9 @@ def analizar_par(par: str):
         base_long  = fvg["bull_fvg"] and kz["in_kz"] and zona_long
         base_short = fvg["bear_fvg"] and kz["in_kz"] and zona_short
 
-        trend_ok_long  = bull_trend_5m and bull_trend_1h
-        trend_ok_short = bear_trend_5m and bear_trend_1h
+        # ✅ FIX: si 1h es NEUTRAL se permite operar; solo bloquea si 1h es contrario
+        trend_ok_long  = bull_trend_5m and (htf != "BEAR")
+        trend_ok_short = bear_trend_5m and (htf != "BULL")
 
         # Decidir dirección
         lado = score = None
@@ -493,6 +494,16 @@ def analizar_par(par: str):
                 lado, score, motivos = "LONG", sl_long, ml_long
 
         if lado is None:
+            # ✅ DEBUG: loguear por qué falló (solo pares con score alto)
+            if sl_long >= 3 or sl_short >= 3:
+                log.debug(
+                    f"[NO-SEÑAL] {par} | L:{sl_long}pts({','.join(ml_long)}) S:{sl_short}pts({','.join(ml_short)}) | "
+                    f"base_L={base_long}(fvg={fvg['bull_fvg']},kz={kz['in_kz']},zona={zona_long}) "
+                    f"base_S={base_short}(fvg={fvg['bear_fvg']},zona={zona_short}) | "
+                    f"trend_L={trend_ok_long}(5m={bull_trend_5m},htf={htf}) "
+                    f"trend_S={trend_ok_short}(5m={bear_trend_5m}) | "
+                    f"near_s1={near_s1},near_s2={near_s2},near_r1={near_r1},ob_bull={ob['bull_ob']},ob_bear={ob['bear_ob']}"
+                )
             return None
 
         # SL / TP usando OB si disponible
