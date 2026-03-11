@@ -609,9 +609,17 @@ def analizar_par(par: str):
                 lado, score, motivos = "LONG", sl_long, ml_long
 
         if lado is None:
-            # ✅ DEBUG: visible en Railway logs — muestra por qué no hay señal
+            # Log ALL pairs that fail — score 0 means FVG/zona missing
+            if sl_long == 0 and sl_short == 0:
+                log.info(
+                    f"[SCORE-0] {par} | "
+                    f"fvg+={fvg['bull_fvg']} fvg-={fvg['bear_fvg']} | "
+                    f"zona+={zona_long} zona-={zona_short} | "
+                    f"kz={kz['nombre']} htf={htf} | "
+                    f"rsi={rsi:.0f} ema5m+={bull_trend_5m}"
+                )
             if sl_long >= 1 or sl_short >= 1:
-                log.debug(
+                log.info(
                     f"[NO-SEÑAL] {par} | "
                     f"L:{sl_long}pts({','.join(ml_long) or '-'}) "
                     f"S:{sl_short}pts({','.join(ml_short) or '-'}) | "
@@ -642,7 +650,7 @@ def analizar_par(par: str):
         # ── Verificar R:R mínimo ──
         rr = abs(tp - precio) / abs(precio - sl) if abs(precio - sl) > 0 else 0
         if rr < config.MIN_RR:
-            log.debug(f"[NO-SEÑAL] {par} R:R={rr:.2f} < mín {config.MIN_RR}")
+            log.info(f"[NO-SEÑAL] {par} R:R={rr:.2f} < mín {config.MIN_RR}")
             return None
 
         return {
