@@ -412,7 +412,11 @@ def volumen_ok(candles: list) -> bool:
 def analizar_par(par: str):
     try:
         candles = exchange.get_candles(par, config.TIMEFRAME, config.CANDLES_LIMIT)
-        if len(candles) < 60 or not volumen_ok(candles):
+        if len(candles) < 60:
+            log.info(f"[SKIP] {par} — pocas velas: {len(candles)}")
+            return None
+        if not volumen_ok(candles):
+            log.info(f"[SKIP] {par} — volumen insuficiente")
             return None
 
         closes = [c["close"] for c in candles]
@@ -681,7 +685,7 @@ def analizar_par(par: str):
         }
 
     except Exception as e:
-        log.error(f"analizar_par {par}: {e}")
+        log.info(f"[ERROR-PAR] {par}: {type(e).__name__}: {e}")
         return None
 
 
