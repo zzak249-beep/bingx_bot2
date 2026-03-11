@@ -114,29 +114,55 @@ def get_precio(symbol: str) -> float:
 # ══════════════════════════════════════════════════════════════
 
 INTERVAL_MAP = {
-    "1m": "1",   "3m": "3",   "5m": "5",  "15m": "15",
-    "30m": "30", "1h": "60",  "2h": "120","4h": "240",
-    "1d": "1440",
+    "1m": "1m",   "3m": "3m",   "5m": "5m",  "15m": "15m",
+    "30m": "30m", "1h": "1h",   "2h": "2h",  "4h": "4h",
+    "1d": "1d",
 }
 
 def get_candles(symbol: str, interval: str = "5m", limit: int = 200) -> list:
-    iv = INTERVAL_MAP.get(interval, "5")
+    iv = INTERVAL_MAP.get(interval, "5m")
     try:
+        # Intentar v3 primero, fallback a v2
         res = _SESSION.get(
             BASE_URL + "/openApi/swap/v3/quote/klines",
             params={"symbol": symbol, "interval": iv, "limit": limit},
             timeout=15,
         ).json()
+        raw = res.get("data", [])
+
+        # Si v3 falla o devuelve vacío, intentar v2
+        if not raw:
+            log.debug(f"get_candles {symbol}: v3 vacío, probando v2")
+            res2 = _SESSION.get(
+                BASE_URL + "/openApi/swap/v2/quote/klines",
+                params={"symbol": symbol, "interval": iv, "limit": limit},
+                timeout=15,
+            ).json()
+            raw = res2.get("data", [])
+
         candles = []
-        for c in res.get("data", []):
-            candles.append({
-                "ts":     int(c[0]),
-                "open":   float(c[1]),
-                "high":   float(c[2]),
-                "low":    float(c[3]),
-                "close":  float(c[4]),
-                "volume": float(c[5]),
-            })
+        for c in raw:
+            try:
+                if isinstance(c, list):
+                    candles.append({
+                        "ts":     int(c[0]),
+                        "open":   float(c[1]),
+                        "high":   float(c[2]),
+                        "low":    float(c[3]),
+                        "close":  float(c[4]),
+                        "volume": float(c[5]),
+                    })
+                elif isinstance(c, dict):
+                    candles.append({
+                        "ts":     int(c.get("time", c.get("openTime", 0))),
+                        "open":   float(c.get("open", 0)),
+                        "high":   float(c.get("high", 0)),
+                        "low":    float(c.get("low", 0)),
+                        "close":  float(c.get("close", 0)),
+                        "volume": float(c.get("volume", 0)),
+                    })
+            except Exception:
+                continue
         candles.sort(key=lambda x: x["ts"])
         return candles
     except Exception as e:
