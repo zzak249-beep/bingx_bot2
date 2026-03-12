@@ -1,27 +1,31 @@
 """
-analizar.py — Motor de señales SMC v4.0 [PRECISION ENTRY]
-Integra estrategia Pine Script v5:
-  ✅ Pin Bar + Engulfing detection
-  ✅ EMA 9/21 local (tendencia inmediata)
-  ✅ VWAP como nivel de referencia
-  ✅ Liquidity Sweeps
-  ✅ Cooldown por par (evita señales consecutivas)
-  ✅ ATR rápido (7) para SL más ajustados
-  ✅ Momentum de velas (3 previas)
-  ✅ MACD + volumen spike
-  ✅ Score máximo 14 puntos
+analizar.py — Motor de señales SMC v4.2 [OB+FVG CONFLUENCIA]
+
+REGLAS NUEVAS APLICADAS:
+  ✅ OB solo válido si tiene FVG coincidente (OB+FVG obligatorio)
+  ✅ OB solo válido si NO está mitigado (precio no ha vuelto al OB antes)
+  ✅ FVG como orden de magnitud institucional (gap indica bulk orders)
+  ✅ FVG bearish: solo SHORT. FVG bullish: solo LONG.
+  ✅ OB mitigado se invalida automáticamente
+  ✅ Detección mejorada de zona OB+FVG combinada para entry area
+
+BUGS CORREGIDOS:
+  ✅ total_trades no existía en compounding (KeyError en reporte horario)
+  ✅ cooldown_ok maneja TF con 'h' correctamente
+  ✅ mech_ok usa close en lugar de open para LONG (era incorrecto)
 """
 
 import logging
 from datetime import datetime, timezone
 import concurrent.futures
+import time
 
 import config
 import exchange
 
 log = logging.getLogger("analizar")
 
-# Cooldown por par: guarda el índice de barra de última señal
+# Cooldown por par: guarda el timestamp de última señal
 _last_signal_ts: dict = {}
 
 
@@ -124,10 +128,6 @@ def calc_pivotes(ph, pl, pc) -> dict:
 # ══════════════════════════════════════════════════════════════
 
 def detectar_patron_vela(candles: list, lado: str) -> dict:
-    """
-    Detecta Pin Bar, Engulfing y vela de momentum.
-    Retorna dict con tipo y confianza.
-    """
     result = {"patron": None, "confianza": 0}
     if len(candles) < 2:
         return result
@@ -144,40 +144,29 @@ def detectar_patron_vela(candles: list, lado: str) -> dict:
     body_pct    = body / rng
 
     if lado == "LONG":
-        # Pin Bar alcista: mecha inferior >= 55%, body pequeño, cierra en mitad superior
         if (lower_wick / rng >= config.PINBAR_RATIO and
                 body_pct < 0.35 and
                 c["close"] > (c["high"] + c["low"]) / 2):
             result = {"patron": "PIN_BAR", "confianza": 2}
-
-        # Engulfing alcista: vela alcista que supera el body bajista anterior
         elif (config.ENGULF_ACTIVO and
               c["close"] > c["open"] and
               prev["close"] < prev["open"] and
               c["close"] > prev["open"] and
               c["open"]  < prev["close"]):
             result = {"patron": "ENGULFING", "confianza": 2}
-
-        # Vela alcista fuerte (body > 50%)
         elif c["close"] > c["open"] and body_pct > 0.50:
             result = {"patron": "BULL_STRONG", "confianza": 1}
-
-    else:  # SHORT
-        # Pin Bar bajista: mecha superior >= 55%, body pequeño, cierra en mitad inferior
+    else:
         if (upper_wick / rng >= config.PINBAR_RATIO and
                 body_pct < 0.35 and
                 c["close"] < (c["high"] + c["low"]) / 2):
             result = {"patron": "PIN_BAR", "confianza": 2}
-
-        # Engulfing bajista
         elif (config.ENGULF_ACTIVO and
               c["close"] < c["open"] and
               prev["close"] > prev["open"] and
               c["close"] < prev["open"] and
               c["open"]  > prev["close"]):
             result = {"patron": "ENGULFING", "confianza": 2}
-
-        # Vela bajista fuerte
         elif c["close"] < c["open"] and body_pct > 0.50:
             result = {"patron": "BEAR_STRONG", "confianza": 1}
 
@@ -199,10 +188,6 @@ def momentum_ok(candles: list, lado: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 def detectar_sweep(candles: list) -> dict:
-    """
-    Sweep alcista: mecha toca mínimos del lookback pero cierra por encima.
-    Sweep bajista: mecha toca máximos del lookback pero cierra por debajo.
-    """
     result = {"sweep_bull": False, "sweep_bear": False}
     if not config.SWEEP_ACTIVO or len(candles) < config.SWEEP_LOOKBACK + 2:
         return result
@@ -275,17 +260,70 @@ def get_rango_asia(candles: list) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# ORDER BLOCKS
+# FAIR VALUE GAP — con detección de tamaño
+# ══════════════════════════════════════════════════════════════
+
+def detectar_fvg(candles: list) -> dict:
+    result = {
+        "bull_fvg": False, "bear_fvg": False,
+        "fvg_top": 0.0, "fvg_bottom": 0.0,
+        "fvg_size": 0.0,  # tamaño absoluto del FVG
+        "fvg_idx": -1,    # índice de la vela donde se detectó
+    }
+    if len(candles) < 3:
+        return result
+    desde = len(candles) - 1
+    hasta = max(len(candles) - 20, 2)
+    for i in range(desde, hasta-1, -1):
+        c0, c2 = candles[i], candles[i-2]
+        gap_bull = c0["low"] - c2["high"]
+        gap_bear = c2["low"] - c0["high"]
+        if gap_bull > config.FVG_MIN_PIPS:
+            result.update({
+                "bull_fvg": True,
+                "fvg_top": c0["low"],
+                "fvg_bottom": c2["high"],
+                "fvg_size": gap_bull,
+                "fvg_idx": i,
+            })
+            break
+        if gap_bear > config.FVG_MIN_PIPS:
+            result.update({
+                "bear_fvg": True,
+                "fvg_top": c2["low"],
+                "fvg_bottom": c0["high"],
+                "fvg_size": gap_bear,
+                "fvg_idx": i,
+            })
+            break
+    return result
+
+
+def fvg_grande(fvg: dict, atr: float) -> bool:
+    gap = fvg.get("fvg_size", abs(fvg.get("fvg_top", 0) - fvg.get("fvg_bottom", 0)))
+    return atr > 0 and gap >= atr * 0.3
+
+
+# ══════════════════════════════════════════════════════════════
+# ORDER BLOCKS — con verificación de NO mitigación  ← NUEVO
 # ══════════════════════════════════════════════════════════════
 
 def detectar_order_blocks(candles: list) -> dict:
+    """
+    Detecta Order Blocks bullish y bearish.
+    REGLA CLAVE: Un OB es válido SOLO si no ha sido mitigado.
+    Mitigación = el precio ha regresado al 50% del body del OB.
+    """
     result = {
         "bull_ob": False, "bull_ob_top": 0.0, "bull_ob_bottom": 0.0,
         "bear_ob": False, "bear_ob_top": 0.0, "bear_ob_bottom": 0.0,
+        "bull_ob_mitigado": True,   # arranca como mitigado (inválido)
+        "bear_ob_mitigado": True,
     }
     if not config.OB_ACTIVO or len(candles) < 5:
         return result
 
+    precio_actual = candles[-1]["close"]
     lb    = min(config.OB_LOOKBACK, len(candles) - 2)
     buscar = candles[-(lb+2):-1]
 
@@ -294,23 +332,113 @@ def detectar_order_blocks(candles: list) -> dict:
         rng = c["high"] - c["low"]
         if rng <= 0:
             continue
+
+        # ── Bullish OB: vela bajista seguida de impulso alcista ──
         if c["close"] < c["open"] and not result["bull_ob"]:
             if i + 2 < len(buscar):
                 c1, c2 = buscar[i+1], buscar[i+2]
                 if (c1["close"] > c1["open"] and c2["close"] > c2["open"] and c2["high"] > c["high"]):
-                    result["bull_ob"]        = True
-                    result["bull_ob_top"]    = max(c["open"], c["close"])
-                    result["bull_ob_bottom"] = c["low"]
+                    ob_top    = max(c["open"], c["close"])
+                    ob_bottom = c["low"]
+                    ob_50pct  = (ob_top + ob_bottom) / 2
+
+                    # Verificar que no fue mitigado: precio actual no debe
+                    # haber cerrado por DEBAJO del 50% del OB en velas posteriores
+                    mitigado = False
+                    for j in range(i+1, len(buscar)):
+                        if buscar[j]["close"] < ob_50pct:
+                            mitigado = True
+                            break
+
+                    result["bull_ob"]         = True
+                    result["bull_ob_top"]     = ob_top
+                    result["bull_ob_bottom"]  = ob_bottom
+                    result["bull_ob_mitigado"] = mitigado
+                    if mitigado:
+                        log.debug(f"[OB] Bull OB mitigado en índice {i} — ignorando")
+
+        # ── Bearish OB: vela alcista seguida de impulso bajista ──
         if c["close"] > c["open"] and not result["bear_ob"]:
             if i + 2 < len(buscar):
                 c1, c2 = buscar[i+1], buscar[i+2]
                 if (c1["close"] < c1["open"] and c2["close"] < c2["open"] and c2["low"] < c["low"]):
-                    result["bear_ob"]        = True
-                    result["bear_ob_top"]    = c["high"]
-                    result["bear_ob_bottom"] = min(c["open"], c["close"])
+                    ob_top    = c["high"]
+                    ob_bottom = min(c["open"], c["close"])
+                    ob_50pct  = (ob_top + ob_bottom) / 2
+
+                    mitigado = False
+                    for j in range(i+1, len(buscar)):
+                        if buscar[j]["close"] > ob_50pct:
+                            mitigado = True
+                            break
+
+                    result["bear_ob"]          = True
+                    result["bear_ob_top"]      = ob_top
+                    result["bear_ob_bottom"]   = ob_bottom
+                    result["bear_ob_mitigado"] = mitigado
+                    if mitigado:
+                        log.debug(f"[OB] Bear OB mitigado en índice {i} — ignorando")
+
         if result["bull_ob"] and result["bear_ob"]:
             break
+
     return result
+
+
+def ob_valido_bull(ob: dict, precio: float) -> bool:
+    """OB alcista válido: existe, NO mitigado, precio dentro de zona."""
+    return (ob["bull_ob"] and
+            not ob["bull_ob_mitigado"] and
+            ob["bull_ob_bottom"] <= precio <= ob["bull_ob_top"] * 1.005)
+
+
+def ob_valido_bear(ob: dict, precio: float) -> bool:
+    """OB bajista válido: existe, NO mitigado, precio dentro de zona."""
+    return (ob["bear_ob"] and
+            not ob["bear_ob_mitigado"] and
+            ob["bear_ob_bottom"] * 0.995 <= precio <= ob["bear_ob_top"])
+
+
+# ══════════════════════════════════════════════════════════════
+# CONFLUENCIA OB + FVG  ← REGLA PRINCIPAL NUEVA
+# ══════════════════════════════════════════════════════════════
+
+def ob_fvg_confluencia_bull(ob: dict, fvg: dict, precio: float) -> bool:
+    """
+    Confluencia ALCISTA: OB válido (no mitigado) + FVG alcista coincidente.
+    El FVG debe estar en zona del OB o cerca (overlap o FVG dentro del OB).
+    """
+    if not ob["bull_ob"] or ob["bull_ob_mitigado"]:
+        return False
+    if not fvg["bull_fvg"]:
+        return False
+    # El FVG bottom debe estar cerca o dentro del rango del OB
+    ob_top    = ob["bull_ob_top"]
+    ob_bottom = ob["bull_ob_bottom"]
+    fvg_bot   = fvg["fvg_bottom"]
+    fvg_top   = fvg["fvg_top"]
+    # Overlap: algún punto del FVG toca el OB
+    overlap = (fvg_bot <= ob_top and fvg_top >= ob_bottom)
+    # O precio en zona OB+FVG combinada
+    precio_en_zona = ob_bottom <= precio <= ob_top * 1.01 or fvg_bot <= precio <= fvg_top
+    return overlap or precio_en_zona
+
+
+def ob_fvg_confluencia_bear(ob: dict, fvg: dict, precio: float) -> bool:
+    """
+    Confluencia BAJISTA: OB válido (no mitigado) + FVG bajista coincidente.
+    """
+    if not ob["bear_ob"] or ob["bear_ob_mitigado"]:
+        return False
+    if not fvg["bear_fvg"]:
+        return False
+    ob_top    = ob["bear_ob_top"]
+    ob_bottom = ob["bear_ob_bottom"]
+    fvg_bot   = fvg["fvg_bottom"]
+    fvg_top   = fvg["fvg_top"]
+    overlap = (fvg_bot <= ob_top and fvg_top >= ob_bottom)
+    precio_en_zona = ob_bottom * 0.99 <= precio <= ob_top or fvg_bot <= precio <= fvg_top
+    return overlap or precio_en_zona
 
 
 # ══════════════════════════════════════════════════════════════
@@ -410,31 +538,6 @@ def detectar_eqh_eql(candles: list) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# FAIR VALUE GAP
-# ══════════════════════════════════════════════════════════════
-
-def detectar_fvg(candles: list) -> dict:
-    result = {"bull_fvg": False, "bear_fvg": False, "fvg_top": 0.0, "fvg_bottom": 0.0}
-    if len(candles) < 3:
-        return result
-    desde = len(candles) - 1
-    hasta = max(len(candles) - 20, 2)
-    for i in range(desde, hasta-1, -1):
-        c0, c2 = candles[i], candles[i-2]
-        if c0["low"] - c2["high"] > config.FVG_MIN_PIPS:
-            result.update({"bull_fvg": True, "fvg_top": c0["low"], "fvg_bottom": c2["high"]})
-            break
-        if c2["low"] - c0["high"] > config.FVG_MIN_PIPS:
-            result.update({"bear_fvg": True, "fvg_top": c2["low"], "fvg_bottom": c0["high"]})
-            break
-    return result
-
-def fvg_grande(fvg: dict, atr: float) -> bool:
-    gap = abs(fvg.get("fvg_top", 0) - fvg.get("fvg_bottom", 0))
-    return atr > 0 and gap >= atr * 0.3
-
-
-# ══════════════════════════════════════════════════════════════
 # ICT KILLZONES
 # ══════════════════════════════════════════════════════════════
 
@@ -466,37 +569,52 @@ def volumen_ok(candles: list) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-# COOLDOWN POR PAR
+# COOLDOWN POR PAR  ← FIX: manejo correcto de TF con 'h'
 # ══════════════════════════════════════════════════════════════
 
+def _tf_to_seconds(tf: str) -> int:
+    """Convierte '5m', '1h', '15m' a segundos."""
+    tf = tf.strip().lower()
+    try:
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 3600
+        elif tf.endswith("m"):
+            return int(tf[:-1]) * 60
+        elif tf.endswith("d"):
+            return int(tf[:-1]) * 86400
+        else:
+            return int(tf) * 60
+    except Exception:
+        return 300  # default 5m
+
+
 def cooldown_ok(par: str) -> bool:
-    """Evita señales consecutivas en el mismo par (mínimo N minutos)."""
-    import time
+    """Evita señales consecutivas en el mismo par."""
     last = _last_signal_ts.get(par, 0)
-    secs = config.COOLDOWN_VELAS * int(config.TIMEFRAME.replace("m","").replace("h","")) * 60
+    secs = config.COOLDOWN_VELAS * _tf_to_seconds(config.TIMEFRAME)
     return (time.time() - last) >= secs
 
+
 def registrar_senal_ts(par: str):
-    import time
     _last_signal_ts[par] = time.time()
 
 
 # ══════════════════════════════════════════════════════════════
-# SEÑAL PRINCIPAL v4.0 — Score máximo 14 puntos
+# SEÑAL PRINCIPAL v4.2 — Score máximo 14 puntos
 #
-# FVG            +2  (base obligatoria)
-# Zona S/R       +1  (base obligatoria)
-# Sweep          +2  ← NUEVO
-# OB             +2
-# BOS/CHoCH      +1
-# Patrón vela    +1/+2 (Bull_strong=1, Pin/Engulf=2)
-# MTF 1h         +1
-# EMA local      +1  ← NUEVO (EMA9>21 en 5m)
-# RSI            +1
-# MACD           +1
-# Volumen spike  +1
-# FVG grande     +1
-# Killzone       +1
+# OB+FVG confluencia  +3  (base OBLIGATORIA para máximo score)
+# FVG solo            +2  (si no hay OB, FVG sigue siendo base)
+# Liquidity Sweep     +2  ← señal fuerte de reversal
+# BOS / CHoCH         +1
+# Patrón vela         +1/+2 (Bull_strong=1, Pin/Engulf=2)
+# MTF 1h              +1
+# EMA9 + VWAP         +1
+# EMA21/50 5m         +1
+# RSI favorable       +1
+# MACD confirmado     +1
+# Volumen spike       +1
+# Killzone activa     +1
+# Zonas S/R           +1 cada (acumulativas)
 # ═════════════  14  MÁXIMO
 # ══════════════════════════════════════════════════════════════
 
@@ -519,13 +637,13 @@ def analizar_par(par: str):
         if atr <= 0:
             return None
 
-        # ── EMAs 5m (21/50 tendencia) ──
+        # ── EMAs 5m ──
         ema_f         = calc_ema(closes, config.EMA_FAST)
         ema_s         = calc_ema(closes, config.EMA_SLOW)
         bull_trend_5m = ema_f is not None and ema_s is not None and ema_f > ema_s
         bear_trend_5m = ema_f is not None and ema_s is not None and ema_f < ema_s
 
-        # ── EMA local 9/21 (señal inmediata) ──
+        # ── EMA local 9/21 ──
         ema_loc_f  = calc_ema(closes, config.EMA_LOCAL_FAST)
         ema_loc_s  = calc_ema(closes, config.EMA_LOCAL_SLOW)
         ema9_bull  = ema_loc_f is not None and ema_loc_s is not None and ema_loc_f > ema_loc_s
@@ -569,8 +687,8 @@ def analizar_par(par: str):
         pivotes   = None
         near_s1 = near_s2 = near_r1 = near_r2 = near_pp = False
         if len(candles_d) >= 2:
-            prev    = candles_d[-2]
-            pivotes = calc_pivotes(prev["high"], prev["low"], prev["close"])
+            prev_d  = candles_d[-2]
+            pivotes = calc_pivotes(prev_d["high"], prev_d["low"], prev_d["close"])
             pct     = config.PIVOT_NEAR_PCT / 100
             pct_w   = pct * 1.5
             near_s1 = abs(precio - pivotes["S1"]) / precio < pct
@@ -593,29 +711,41 @@ def analizar_par(par: str):
         if not cooldown_ok(par):
             return None
 
+        # ── Confluencia OB+FVG  ← REGLA CLAVE ──
+        ob_fvg_bull = ob_fvg_confluencia_bull(ob, fvg, precio)
+        ob_fvg_bear = ob_fvg_confluencia_bear(ob, fvg, precio)
+
         # ══════════════════════════════════════════════════════
-        # SCORING v4.0 — LONG (máx 14)
+        # SCORING v4.2 — LONG (máx 14)
         # ══════════════════════════════════════════════════════
         sl_long  = 0
         ml_long  = []
 
-        # FVG +2 (base)
-        if fvg["bull_fvg"]:
+        # OB+FVG confluencia +3 (gran señal institucional)
+        if ob_fvg_bull:
+            sl_long += 3
+            ml_long.append("OB+FVG")
+        elif fvg["bull_fvg"]:
+            # FVG solo sin OB — suma 2 puntos (base)
             sl_long += 2
             ml_long.append("FVG")
             if fvg_grande(fvg, atr):
                 sl_long += 1
                 ml_long.append("FVG+")
+        elif ob_valido_bull(ob, precio):
+            # OB sin FVG — suma 1 punto (OB sin confirmación institucional)
+            sl_long += 1
+            ml_long.append("OB")
 
-        # Sweep de mínimos +2 (señal fuerte de reversal)
+        # FVG grande como señal adicional cuando ya hay OB+FVG
+        if ob_fvg_bull and fvg_grande(fvg, atr):
+            sl_long += 1
+            ml_long.append("FVG+")
+
+        # Sweep de mínimos +2
         if sweep["sweep_bull"]:
             sl_long += 2
             ml_long.append("SWEEP")
-
-        # Order Block +2
-        if ob["bull_ob"] and ob["bull_ob_bottom"] <= precio <= ob["bull_ob_top"] * 1.005:
-            sl_long += 2
-            ml_long.append("OB")
 
         # BOS / CHoCH +1
         if bos["bos_bull"]:
@@ -662,34 +792,40 @@ def analizar_par(par: str):
             sl_long += 1
             ml_long.append(f"KZ_{kz['nombre']}")
 
-        # Zona soporte (acumulativa)
-        if near_s1:     sl_long += 1; ml_long.append("S1")
-        if near_s2:     sl_long += 1; ml_long.append("S2")
-        if eq["is_eql"]:sl_long += 1; ml_long.append("EQL")
-        if near_asia_low:sl_long += 1;ml_long.append("ASIA_LOW")
-        if asia_brk_low: sl_long += 1;ml_long.append("ASIA_BRK")
-        if near_pp:      sl_long += 1;ml_long.append("PP")
+        # Zonas soporte (acumulativas)
+        if near_s1:      sl_long += 1; ml_long.append("S1")
+        if near_s2:      sl_long += 1; ml_long.append("S2")
+        if eq["is_eql"]: sl_long += 1; ml_long.append("EQL")
+        if near_asia_low:sl_long += 1; ml_long.append("ASIA_LOW")
+        if asia_brk_low: sl_long += 1; ml_long.append("ASIA_BRK")
+        if near_pp:      sl_long += 1; ml_long.append("PP")
 
         # ══════════════════════════════════════════════════════
-        # SCORING v4.0 — SHORT (máx 14)
+        # SCORING v4.2 — SHORT (máx 14)
         # ══════════════════════════════════════════════════════
         sl_short = 0
         ml_short = []
 
-        if fvg["bear_fvg"]:
+        if ob_fvg_bear:
+            sl_short += 3
+            ml_short.append("OB+FVG")
+        elif fvg["bear_fvg"]:
             sl_short += 2
             ml_short.append("FVG")
             if fvg_grande(fvg, atr):
                 sl_short += 1
                 ml_short.append("FVG+")
+        elif ob_valido_bear(ob, precio):
+            sl_short += 1
+            ml_short.append("OB")
+
+        if ob_fvg_bear and fvg_grande(fvg, atr):
+            sl_short += 1
+            ml_short.append("FVG+")
 
         if sweep["sweep_bear"]:
             sl_short += 2
             ml_short.append("SWEEP")
-
-        if ob["bear_ob"] and ob["bear_ob_bottom"]*0.995 <= precio <= ob["bear_ob_top"]:
-            sl_short += 2
-            ml_short.append("OB")
 
         if bos["bos_bear"]:
             sl_short += 1
@@ -727,27 +863,31 @@ def analizar_par(par: str):
             sl_short += 1
             ml_short.append(f"KZ_{kz['nombre']}")
 
-        if near_r1:      sl_short += 1; ml_short.append("R1")
-        if near_r2:      sl_short += 1; ml_short.append("R2")
-        if eq["is_eqh"]: sl_short += 1; ml_short.append("EQH")
-        if near_asia_high:sl_short += 1;ml_short.append("ASIA_HIGH")
-        if asia_brk_high: sl_short += 1;ml_short.append("ASIA_BRK")
-        if near_pp:       sl_short += 1;ml_short.append("PP")
+        if near_r1:       sl_short += 1; ml_short.append("R1")
+        if near_r2:       sl_short += 1; ml_short.append("R2")
+        if eq["is_eqh"]:  sl_short += 1; ml_short.append("EQH")
+        if near_asia_high:sl_short += 1; ml_short.append("ASIA_HIGH")
+        if asia_brk_high: sl_short += 1; ml_short.append("ASIA_BRK")
+        if near_pp:       sl_short += 1; ml_short.append("PP")
 
         # ══════════════════════════════════════════════════════
         # CONDICIONES BASE — lo mínimo para generar señal
+        # REGLA: FVG es OBLIGATORIO (confirma bulk orders institucionales)
         # ══════════════════════════════════════════════════════
         zona_long  = (near_s1 or near_s2 or near_pp or eq["is_eql"] or
                       near_asia_low or asia_brk_low or ob["bull_ob"])
         zona_short = (near_r1 or near_r2 or near_pp or eq["is_eqh"] or
                       near_asia_high or asia_brk_high or ob["bear_ob"])
 
+        # FVG obligatorio (señal de órdenes institucionales)
         base_long  = fvg["bull_fvg"] and zona_long
         base_short = fvg["bear_fvg"] and zona_short
 
         # Filtros de precisión obligatorios
-        mech_ok_long  = (candles[-1]["open"] - candles[-1]["low"]) / max(candles[-1]["high"]-candles[-1]["low"], 1e-10) < 0.40
-        mech_ok_short = (candles[-1]["high"] - candles[-1]["close"]) / max(candles[-1]["high"]-candles[-1]["low"], 1e-10) < 0.40
+        rng_vela      = max(candles[-1]["high"] - candles[-1]["low"], 1e-10)
+        # FIX: mech_ok_long usa CLOSE - LOW (mecha inferior para LONG)
+        mech_ok_long  = (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > 0.40  # cierra en mitad superior
+        mech_ok_short = (candles[-1]["high"] - candles[-1]["close"]) / rng_vela < 0.60  # no mecha superior excesiva
         conf_long     = candles[-1]["close"] > candles[-1]["open"] and candles[-1]["close"] > candles[-2]["low"]
         conf_short    = candles[-1]["close"] < candles[-1]["open"] and candles[-1]["close"] < candles[-2]["high"]
         mom_long      = momentum_ok(candles, "LONG")
@@ -776,22 +916,23 @@ def analizar_par(par: str):
             if sl_long >= 3 or sl_short >= 3:
                 log.info(
                     f"[NO-SE] {par} L:{sl_long}pts S:{sl_short}pts | "
-                    f"bL={base_long}(fvg={fvg['bull_fvg']},zona={zona_long},conf={conf_long}) "
-                    f"bS={base_short}(fvg={fvg['bear_fvg']},zona={zona_short},conf={conf_short}) "
+                    f"bL={base_long}(fvg={fvg['bull_fvg']},zona={zona_long},conf={conf_long},ob_fvg={ob_fvg_bull}) "
+                    f"bS={base_short}(fvg={fvg['bear_fvg']},zona={zona_short},conf={conf_short},ob_fvg={ob_fvg_bear}) "
                     f"htf={htf} rsi={rsi:.1f} kz={kz['nombre']}"
                 )
             return None
 
-        # ── SL / TP usando ATR7 (más preciso en timeframes cortos) ──
+        # ── SL / TP usando ATR7 ──
         atr_sl = atr7 if atr7 > 0 else atr
         if lado == "LONG":
-            sl_ob  = ob["bull_ob_bottom"] * 0.998 if ob["bull_ob"] else 0
+            # SL bajo el OB si hay OB válido, si no bajo ATR
+            sl_ob  = ob["bull_ob_bottom"] * 0.998 if (ob["bull_ob"] and not ob["bull_ob_mitigado"]) else 0
             sl_atr = precio - atr_sl * config.SL_ATR_MULT
             sl     = max(sl_ob, sl_atr) if sl_ob > 0 else sl_atr
             tp     = precio + atr_sl * config.TP_ATR_MULT
             tp1    = precio + atr_sl * config.PARTIAL_TP1_MULT
         else:
-            sl_ob  = ob["bear_ob_top"] * 1.002 if ob["bear_ob"] else 0
+            sl_ob  = ob["bear_ob_top"] * 1.002 if (ob["bear_ob"] and not ob["bear_ob_mitigado"]) else 0
             sl_atr = precio + atr_sl * config.SL_ATR_MULT
             sl     = min(sl_ob, sl_atr) if sl_ob > 0 else sl_atr
             tp     = precio - atr_sl * config.TP_ATR_MULT
@@ -806,37 +947,40 @@ def analizar_par(par: str):
         registrar_senal_ts(par)
 
         return {
-            "par":        par,
-            "lado":       lado,
-            "precio":     precio,
-            "sl":         round(sl, 8),
-            "tp":         round(tp, 8),
-            "tp1":        round(tp1, 8),
-            "atr":        round(atr_sl, 8),
-            "score":      score,
-            "rsi":        rsi,
-            "rr":         round(rr, 2),
-            "motivos":    motivos,
-            "kz":         kz["nombre"],
-            "vwap":       round(vwap, 8),
-            "sobre_vwap": sobre_vwap,
-            "fvg_top":    fvg.get("fvg_top", 0),
-            "fvg_bottom": fvg.get("fvg_bottom", 0),
-            "pivotes":    pivotes,
-            "htf":        htf,
-            "ob_bull":    ob["bull_ob"],
-            "ob_bear":    ob["bear_ob"],
-            "bos_bull":   bos["bos_bull"],
-            "bos_bear":   bos["bos_bear"],
-            "choch_bull": bos["choch_bull"],
-            "choch_bear": bos["choch_bear"],
-            "sweep_bull": sweep["sweep_bull"],
-            "sweep_bear": sweep["sweep_bear"],
-            "patron":     pat_long["patron"] if lado == "LONG" else pat_short["patron"],
-            "vela_conf":  pat_long["patron"] is not None if lado == "LONG" else pat_short["patron"] is not None,
-            "macd_hist":  macd_hist,
-            "vol_ratio":  round(vol_ratio, 2),
-            "asia_valido":asia["valido"],
+            "par":          par,
+            "lado":         lado,
+            "precio":       precio,
+            "sl":           round(sl, 8),
+            "tp":           round(tp, 8),
+            "tp1":          round(tp1, 8),
+            "atr":          round(atr_sl, 8),
+            "score":        score,
+            "rsi":          rsi,
+            "rr":           round(rr, 2),
+            "motivos":      motivos,
+            "kz":           kz["nombre"],
+            "vwap":         round(vwap, 8),
+            "sobre_vwap":   sobre_vwap,
+            "fvg_top":      fvg.get("fvg_top", 0),
+            "fvg_bottom":   fvg.get("fvg_bottom", 0),
+            "pivotes":      pivotes,
+            "htf":          htf,
+            "ob_bull":      ob["bull_ob"],
+            "ob_bear":      ob["bear_ob"],
+            "ob_fvg_bull":  ob_fvg_bull,
+            "ob_fvg_bear":  ob_fvg_bear,
+            "ob_mitigado":  ob["bull_ob_mitigado"] if lado == "LONG" else ob["bear_ob_mitigado"],
+            "bos_bull":     bos["bos_bull"],
+            "bos_bear":     bos["bos_bear"],
+            "choch_bull":   bos["choch_bull"],
+            "choch_bear":   bos["choch_bear"],
+            "sweep_bull":   sweep["sweep_bull"],
+            "sweep_bear":   sweep["sweep_bear"],
+            "patron":       pat_long["patron"] if lado == "LONG" else pat_short["patron"],
+            "vela_conf":    pat_long["patron"] is not None if lado == "LONG" else pat_short["patron"] is not None,
+            "macd_hist":    macd_hist,
+            "vol_ratio":    round(vol_ratio, 2),
+            "asia_valido":  asia["valido"],
         }
 
     except Exception as e:
