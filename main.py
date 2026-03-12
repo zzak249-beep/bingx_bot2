@@ -1,5 +1,5 @@
 """
-main.py — SMC Bot BingX v4.2 [REAL MONEY | 24/7 | AUTO-LEARN]
+main.py — SMC Bot BingX v4.3 [REAL MONEY | 24/7 | AUTO-LEARN]
 $10 por trade × 10x | Compounding | OB+FVG confluencia | Sin parar
 
 BUGS CORREGIDOS:
@@ -594,6 +594,10 @@ def main():
     if balance <= 0 and not config.MODO_DEMO:
         _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
 
+    # FIX v4.3: sincronizar reloj con BingX para evitar errores de timestamp en órdenes
+    log.info("Sincronizando tiempo con servidor BingX...")
+    exchange.sync_server_time()
+
     log.info("Cargando contratos de futuros perpetuos...")
     exchange._cargar_contratos()
     log.info(f"Contratos cargados: {len(exchange._CONTRATOS_FUTURES)} pares válidos")
@@ -744,7 +748,7 @@ def main():
 
         except KeyboardInterrupt:
             log.info("Detenido (Ctrl+C)")
-            _notif("🛑 *SMC Bot v4.2 detenido manualmente.*")
+            _notif("🛑 *SMC Bot v4.3 detenido manualmente.*")
             break
         except Exception as e:
             log.error(f"ERROR CICLO {ciclo}: {e}\n{traceback.format_exc()}")
