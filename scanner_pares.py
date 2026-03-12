@@ -5,6 +5,10 @@ Cache de 1 hora para no saturar la API.
 """
 
 import requests, logging, time
+try:
+    import memoria as _memoria
+except ImportError:
+    _memoria = None
 
 log      = logging.getLogger("scanner")
 BASE_URL = "https://open-api.bingx.com"
@@ -110,4 +114,19 @@ def get_pares_cached(volumen_min: float = VOLUMEN_MIN_24H) -> list:
         _cache_pares = get_todos_los_pares(volumen_min)
         _cache_ts    = time.time()
         log.info(f"[SCANNER] Cache actualizada: {len(_cache_pares)} pares")
+        # Filtrar pares eliminados por aprendizaje (memoria)
+    if _memoria:
+        _cache_pares = _memoria.filtrar_pares(_cache_pares)
+
+    # Filtrar pares que fallaron en API (exchange)
+    try:
+        import exchange as _ex
+        ns = _ex.get_pares_no_soportados()
+        if ns:
+            antes = len(_cache_pares)
+            _cache_pares = [p for p in _cache_pares if p not in ns]
+            log.debug(f"[SCANNER] {antes - len(_cache_pares)} pares bloqueados por API eliminados")
+    except Exception:
+        pass
+
     return _cache_pares
