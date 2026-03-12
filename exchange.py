@@ -1,20 +1,17 @@
 """
-exchange.py — BingX Perpetual Futures REST API v4.2 [FIX ERROR 109400]
+exchange.py — BingX Perpetual Futures REST API v4.3 [FIX COMPLETO]
 
 BUGS CORREGIDOS EN ESTA VERSION:
-  ✅ FIX#7 — _build_query NO usa sorted() — BingX firma sobre el string
-             en el orden exacto de inserción. sorted() rompía la firma
-             cuando el orden alfabético difería del orden de inserción.
-             SOLUCIÓN: timestamp siempre al FINAL, sin sorted().
-  ✅ FIX#8 — quantity como string limpio sin notación científica ni .0
-             '5600.0' → '5600' | '0.001' se mantiene | nunca '5.6e3'
-  ✅ FIX#9 — _place_sl_tp: quantity también formateada igual (string limpio)
-  ✅ FIX#10 — set_leverage: verificar código respuesta, no crashear
-  ✅ FIX#11 — Modo hedge (BOTH) vs modo one-way: detectar y adaptar
-             positionSide solo se envía si la cuenta usa hedge mode
-  ✅ FIX#12 — calcular_cantidad: PIXEL-USDT y similares pueden tener
-             stepSize muy pequeño → log detallado para diagnóstico
-  ✅ FIX#1-6 — Todos los fixes anteriores se mantienen
+  ✅ FIX#13 — detectar_modo_posicion() AÑADIDA (faltaba, causaba AttributeError
+              al arrancar y bloqueaba todo el bot)
+  ✅ FIX#14 — positionSide ahora es DINÁMICO según _HEDGE_MODE:
+              Hedge mode  → "LONG" / "SHORT"
+              One-way mode → "BOTH"
+              Error 109400 "Invalid parameters" resuelto definitivamente
+  ✅ FIX#15 — get_balance() robusto: maneja data como dict, list, o valor
+              plano. Prueba múltiples campos (availableMargin, balance,
+              walletBalance) y usa fallback seguro en todos los casos
+  ✅ FIX#7-12 — Todos los fixes anteriores se mantienen
 """
 
 import time, hmac, hashlib, logging, math
@@ -33,6 +30,59 @@ _CONTRATOS_TS:      float = 0
 
 # Modo de posición: True = hedge (LONG/SHORT), False = one-way
 _HEDGE_MODE: bool = True   # BingX perpetuos usan hedge mode por defecto
+
+
+def detectar_modo_posicion():
+    """
+    ✅ FIX#13 — Detecta si la cuenta BingX usa Hedge mode o One-way mode.
+    Hedge mode   → positionSide = "LONG" / "SHORT"
+    One-way mode → positionSide = "BOTH"
+    Sin esta función, main.py crasheaba con AttributeError al arrancar.
+    """
+    global _HEDGE_MODE
+    if config.MODO_DEMO:
+        _HEDGE_MODE = True
+        return
+
+    # Intentar endpoint oficial de modo de posición
+    for endpoint in (
+        "/openApi/swap/v1/trade/positionSide/dual",
+        "/openApi/swap/v2/trade/positionSide/dual",
+    ):
+        try:
+            res  = _get(endpoint)
+            code = res.get("code", -1)
+            if code in (0, 200):
+                data = res.get("data", {})
+                if isinstance(data, dict):
+                    dual = data.get("dualSidePosition", data.get("dualSide", True))
+                    _HEDGE_MODE = bool(dual)
+                    log.info(
+                        f"[MODE] Modo detectado vía {endpoint}: "
+                        f"dualSidePosition={dual} → "
+                        f"{'HEDGE (LONG/SHORT)' if _HEDGE_MODE else 'ONE-WAY (BOTH)'}"
+                    )
+                    return
+        except Exception as e:
+            log.debug(f"detectar_modo_posicion {endpoint}: {e}")
+
+    # Fallback: inspeccionar posiciones abiertas
+    try:
+        pos = get_posiciones_abiertas()
+        if pos:
+            side = (pos[0] or {}).get("positionSide", "BOTH")
+            _HEDGE_MODE = side.upper() in ("LONG", "SHORT")
+            log.info(
+                f"[MODE] Modo detectado por posiciones: positionSide={side} → "
+                f"{'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}"
+            )
+            return
+    except Exception as e:
+        log.debug(f"detectar_modo_posicion fallback posiciones: {e}")
+
+    # No se pudo detectar → asumir hedge (más común en BingX perpetuos)
+    _HEDGE_MODE = True
+    log.warning("[MODE] No se pudo detectar modo — asumiendo HEDGE (LONG/SHORT)")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -237,12 +287,46 @@ def get_qty_precision(symbol: str) -> int:
 # ══════════════════════════════════════════════════════════════
 
 def get_balance() -> float:
+    """
+    ✅ FIX#15 — Maneja múltiples formatos de respuesta de BingX:
+    - data.balance.availableMargin  (formato estándar v2)
+    - data.availableMargin          (formato plano)
+    - data como lista de assets
+    - campos alternativos: walletBalance, equity
+    """
     if config.MODO_DEMO:
         return 1000.0
     try:
-        res = _get("/openApi/swap/v2/user/balance")
-        bal = res.get("data", {}).get("balance", {})
-        return float(bal.get("availableMargin", bal.get("balance", 0)) or 0)
+        res  = _get("/openApi/swap/v2/user/balance")
+        code = res.get("code", -1)
+        if code not in (0, 200):
+            log.warning(f"get_balance: code={code} msg={res.get('msg','')}")
+            return 0.0
+
+        data = res.get("data", {})
+
+        # Caso 1: data es una lista de assets
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("asset", "").upper() in ("USDT", ""):
+                    for campo in ("availableMargin", "balance", "walletBalance", "equity"):
+                        v = item.get(campo)
+                        if v is not None:
+                            return float(v or 0)
+
+        # Caso 2: data es un dict con sub-dict "balance"
+        if isinstance(data, dict):
+            bal = data.get("balance", data)
+            if isinstance(bal, dict):
+                for campo in ("availableMargin", "balance", "walletBalance", "equity"):
+                    v = bal.get(campo)
+                    if v is not None:
+                        return float(v or 0)
+            elif isinstance(bal, (int, float, str)):
+                return float(bal or 0)
+
+        log.warning(f"get_balance: estructura inesperada: {str(res)[:200]}")
+        return 0.0
     except Exception as e:
         log.error(f"get_balance: {e}")
         return 0.0
@@ -463,7 +547,7 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
 
     try:
         close_side  = "SELL" if lado == "LONG" else "BUY"
-        pos_side    = lado
+        pos_side    = lado if _HEDGE_MODE else "BOTH"   # ✅ FIX#14
         pp          = get_price_precision(symbol)
         qty_str     = _fmt_qty(qty)   # ✅ FIX#9: string limpio
         sl_str      = _fmt_price(sl, pp)
@@ -525,11 +609,11 @@ def abrir_long(symbol: str, qty: float, precio: float,
     qty_str = _fmt_qty(qty)
     log.info(f"[ORDER] LONG {symbol} qty={qty_str} @ ~{precio:.6f}")
 
-    # BingX perpetuos usan hedge mode → positionSide obligatorio
+    # ✅ FIX#14 — positionSide dinámico según modo de la cuenta
     params = {
         "symbol":       symbol,
         "side":         "BUY",
-        "positionSide": "LONG",
+        "positionSide": "LONG" if _HEDGE_MODE else "BOTH",
         "type":         "MARKET",
         "quantity":     qty_str,
     }
@@ -570,10 +654,11 @@ def abrir_short(symbol: str, qty: float, precio: float,
     qty_str = _fmt_qty(qty)
     log.info(f"[ORDER] SHORT {symbol} qty={qty_str} @ ~{precio:.6f}")
 
+    # ✅ FIX#14 — positionSide dinámico según modo de la cuenta
     params = {
         "symbol":       symbol,
         "side":         "SELL",
-        "positionSide": "SHORT",
+        "positionSide": "SHORT" if _HEDGE_MODE else "BOTH",
         "type":         "MARKET",
         "quantity":     qty_str,
     }
@@ -612,7 +697,7 @@ def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
     params   = {
         "symbol":       symbol,
         "side":         side,
-        "positionSide": lado,
+        "positionSide": lado if _HEDGE_MODE else "BOTH",   # ✅ FIX#14
         "type":         "MARKET",
         "quantity":     qty_str,
     }
