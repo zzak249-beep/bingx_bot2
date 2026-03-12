@@ -1,6 +1,11 @@
 """
-main.py — SMC Bot BingX v4.0 [REAL MONEY | 24/7 | AUTO-LEARN]
-$10 por trade × 10x | Compounding | Aprende errores | Sin parar
+main.py — SMC Bot BingX v4.2 [REAL MONEY | 24/7 | AUTO-LEARN]
+$10 por trade × 10x | Compounding | OB+FVG confluencia | Sin parar
+
+BUGS CORREGIDOS:
+  ✅ FIX#1 — KeyError 'total_trades' en reporte horario (campo no existía)
+  ✅ FIX#2 — Notificación muestra si es OB+FVG confluencia o solo FVG
+  ✅ FIX#3 — OB mitigado se indica en logs y Telegram
 """
 
 import sys, os, time, traceback
@@ -17,7 +22,7 @@ if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
     logging.getLogger().setLevel(logging.DEBUG)
 
 log = logging.getLogger("main")
-log.info("=== ARRANQUE SMC BOT v4.0 ===")
+log.info("=== ARRANQUE SMC BOT v4.2 ===")
 
 try:
     import config, exchange, analizar, memoria, scanner_pares
@@ -123,12 +128,17 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
     motiv = " + ".join(s.get("motivos", []))
 
     extras = ""
+    # OB+FVG confluencia es la señal más fuerte — mostrar prominentemente
+    if s.get("ob_fvg_bull") or s.get("ob_fvg_bear"):
+        extras += "🏆 `OB + FVG Confluencia` ← Entry Area\n"
+    elif s.get("ob_bull") or s.get("ob_bear"):
+        mit = s.get("ob_mitigado", False)
+        extras += f"📦 `Order Block` {'⚠️ mitigado' if mit else '✅ no mitigado'}\n"
+
     if s.get("sweep_bull") or s.get("sweep_bear"):
         extras += "💧 `Liquidity Sweep`\n"
     if s.get("patron"):
         extras += f"🕯️ `{s['patron']}`\n"
-    if s.get("ob_bull") or s.get("ob_bear"):
-        extras += "📦 `Order Block`\n"
     if s.get("choch_bull") or s.get("choch_bear"):
         extras += "🔄 `Change of Character`\n"
     elif s.get("bos_bull") or s.get("bos_bear"):
@@ -470,7 +480,7 @@ def ejecutar_senal(s: dict) -> bool:
     if entrada_real <= 0:
         entrada_real = exchange.get_precio(par) or s["precio"]
 
-    atr   = s.get("atr", 0)
+    atr    = s.get("atr", 0)
     precio = s["precio"]
     if atr > 0:
         sl_r  = (entrada_real - atr * config.SL_ATR_MULT)  if lado == "LONG" else (entrada_real + atr * config.SL_ATR_MULT)
@@ -501,6 +511,7 @@ def ejecutar_senal(s: dict) -> bool:
         "motivos":     s.get("motivos", []),
         "kz":          s.get("kz", ""),
         "trade_usdt":  trade_usdt,
+        "ob_fvg":      s.get("ob_fvg_bull") or s.get("ob_fvg_bear"),
     }
 
     slip = abs(entrada_real - precio) / precio * 100 if precio > 0 else 0
@@ -508,13 +519,14 @@ def ejecutar_senal(s: dict) -> bool:
         f"✅ {lado} {par} fill:{entrada_real:.6f} "
         f"{'⚠️ SLIP:'+str(round(slip,1))+'%' if slip > 0.5 else ''} "
         f"${trade_usdt:.2f}×{config.LEVERAGE}x "
-        f"SL:{sl_r:.6f} TP:{tp_r:.6f} score:{s['score']}/14"
+        f"SL:{sl_r:.6f} TP:{tp_r:.6f} score:{s['score']}/14 "
+        f"{'🏆OB+FVG' if s.get('ob_fvg_bull') or s.get('ob_fvg_bear') else ''}"
     )
     return True
 
 
 # ═══════════════════════════════════════════════════════
-# REPORTE HORARIO
+# REPORTE HORARIO — FIX: total_trades no existe en compounding
 # ═══════════════════════════════════════════════════════
 
 def enviar_reporte(balance: float):
@@ -529,7 +541,8 @@ def enviar_reporte(balance: float):
             )
         fase = "🔶→TP2" if pos.get("tp1_hit") else "▶️→TP1"
         ico  = "🟢" if pos["lado"] == "LONG" else "🔴"
-        pos_txt += f"  {ico} `{par}` est:${pnl_est:+.2f} {fase} [{pos.get('score','?')}/14]\n"
+        ob_tag = " 🏆" if pos.get("ob_fvg") else ""
+        pos_txt += f"  {ico} `{par}` est:${pnl_est:+.2f} {fase} [{pos.get('score','?')}/14]{ob_tag}\n"
     if not pos_txt:
         pos_txt = "  _(sin posiciones)_\n"
 
@@ -537,6 +550,9 @@ def enviar_reporte(balance: float):
     wr   = f"{w/(w+l)*100:.1f}%" if (w+l) > 0 else "N/A"
     comp = memoria._data["compounding"]
     kz   = analizar.en_killzone()
+
+    # FIX: usar len(memoria._data["trades"]) en lugar de comp["total_trades"]
+    total_trades = len(memoria._data.get("trades", []))
 
     _notif(
         f"📊 *Reporte — {config.VERSION}*\n"
@@ -549,7 +565,7 @@ def enviar_reporte(balance: float):
         f"📊 Próx trade : `${memoria.get_trade_amount():.2f}`\n"
         f"💹 Pool reinv.: `${comp['ganancias']:.2f}` USDT\n"
         f"📊 Total PnL  : `${comp['total_ganado']:+.4f}`\n"
-        f"🏆 Trades tot.: `{comp['total_trades']}`\n"
+        f"🏆 Trades tot.: `{total_trades}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Posiciones:\n{pos_txt}"
     )
@@ -567,6 +583,7 @@ def main():
     log.info(f"  SCORE≥{config.SCORE_MIN}/14 | PIVOT_PCT:{config.PIVOT_NEAR_PCT}% | MIN_RR:{config.MIN_RR}")
     log.info(f"  PIN_BAR:{config.PINBAR_RATIO} | VWAP:{config.VWAP_ACTIVO} | SWEEP:{config.SWEEP_ACTIVO}")
     log.info(f"  COOLDOWN:{config.COOLDOWN_VELAS} velas | DEMO:{config.MODO_DEMO}")
+    log.info(f"  OB+FVG CONFLUENCIA ACTIVO | OB MITIGADO = INVÁLIDO")
     log.info("=" * 65)
 
     balance = exchange.get_balance()
@@ -575,20 +592,17 @@ def main():
     if balance <= 0 and not config.MODO_DEMO:
         _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
 
-    # Pre-cargar contratos de futuros válidos (evita signature mismatch)
     log.info("Cargando contratos de futuros perpetuos...")
     exchange._cargar_contratos()
     log.info(f"Contratos cargados: {len(exchange._CONTRATOS_FUTURES)} pares válidos")
 
     cargar_posiciones_desde_bingx()
 
-    # ── Cargar pares ──
     log.info("Cargando pares de BingX...")
     pares_todos  = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
     bloq_config  = set(config.PARES_BLOQUEADOS)
-    # Filtrar solo futuros perpetuos válidos
     futuros_validos = exchange._CONTRATOS_FUTURES
-    pares_todos  = [p for p in pares_todos if p not in bloq_config 
+    pares_todos  = [p for p in pares_todos if p not in bloq_config
                     and (not futuros_validos or p in futuros_validos)]
     prioritarios = [p for p in (PARES_FIJOS + config.PARES_PRIORITARIOS) if p in set(pares_todos)]
     top_memoria  = [p for p in memoria.get_top_pares(10) if p in set(pares_todos)]
@@ -607,6 +621,7 @@ def main():
         f"📊 Pares      : `{len(pares)}` (vol >${config.VOLUMEN_MIN_24H/1e6:.0f}M)\n"
         f"🏅 Score≥`{config.SCORE_MIN}/14` | Min R:R `{config.MIN_RR}x`\n"
         f"💹 Compounding: cada ${config.COMPOUND_STEP_USDT:.0f} ganados → +${config.COMPOUND_ADD_USDT:.0f}/trade\n"
+        f"🏆 OB+FVG Confluencia | OB no mitigado\n"
         f"🧠 Pin Bar + Engulfing + Sweeps + VWAP\n"
         f"⏱️ Cooldown: {config.COOLDOWN_VELAS} velas | Time exit: {config.TIME_EXIT_HORAS}h\n"
         f"🔁 Anti-hedge + Correlación\n"
@@ -675,11 +690,12 @@ def main():
                 if senales:
                     log.info(f"✓ {len(senales)} señal(es):")
                     for s in senales[:5]:
+                        ob_tag = "🏆OB+FVG" if (s.get("ob_fvg_bull") or s.get("ob_fvg_bear")) else ""
                         log.info(
                             f"  {s['lado']:5s} {s['par']:15s} "
                             f"score={s['score']}/14 RSI={s['rsi']:.1f} "
                             f"R:R={s['rr']:.2f} KZ={s['kz']} HTF={s.get('htf','?')} "
-                            f"patron={s.get('patron','-')} sweep={s.get('sweep_bull') or s.get('sweep_bear')}"
+                            f"patron={s.get('patron','-')} {ob_tag}"
                         )
                 else:
                     log.info("Sin señales este ciclo")
@@ -690,7 +706,6 @@ def main():
                     if s["par"] in estado.posiciones:
                         continue
 
-                    # Ajuste de score con aprendizaje
                     s["score"] = memoria.ajustar_score(
                         s["par"], s["score"],
                         kz=s.get("kz", ""),
@@ -702,7 +717,6 @@ def main():
 
                     ejecutado = ejecutar_senal(s)
                     _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
-                    # Note: notif sent AFTER execution with real result
                     if ejecutado:
                         balance = exchange.get_balance()
                         time.sleep(2)
@@ -715,7 +729,7 @@ def main():
 
         except KeyboardInterrupt:
             log.info("Detenido (Ctrl+C)")
-            _notif("🛑 *SMC Bot v4.0 detenido manualmente.*")
+            _notif("🛑 *SMC Bot v4.2 detenido manualmente.*")
             break
         except Exception as e:
             log.error(f"ERROR CICLO {ciclo}: {e}\n{traceback.format_exc()}")
