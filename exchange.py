@@ -101,7 +101,9 @@ _cargar_no_soportados()
 # FIRMA  ← FIX#1: recvWindow incluido en todas las peticiones
 # ══════════════════════════════════════════════════════════════
 def _sign(params: dict) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    # FIX: NO sorted() — BingX verifica sobre el query string TAL COMO llega en la URL
+    # sorted() produce orden diferente al que requests envia → code=100001 "Signature mismatch"
+    query = "&".join(f"{k}={v}" for k, v in params.items())
     return hmac.new(
         config.BINGX_SECRET_KEY.encode(),
         query.encode(),
@@ -191,10 +193,6 @@ def _extract_float(data, keys) -> float:
 def get_balance() -> float:
     if config.MODO_DEMO:
         return 1000.0
-    # Auto-sync tiempo si aún no se ha hecho (primera llamada)
-    global _time_offset
-    if _time_offset == 0:
-        sync_server_time()
     keys_real     = ("balance", "walletBalance", "equity")
     keys_fallback = ("availableMargin", "availableBalance", "crossAvailableBalance", "free")
     for ep in ["/openApi/swap/v2/user/balance", "/openApi/swap/v3/user/balance", "/openApi/swap/v2/user/margin"]:
