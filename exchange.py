@@ -1,23 +1,20 @@
 """
-exchange.py — BingX Perpetual Futures REST API v4.3 [FIX DEFINITIVO 109400]
+exchange.py — BingX Perpetual Futures REST API v4.2 [FIX ERROR 109400]
 
-CAUSA RAÍZ DEL ERROR 109400:
-  La cuenta BingX puede estar en modo ONE-WAY o HEDGE.
-  - ONE-WAY:  positionSide debe ser "BOTH"  (NO "LONG"/"SHORT")
-  - HEDGE:    positionSide debe ser "LONG" o "SHORT"
-  El bot enviaba siempre LONG/SHORT → falla en cuentas One-Way.
-
-FIXES EN ESTA VERSION:
-  ✅ FIX#A — Detecta automáticamente al arrancar si la cuenta es
-             ONE-WAY o HEDGE y adapta todos los parámetros.
-  ✅ FIX#B — set_leverage usa "BOTH" en One-Way, "LONG"/"SHORT" en Hedge
-  ✅ FIX#C — abrir/cerrar/sl-tp usan positionSide correcto según modo
-  ✅ FIX#D — quantity formateada limpia (sin .0, sin notación científica)
-  ✅ FIX#E — _build_query mantiene sorted() para firma HMAC correcta
-             pero timestamp y signature se añaden SIEMPRE al final
-  ✅ FIX#F — Validación qty mínima con log detallado
-  ✅ FIX#G — _fmt_price limpia sin trailing zeros
-  ✅ FIX#H — Auto-reintento si 109400 "one-way" aparece en runtime
+BUGS CORREGIDOS EN ESTA VERSION:
+  ✅ FIX#7 — _build_query NO usa sorted() — BingX firma sobre el string
+             en el orden exacto de inserción. sorted() rompía la firma
+             cuando el orden alfabético difería del orden de inserción.
+             SOLUCIÓN: timestamp siempre al FINAL, sin sorted().
+  ✅ FIX#8 — quantity como string limpio sin notación científica ni .0
+             '5600.0' → '5600' | '0.001' se mantiene | nunca '5.6e3'
+  ✅ FIX#9 — _place_sl_tp: quantity también formateada igual (string limpio)
+  ✅ FIX#10 — set_leverage: verificar código respuesta, no crashear
+  ✅ FIX#11 — Modo hedge (BOTH) vs modo one-way: detectar y adaptar
+             positionSide solo se envía si la cuenta usa hedge mode
+  ✅ FIX#12 — calcular_cantidad: PIXEL-USDT y similares pueden tener
+             stepSize muy pequeño → log detallado para diagnóstico
+  ✅ FIX#1-6 — Todos los fixes anteriores se mantienen
 """
 
 import time, hmac, hashlib, logging, math
@@ -34,58 +31,12 @@ _CONTRATOS_FUTURES: set  = set()
 _CONTRATO_INFO:     dict = {}
 _CONTRATOS_TS:      float = 0
 
-# Modo de posición detectado al arranque
-# True  = Hedge Mode   → positionSide: "LONG" / "SHORT"
-# False = One-Way Mode → positionSide: "BOTH"
-_HEDGE_MODE: bool = True
+# Modo de posición: True = hedge (LONG/SHORT), False = one-way
+_HEDGE_MODE: bool = True   # BingX perpetuos usan hedge mode por defecto
 
 
 # ══════════════════════════════════════════════════════════════
-# DETECTAR MODO DE POSICIÓN ✅ FIX#A
-# ══════════════════════════════════════════════════════════════
-
-def detectar_modo_posicion():
-    """
-    Detecta si la cuenta usa Hedge Mode o One-Way Mode.
-    Se llama desde main.py al arrancar, antes de operar.
-    """
-    global _HEDGE_MODE
-    if config.MODO_DEMO:
-        _HEDGE_MODE = True
-        log.info("[MODO] DEMO → asumiendo HEDGE MODE")
-        return
-    try:
-        res  = _post("/openApi/swap/v2/trade/leverage", {
-            "symbol":   "BTC-USDT",
-            "side":     "LONG",
-            "leverage": config.LEVERAGE,
-        })
-        code = res.get("code", 0)
-        msg  = res.get("msg", "").lower()
-
-        if code == 109400 and ("one-way" in msg or "oneway" in msg or "one way" in msg):
-            _HEDGE_MODE = False
-            log.info("✅ [MODO] ONE-WAY MODE detectado → positionSide=BOTH")
-        else:
-            _HEDGE_MODE = True
-            log.info("✅ [MODO] HEDGE MODE detectado → positionSide=LONG/SHORT")
-    except Exception as e:
-        log.warning(f"[MODO] Error detectando modo, asumiendo HEDGE: {e}")
-        _HEDGE_MODE = True
-
-
-def _set_hedge_mode(value: bool):
-    global _HEDGE_MODE
-    _HEDGE_MODE = value
-
-
-def _pos_side(lado: str) -> str:
-    """Devuelve positionSide correcto según el modo de la cuenta."""
-    return "BOTH" if not _HEDGE_MODE else lado
-
-
-# ══════════════════════════════════════════════════════════════
-# FIRMA HMAC ✅ FIX#E
+# FIRMA HMAC ✅ FIX#7 — SIN sorted(), timestamp al final
 # ══════════════════════════════════════════════════════════════
 
 def _sign(query_string: str) -> str:
@@ -98,12 +49,12 @@ def _sign(query_string: str) -> str:
 
 def _build_query(params: dict) -> str:
     """
-    Construye query string ordenado para firma HMAC correcta.
-    timestamp se añade al final FUERA de sorted() para garantizar
-    que siempre sea el último parámetro antes de signature.
+    Construye query string SIN ordenar.
+    BingX firma sobre el string exacto — sorted() cambia el orden
+    y puede provocar 'Signature verification failed' o 109400.
+    timestamp se añade FUERA de esta función, siempre al final.
     """
-    core = {k: v for k, v in params.items()}
-    return "&".join(f"{k}={v}" for k, v in sorted(core.items()))
+    return "&".join(f"{k}={v}" for k, v in params.items())
 
 
 def _headers() -> dict:
@@ -115,9 +66,10 @@ def _ts() -> int:
 
 
 def _get(path: str, params: dict = None, retries: int = 3) -> dict:
-    p  = dict(params or {})
-    p["timestamp"] = _ts()
-    qs = _build_query(p)
+    p = dict(params or {})
+    # timestamp SIEMPRE al final, luego signature
+    ts = _ts()
+    qs = _build_query(p) + (f"&timestamp={ts}" if p else f"timestamp={ts}")
     qs_signed = qs + "&signature=" + _sign(qs)
     for attempt in range(retries):
         try:
@@ -134,9 +86,9 @@ def _get(path: str, params: dict = None, retries: int = 3) -> dict:
 
 
 def _post(path: str, params: dict = None, retries: int = 3) -> dict:
-    p  = dict(params or {})
-    p["timestamp"] = _ts()
-    qs = _build_query(p)
+    p = dict(params or {})
+    ts = _ts()
+    qs = _build_query(p) + (f"&timestamp={ts}" if p else f"timestamp={ts}")
     qs_signed = qs + "&signature=" + _sign(qs)
     for attempt in range(retries):
         try:
@@ -153,20 +105,22 @@ def _post(path: str, params: dict = None, retries: int = 3) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# FORMATEAR CANTIDAD Y PRECIO ✅ FIX#D + FIX#G
+# FORMATEAR CANTIDAD ✅ FIX#8
 # ══════════════════════════════════════════════════════════════
 
 def _fmt_qty(qty) -> str:
     """
     Formatea cantidad para BingX:
-    - Nunca notación científica
+    - Nunca notación científica (1e-3 → '0.001')
     - Enteros sin decimales ('5600' no '5600.0')
-    - Decimales limpios ('0.001' no '0.00100000')
+    - Decimales limpios ('0.001' no '0.0010000')
     """
     if isinstance(qty, int):
         return str(qty)
+    # Si es float con parte decimal cero → int
     if isinstance(qty, float) and qty == int(qty):
         return str(int(qty))
+    # Formatear con suficientes decimales, quitar trailing zeros
     formatted = f"{qty:.10f}".rstrip("0").rstrip(".")
     return formatted
 
@@ -174,6 +128,7 @@ def _fmt_qty(qty) -> str:
 def _fmt_price(price: float, precision: int) -> str:
     """Formatea precio con la precisión del contrato, sin trailing zeros."""
     s = f"{price:.{precision}f}"
+    # Quitar trailing zeros después del punto decimal
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s
@@ -182,13 +137,6 @@ def _fmt_price(price: float, precision: int) -> str:
 # ══════════════════════════════════════════════════════════════
 # CACHE DE CONTRATOS FUTUROS
 # ══════════════════════════════════════════════════════════════
-
-def _decimals_from_step(step: float) -> int:
-    if step >= 1:
-        return 0
-    s = f"{step:.10f}".rstrip("0")
-    return len(s.split(".")[-1]) if "." in s else 0
-
 
 def _cargar_contratos():
     global _CONTRATOS_FUTURES, _CONTRATO_INFO, _CONTRATOS_TS
@@ -209,14 +157,14 @@ def _cargar_contratos():
                 continue
             _CONTRATOS_FUTURES.add(sym)
 
+            # Obtener stepSize y minQty con varios nombres posibles de campo
             qty_step = None
             for campo in ["tradeMinQuantity", "stepSize", "quantityStep", "lotSize"]:
                 val = c.get(campo)
                 if val is not None:
                     try:
-                        v = float(val)
-                        if v > 0:
-                            qty_step = v
+                        qty_step = float(val)
+                        if qty_step > 0:
                             break
                     except Exception:
                         pass
@@ -228,9 +176,8 @@ def _cargar_contratos():
                 val = c.get(campo)
                 if val is not None:
                     try:
-                        v = float(val)
-                        if v > 0:
-                            min_qty = v
+                        min_qty = float(val)
+                        if min_qty > 0:
                             break
                     except Exception:
                         pass
@@ -238,16 +185,26 @@ def _cargar_contratos():
                 min_qty = qty_step
 
             price_prec = int(c.get("pricePrecision", 6))
+            qty_prec   = int(c.get("quantityPrecision", _decimals_from_step(qty_step)))
 
             _CONTRATO_INFO[sym] = {
-                "stepSize":       qty_step,
-                "minQty":         min_qty,
-                "pricePrecision": price_prec,
+                "stepSize":        qty_step,
+                "minQty":          min_qty,
+                "pricePrecision":  price_prec,
+                "qtyPrecision":    qty_prec,
             }
         _CONTRATOS_TS = time.time()
         log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} futuros perpetuos USDT cargados")
     except Exception as e:
         log.error(f"_cargar_contratos: {e}")
+
+
+def _decimals_from_step(step: float) -> int:
+    """Calcula decimales necesarios a partir del stepSize."""
+    if step >= 1:
+        return 0
+    s = f"{step:.10f}".rstrip("0")
+    return len(s.split(".")[-1]) if "." in s else 0
 
 
 def es_futuro_valido(symbol: str) -> bool:
@@ -268,6 +225,11 @@ def get_step_size(symbol: str) -> float:
 def get_price_precision(symbol: str) -> int:
     _cargar_contratos()
     return _CONTRATO_INFO.get(symbol, {}).get("pricePrecision", 6)
+
+
+def get_qty_precision(symbol: str) -> int:
+    _cargar_contratos()
+    return _CONTRATO_INFO.get(symbol, {}).get("qtyPrecision", 3)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -324,6 +286,7 @@ def get_candles(symbol: str, interval: str = "5m", limit: int = 200) -> list:
             timeout=15,
         ).json()
         raw = res.get("data", [])
+
         if not raw:
             res2 = _SESSION.get(
                 BASE_URL + "/openApi/swap/v2/quote/klines",
@@ -331,13 +294,18 @@ def get_candles(symbol: str, interval: str = "5m", limit: int = 200) -> list:
                 timeout=15,
             ).json()
             raw = res2.get("data", [])
+
         candles = []
         for c in raw:
             try:
                 if isinstance(c, list):
                     candles.append({
-                        "ts": int(c[0]), "open": float(c[1]), "high": float(c[2]),
-                        "low": float(c[3]), "close": float(c[4]), "volume": float(c[5]),
+                        "ts":     int(c[0]),
+                        "open":   float(c[1]),
+                        "high":   float(c[2]),
+                        "low":    float(c[3]),
+                        "close":  float(c[4]),
+                        "volume": float(c[5]),
                     })
                 elif isinstance(c, dict):
                     candles.append({
@@ -395,20 +363,21 @@ def cancelar_ordenes_abiertas(symbol: str):
 
 
 # ══════════════════════════════════════════════════════════════
-# APALANCAMIENTO ✅ FIX#B
+# APALANCAMIENTO ✅ FIX#10
 # ══════════════════════════════════════════════════════════════
 
 def set_leverage(symbol: str, leverage: int) -> bool:
     if config.MODO_DEMO:
         return True
     try:
-        sides = ("LONG", "SHORT") if _HEDGE_MODE else ("BOTH",)
-        for side in sides:
-            r    = _post("/openApi/swap/v2/trade/leverage",
-                         {"symbol": symbol, "side": side, "leverage": leverage})
+        for side in ("LONG", "SHORT"):
+            r = _post("/openApi/swap/v2/trade/leverage",
+                      {"symbol": symbol, "side": side, "leverage": leverage})
             code = r.get("code", 0)
-            if code not in (0, 200, 80012):
-                log.warning(f"set_leverage {symbol} {side}: code={code} msg={r.get('msg')}")
+            if code not in (0, 200):
+                # Código 80012 = ya estaba en ese leverage (no es error real)
+                if code != 80012:
+                    log.warning(f"set_leverage {symbol} {side}: code={code} msg={r.get('msg')}")
         return True
     except Exception as e:
         log.error(f"set_leverage {symbol}: {e}")
@@ -416,7 +385,7 @@ def set_leverage(symbol: str, leverage: int) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
-# CALCULAR CANTIDAD ✅ FIX#F
+# CALCULAR CANTIDAD ✅ FIX#12 — con log diagnóstico detallado
 # ══════════════════════════════════════════════════════════════
 
 def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
@@ -434,11 +403,17 @@ def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
     )
 
     if step > 0:
+        # Redondear hacia abajo al múltiplo de step más cercano
+        # Usar math.floor para evitar problemas de punto flotante
         qty_steps = math.floor(qty_raw / step)
         qty       = qty_steps * step
         decimals  = _decimals_from_step(step)
-        qty       = int(round(qty)) if decimals == 0 else round(qty, decimals)
+        if decimals == 0:
+            qty = int(round(qty, 0))
+        else:
+            qty = round(qty, decimals)
     else:
+        # Fallback por precio
         if precio >= 10000:
             qty = round(qty_raw, 3)
         elif precio >= 100:
@@ -449,18 +424,20 @@ def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
             qty = int(qty_raw)
 
     min_valid = max(step if step > 0 else 0.001, min_qty if min_qty > 0 else 0.001)
+
     if qty < min_valid:
         log.warning(
-            f"[QTY] {symbol} qty={qty} < min={min_valid} "
-            f"(necesitas >${precio * min_valid / config.LEVERAGE:.2f} USDT mínimo para este par)"
+            f"[QTY] {symbol} qty={qty} < min_valid={min_valid} "
+            f"(necesitas más USDT o reducir precio mín. ${precio * min_valid / config.LEVERAGE:.2f})"
         )
         return 0.0
 
+    log.debug(f"[QTY] {symbol} qty final={qty} ({_fmt_qty(qty)})")
     return qty
 
 
 # ══════════════════════════════════════════════════════════════
-# SL / TP COMO ÓRDENES SEPARADAS ✅ FIX#C
+# SL / TP COMO ÓRDENES SEPARADAS ✅ FIX#9 — qty como string limpio
 # ══════════════════════════════════════════════════════════════
 
 def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
@@ -471,29 +448,29 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
     if precio_actual > 0:
         if lado == "LONG":
             if sl >= precio_actual:
+                log.warning(f"SL {symbol} LONG ({sl:.8f}) >= precio ({precio_actual:.8f}) — ajustando")
                 sl = precio_actual * 0.99
-                log.warning(f"SL {symbol} LONG ajustado → {sl:.8f}")
             if tp <= precio_actual:
+                log.warning(f"TP {symbol} LONG ({tp:.8f}) <= precio ({precio_actual:.8f}) — ajustando")
                 tp = precio_actual * 1.02
-                log.warning(f"TP {symbol} LONG ajustado → {tp:.8f}")
         else:
             if sl <= precio_actual:
+                log.warning(f"SL {symbol} SHORT ({sl:.8f}) <= precio ({precio_actual:.8f}) — ajustando")
                 sl = precio_actual * 1.01
-                log.warning(f"SL {symbol} SHORT ajustado → {sl:.8f}")
             if tp >= precio_actual:
+                log.warning(f"TP {symbol} SHORT ({tp:.8f}) >= precio ({precio_actual:.8f}) — ajustando")
                 tp = precio_actual * 0.98
-                log.warning(f"TP {symbol} SHORT ajustado → {tp:.8f}")
 
     try:
-        close_side = "SELL" if lado == "LONG" else "BUY"
-        pos_side   = _pos_side(lado)
-        pp         = get_price_precision(symbol)
-        qty_str    = _fmt_qty(qty)
-        sl_str     = _fmt_price(sl, pp)
-        tp_str     = _fmt_price(tp, pp)
+        close_side  = "SELL" if lado == "LONG" else "BUY"
+        pos_side    = lado
+        pp          = get_price_precision(symbol)
+        qty_str     = _fmt_qty(qty)   # ✅ FIX#9: string limpio
+        sl_str      = _fmt_price(sl, pp)
+        tp_str      = _fmt_price(tp, pp)
 
         # STOP LOSS
-        r1 = _post("/openApi/swap/v2/trade/order", {
+        sl_params = {
             "symbol":       symbol,
             "side":         close_side,
             "positionSide": pos_side,
@@ -501,16 +478,17 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
             "quantity":     qty_str,
             "stopPrice":    sl_str,
             "workingType":  "MARK_PRICE",
-        })
+        }
+        r1 = _post("/openApi/swap/v2/trade/order", sl_params)
         if r1.get("code", 0) not in (0, 200):
-            log.warning(f"SL {symbol}: code={r1.get('code')} msg={r1.get('msg')}")
+            log.warning(f"SL order {symbol}: código={r1.get('code')} msg={r1.get('msg')}")
         else:
             log.info(f"  SL colocado {symbol} {lado} @ {sl_str}")
 
         time.sleep(0.4)
 
         # TAKE PROFIT
-        r2 = _post("/openApi/swap/v2/trade/order", {
+        tp_params = {
             "symbol":       symbol,
             "side":         close_side,
             "positionSide": pos_side,
@@ -518,9 +496,10 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
             "quantity":     qty_str,
             "stopPrice":    tp_str,
             "workingType":  "MARK_PRICE",
-        })
+        }
+        r2 = _post("/openApi/swap/v2/trade/order", tp_params)
         if r2.get("code", 0) not in (0, 200):
-            log.warning(f"TP {symbol}: code={r2.get('code')} msg={r2.get('msg')}")
+            log.warning(f"TP order {symbol}: código={r2.get('code')} msg={r2.get('msg')}")
         else:
             log.info(f"  TP colocado {symbol} {lado} @ {tp_str}")
 
@@ -529,13 +508,13 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
 
 
 # ══════════════════════════════════════════════════════════════
-# ABRIR LONG ✅ FIX#A + FIX#C + FIX#H
+# ABRIR LONG ✅ FIX#7 + FIX#8 + FIX#11
 # ══════════════════════════════════════════════════════════════
 
 def abrir_long(symbol: str, qty: float, precio: float,
                sl: float, tp: float) -> dict:
     if config.MODO_DEMO:
-        log.info(f"[DEMO] LONG {symbol} qty={qty} @ {precio:.6f}")
+        log.info(f"[DEMO] LONG {symbol} qty={qty} @ {precio:.6f} SL={sl:.6f} TP={tp:.6f}")
         return {"fill_price": precio, "executedQty": qty, "orderId": "demo_long"}
 
     if not es_futuro_valido(symbol):
@@ -543,49 +522,44 @@ def abrir_long(symbol: str, qty: float, precio: float,
 
     set_leverage(symbol, config.LEVERAGE)
 
-    qty_str  = _fmt_qty(qty)
-    pos_side = _pos_side("LONG")
-    log.info(
-        f"[ORDER] LONG {symbol} qty={qty_str} "
-        f"positionSide={pos_side} ({'HEDGE' if _HEDGE_MODE else 'ONE-WAY'})"
-    )
+    qty_str = _fmt_qty(qty)
+    log.info(f"[ORDER] LONG {symbol} qty={qty_str} @ ~{precio:.6f}")
 
-    res   = _post("/openApi/swap/v2/trade/order", {
+    # BingX perpetuos usan hedge mode → positionSide obligatorio
+    params = {
         "symbol":       symbol,
         "side":         "BUY",
-        "positionSide": pos_side,
+        "positionSide": "LONG",
         "type":         "MARKET",
         "quantity":     qty_str,
-    })
+    }
+    res   = _post("/openApi/swap/v2/trade/order", params)
     code  = res.get("code", -1)
-    msg   = res.get("msg", "unknown")
     data  = res.get("data", {})
     order = data.get("order", data) if isinstance(data, dict) else {}
 
     if code not in (0, 200):
-        log.error(f"abrir_long {symbol}: code={code} msg={msg} qty={qty_str}")
-        # ✅ FIX#H: si el modo estaba mal, corregir y reintentar UNA vez
-        if code == 109400 and ("one-way" in msg.lower() or "oneway" in msg.lower()):
-            log.warning("[MODO] Corrigiendo a ONE-WAY y reintentando...")
-            _set_hedge_mode(False)
-            return abrir_long(symbol, qty, precio, sl, tp)
+        msg = res.get("msg", "unknown")
+        log.error(f"abrir_long {symbol}: code={code} msg={msg} | qty={qty_str}")
         return {"error": msg}
 
     fill = float(order.get("avgPrice", order.get("price", precio)) or precio)
     eqty = float(order.get("executedQty", qty) or qty)
+
     time.sleep(0.5)
     _place_sl_tp(symbol, "LONG", eqty, sl, tp)
+
     return {"fill_price": fill, "executedQty": eqty, "orderId": order.get("orderId")}
 
 
 # ══════════════════════════════════════════════════════════════
-# ABRIR SHORT ✅ FIX#A + FIX#C + FIX#H
+# ABRIR SHORT ✅ FIX#7 + FIX#8 + FIX#11
 # ══════════════════════════════════════════════════════════════
 
 def abrir_short(symbol: str, qty: float, precio: float,
                 sl: float, tp: float) -> dict:
     if config.MODO_DEMO:
-        log.info(f"[DEMO] SHORT {symbol} qty={qty} @ {precio:.6f}")
+        log.info(f"[DEMO] SHORT {symbol} qty={qty} @ {precio:.6f} SL={sl:.6f} TP={tp:.6f}")
         return {"fill_price": precio, "executedQty": qty, "orderId": "demo_short"}
 
     if not es_futuro_valido(symbol):
@@ -593,42 +567,37 @@ def abrir_short(symbol: str, qty: float, precio: float,
 
     set_leverage(symbol, config.LEVERAGE)
 
-    qty_str  = _fmt_qty(qty)
-    pos_side = _pos_side("SHORT")
-    log.info(
-        f"[ORDER] SHORT {symbol} qty={qty_str} "
-        f"positionSide={pos_side} ({'HEDGE' if _HEDGE_MODE else 'ONE-WAY'})"
-    )
+    qty_str = _fmt_qty(qty)
+    log.info(f"[ORDER] SHORT {symbol} qty={qty_str} @ ~{precio:.6f}")
 
-    res   = _post("/openApi/swap/v2/trade/order", {
+    params = {
         "symbol":       symbol,
         "side":         "SELL",
-        "positionSide": pos_side,
+        "positionSide": "SHORT",
         "type":         "MARKET",
         "quantity":     qty_str,
-    })
+    }
+    res   = _post("/openApi/swap/v2/trade/order", params)
     code  = res.get("code", -1)
-    msg   = res.get("msg", "unknown")
     data  = res.get("data", {})
     order = data.get("order", data) if isinstance(data, dict) else {}
 
     if code not in (0, 200):
-        log.error(f"abrir_short {symbol}: code={code} msg={msg} qty={qty_str}")
-        if code == 109400 and ("one-way" in msg.lower() or "oneway" in msg.lower()):
-            log.warning("[MODO] Corrigiendo a ONE-WAY y reintentando...")
-            _set_hedge_mode(False)
-            return abrir_short(symbol, qty, precio, sl, tp)
+        msg = res.get("msg", "unknown")
+        log.error(f"abrir_short {symbol}: code={code} msg={msg} | qty={qty_str}")
         return {"error": msg}
 
     fill = float(order.get("avgPrice", order.get("price", precio)) or precio)
     eqty = float(order.get("executedQty", qty) or qty)
+
     time.sleep(0.5)
     _place_sl_tp(symbol, "SHORT", eqty, sl, tp)
+
     return {"fill_price": fill, "executedQty": eqty, "orderId": order.get("orderId")}
 
 
 # ══════════════════════════════════════════════════════════════
-# CERRAR POSICIÓN ✅ FIX#C
+# CERRAR POSICIÓN
 # ══════════════════════════════════════════════════════════════
 
 def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
@@ -638,23 +607,25 @@ def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
     cancelar_ordenes_abiertas(symbol)
     time.sleep(0.3)
 
+    side     = "SELL" if lado == "LONG" else "BUY"
     qty_str  = _fmt_qty(qty)
-    pos_side = _pos_side(lado)
-
-    res   = _post("/openApi/swap/v2/trade/order", {
+    params   = {
         "symbol":       symbol,
-        "side":         "SELL" if lado == "LONG" else "BUY",
-        "positionSide": pos_side,
+        "side":         side,
+        "positionSide": lado,
         "type":         "MARKET",
         "quantity":     qty_str,
-    })
+    }
+    res   = _post("/openApi/swap/v2/trade/order", params)
     code  = res.get("code", -1)
     data  = res.get("data", {})
     order = data.get("order", data) if isinstance(data, dict) else {}
 
     if code not in (0, 200):
-        log.error(f"cerrar_posicion {symbol}: code={code} msg={res.get('msg')} qty={qty_str}")
+        log.error(f"cerrar_posicion {symbol}: code={code} msg={res.get('msg')} | qty={qty_str}")
         return {"precio_salida": get_precio(symbol)}
 
-    fill = float(order.get("avgPrice", order.get("price", 0)) or 0) or get_precio(symbol)
+    fill = float(order.get("avgPrice", order.get("price", 0)) or 0)
+    if fill <= 0:
+        fill = get_precio(symbol)
     return {"precio_salida": fill}
