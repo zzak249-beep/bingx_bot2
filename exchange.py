@@ -322,6 +322,11 @@ def set_leverage(symbol: str, leverage: int) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
+    """
+    Calcula la cantidad respetando el stepSize del contrato.
+    CRÍTICO: BingX rechaza '5600.0' — debe ser '5600' para tokens enteros.
+    La función devuelve int cuando stepSize es entero (≥1), float si es decimal.
+    """
     if precio <= 0 or trade_usdt <= 0:
         return 0.0
 
@@ -329,14 +334,24 @@ def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
     step     = get_step_size(symbol)
     min_qty  = _CONTRATO_INFO.get(symbol, {}).get("minQty", step)
 
-    # Redondear hacia abajo al step más cercano
     if step > 0:
-        qty = int(qty_raw / step) * step
-        # Redondear para evitar errores de float
-        decimals = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-        qty = round(qty, decimals)
+        # Redondear hacia abajo al múltiplo de step más cercano
+        qty = (int(qty_raw / step)) * step
+
+        # Determinar decimales reales del step
+        step_str  = f"{step:.10f}".rstrip("0")
+        if "." in step_str:
+            decimals = len(step_str.split(".")[-1])
+        else:
+            decimals = 0
+
+        if decimals == 0:
+            # Token entero (stepSize=1, 10, 100...) → qty debe ser int sin decimales
+            qty = int(round(qty, 0))
+        else:
+            qty = round(qty, decimals)
     else:
-        # Fallback por precio
+        # Fallback por precio cuando no hay info de contrato
         if precio >= 10000:
             qty = round(qty_raw, 3)
         elif precio >= 100:
@@ -344,9 +359,10 @@ def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
         elif precio >= 1:
             qty = round(qty_raw, 1)
         else:
-            qty = round(qty_raw, 0)
+            qty = int(qty_raw)  # tokens muy baratos → siempre entero
 
-    return qty if qty >= max(step, min_qty, 0.001) else 0.0
+    min_valid = max(step if step > 0 else 0.001, min_qty if min_qty > 0 else 0.001)
+    return qty if qty >= min_valid else 0.0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -356,10 +372,27 @@ def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
 def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
     """
     Coloca SL (STOP_MARKET) y TP (TAKE_PROFIT_MARKET) como órdenes separadas.
-    La orden de entrada va limpia sin SL/TP inline para evitar errores de firma.
+    Valida que SL/TP sean precios razonables antes de enviar.
     """
     if config.MODO_DEMO:
         return
+    # Validar SL y TP antes de enviar
+    precio_actual = get_precio(symbol)
+    if precio_actual > 0:
+        if lado == "LONG":
+            if sl >= precio_actual:
+                log.warning(f"SL {symbol} LONG ({sl:.8f}) >= precio ({precio_actual:.8f}) — ajustando")
+                sl = precio_actual * 0.99
+            if tp <= precio_actual:
+                log.warning(f"TP {symbol} LONG ({tp:.8f}) <= precio ({precio_actual:.8f}) — ajustando")
+                tp = precio_actual * 1.02
+        else:
+            if sl <= precio_actual:
+                log.warning(f"SL {symbol} SHORT ({sl:.8f}) <= precio ({precio_actual:.8f}) — ajustando")
+                sl = precio_actual * 1.01
+            if tp >= precio_actual:
+                log.warning(f"TP {symbol} SHORT ({tp:.8f}) >= precio ({precio_actual:.8f}) — ajustando")
+                tp = precio_actual * 0.98
     try:
         close_side = "SELL" if lado == "LONG" else "BUY"
         pos_side   = lado
