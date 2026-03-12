@@ -127,6 +127,12 @@ PARES_PRIORITARIOS = [p.strip() for p in os.getenv("PARES_PRIORITARIOS", "").spl
 # ── Persistencia ──────────────────────────────────────────────
 MEMORY_DIR = os.getenv("MEMORY_DIR", "")
 
+# ── Modo BingX ────────────────────────────────────────────────
+# "auto"  = detectar automáticamente al arrancar (recomendado)
+# "hedge" = forzar modo Hedge (positionSide=LONG/SHORT)
+# "oneway"= forzar modo One-Way (positionSide omitido)
+BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
+
 
 def validar():
     errores = []
