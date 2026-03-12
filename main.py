@@ -601,26 +601,43 @@ def main():
     log.info(f"  OB+FVG CONFLUENCIA ACTIVO | OB MITIGADO = INVÁLIDO")
     log.info("=" * 65)
 
+    # FIX v4.4: sync PRIMERO — get_balance usa timestamp firmado,
+    # si el reloj local difiere del servidor BingX → data=null → balance=$0
+    log.info("Sincronizando tiempo con servidor BingX...")
+    exchange.sync_server_time()
+
+    # Con el reloj ya sincronizado, leer balance real
     balance = exchange.get_balance()
     log.info(f"Balance inicial: ${balance:.2f} USDT")
 
     if balance <= 0 and not config.MODO_DEMO:
-        # Solo notificar UNA vez al arrancar — no en cada ciclo
-        _notif("🚨 *Balance = $0 — arrancando de todos modos*\nVerifica API keys en Railway si el error persiste.")
-        # No salir — intentar continuar (las keys pueden tardar en activarse)
+        # Reintentar una vez antes de reportar (primera petición puede fallar)
+        log.warning("[BALANCE] Balance=0, reintentando en 3s...")
+        time.sleep(3)
+        balance = exchange.get_balance()
+        log.info(f"Balance reintento: ${balance:.2f} USDT")
+        if balance <= 0:
+            _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
 
-    # FIX v4.3: sincronizar reloj con BingX para evitar errores de timestamp en órdenes
-    log.info("Sincronizando tiempo con servidor BingX...")
-    exchange.sync_server_time()
+    # FIX v4.4: wrap startup en try/except para evitar crash por fallo de red
+    try:
+        log.info("Cargando contratos de futuros perpetuos...")
+        exchange._cargar_contratos()
+        log.info(f"Contratos cargados: {len(exchange._CONTRATOS_FUTURES)} pares válidos")
+    except Exception as e:
+        log.warning(f"[STARTUP] _cargar_contratos falló: {e} — continuando sin filtro de contratos")
 
-    log.info("Cargando contratos de futuros perpetuos...")
-    exchange._cargar_contratos()
-    log.info(f"Contratos cargados: {len(exchange._CONTRATOS_FUTURES)} pares válidos")
-
-    cargar_posiciones_desde_bingx()
+    try:
+        cargar_posiciones_desde_bingx()
+    except Exception as e:
+        log.warning(f"[STARTUP] cargar_posiciones falló: {e} — continuando con posiciones vacías")
 
     log.info("Cargando pares de BingX...")
-    pares_todos  = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
+    try:
+        pares_todos = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
+    except Exception as e:
+        log.warning(f"[STARTUP] scanner_pares falló: {e} — usando lista de respaldo")
+        from config_pares import PARES as pares_todos
     bloq_config  = set(config.PARES_BLOQUEADOS)
     futuros_validos = exchange._CONTRATOS_FUTURES
     pares_todos  = [p for p in pares_todos if p not in bloq_config
@@ -657,11 +674,8 @@ def main():
         try:
             ciclo += 1
             estado.reset_diario()
-            try:
-                balance = exchange.get_balance()
-            except Exception as e:
-                log.error(f"Error leyendo balance: {e}")
-            kz = analizar.en_killzone()
+            balance = exchange.get_balance()
+            kz      = analizar.en_killzone()
 
             log.info(
                 f"Ciclo {ciclo} | {datetime.now(timezone.utc).strftime('%H:%M UTC')} | "
