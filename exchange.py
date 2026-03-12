@@ -1,17 +1,20 @@
 """
-exchange.py — BingX Perpetual Futures REST API v4.3 [FIX COMPLETO]
+exchange.py — BingX Perpetual Futures REST API v4.3 [TODOS LOS FIXES]
 
 BUGS CORREGIDOS EN ESTA VERSION:
-  ✅ FIX#13 — detectar_modo_posicion() AÑADIDA (faltaba, causaba AttributeError
-              al arrancar y bloqueaba todo el bot)
-  ✅ FIX#14 — positionSide ahora es DINÁMICO según _HEDGE_MODE:
-              Hedge mode  → "LONG" / "SHORT"
-              One-way mode → "BOTH"
-              Error 109400 "Invalid parameters" resuelto definitivamente
-  ✅ FIX#15 — get_balance() robusto: maneja data como dict, list, o valor
-              plano. Prueba múltiples campos (availableMargin, balance,
-              walletBalance) y usa fallback seguro en todos los casos
-  ✅ FIX#7-12 — Todos los fixes anteriores se mantienen
+  ✅ FIX#7  — _build_query sin sorted(), timestamp al final
+  ✅ FIX#8  — quantity como string limpio, nunca notación científica
+  ✅ FIX#9  — _place_sl_tp quantity también como string limpio
+  ✅ FIX#10 — set_leverage no crashea en error
+  ✅ FIX#11 — positionSide dinámico (hedge vs one-way)
+  ✅ FIX#12 — calcular_cantidad con log diagnóstico detallado
+  ✅ FIX#13 — detectar_modo_posicion() AÑADIDA (faltaba → AttributeError)
+  ✅ FIX#14 — positionSide dinámico en TODAS las órdenes:
+              One-way mode → "BOTH"  |  Hedge mode → "LONG"/"SHORT"
+              Causa raíz del error "Invalid parameters" en todas las órdenes
+  ✅ FIX#15 — set_leverage sin parámetro 'side' en modo one-way
+              (BingX rechaza side=LONG/SHORT con 109400 en one-way)
+  ✅ FIX#16 — get_balance() robusto: maneja todos los formatos de respuesta
 """
 
 import time, hmac, hashlib, logging, math
@@ -28,8 +31,8 @@ _CONTRATOS_FUTURES: set  = set()
 _CONTRATO_INFO:     dict = {}
 _CONTRATOS_TS:      float = 0
 
-# Modo de posición: True = hedge (LONG/SHORT), False = one-way
-_HEDGE_MODE: bool = True   # BingX perpetuos usan hedge mode por defecto
+# Modo de posición: True = hedge (LONG/SHORT), False = one-way (BOTH)
+_HEDGE_MODE: bool = False  # ✅ FIX#14: default one-way (BOTH) — más seguro
 
 
 def detectar_modo_posicion():
@@ -37,14 +40,16 @@ def detectar_modo_posicion():
     ✅ FIX#13 — Detecta si la cuenta BingX usa Hedge mode o One-way mode.
     Hedge mode   → positionSide = "LONG" / "SHORT"
     One-way mode → positionSide = "BOTH"
-    Sin esta función, main.py crasheaba con AttributeError al arrancar.
+
+    Llamada desde main.py al arrancar.
+    Sin ella el bot crasheaba con AttributeError en el primer ciclo.
     """
     global _HEDGE_MODE
     if config.MODO_DEMO:
-        _HEDGE_MODE = True
+        _HEDGE_MODE = False  # demo → one-way por defecto
         return
 
-    # Intentar endpoint oficial de modo de posición
+    # Intentar endpoint oficial de modo de posición (v1 y v2)
     for endpoint in (
         "/openApi/swap/v1/trade/positionSide/dual",
         "/openApi/swap/v2/trade/positionSide/dual",
@@ -55,38 +60,39 @@ def detectar_modo_posicion():
             if code in (0, 200):
                 data = res.get("data", {})
                 if isinstance(data, dict):
-                    dual = data.get("dualSidePosition", data.get("dualSide", True))
-                    _HEDGE_MODE = bool(dual)
-                    log.info(
-                        f"[MODE] Modo detectado vía {endpoint}: "
-                        f"dualSidePosition={dual} → "
-                        f"{'HEDGE (LONG/SHORT)' if _HEDGE_MODE else 'ONE-WAY (BOTH)'}"
-                    )
-                    return
+                    dual = data.get("dualSidePosition", data.get("dualSide", None))
+                    if dual is not None:
+                        _HEDGE_MODE = bool(dual)
+                        log.info(
+                            f"[MODE] Detectado vía {endpoint}: dualSide={dual} → "
+                            f"{'HEDGE (LONG/SHORT)' if _HEDGE_MODE else 'ONE-WAY (BOTH)'}"
+                        )
+                        return
         except Exception as e:
             log.debug(f"detectar_modo_posicion {endpoint}: {e}")
 
-    # Fallback: inspeccionar posiciones abiertas
+    # Fallback: inspeccionar posiciones abiertas existentes
     try:
         pos = get_posiciones_abiertas()
         if pos:
-            side = (pos[0] or {}).get("positionSide", "BOTH")
-            _HEDGE_MODE = side.upper() in ("LONG", "SHORT")
+            side = str((pos[0] or {}).get("positionSide", "")).upper()
+            if side in ("LONG", "SHORT"):
+                _HEDGE_MODE = True
+            elif side == "BOTH":
+                _HEDGE_MODE = False
             log.info(
-                f"[MODE] Modo detectado por posiciones: positionSide={side} → "
+                f"[MODE] Detectado por posiciones: positionSide='{side}' → "
                 f"{'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}"
             )
             return
     except Exception as e:
-        log.debug(f"detectar_modo_posicion fallback posiciones: {e}")
+        log.debug(f"detectar_modo_posicion fallback: {e}")
 
-    # No se pudo detectar → asumir hedge (más común en BingX perpetuos)
-    _HEDGE_MODE = True
-    log.warning("[MODE] No se pudo detectar modo — asumiendo HEDGE (LONG/SHORT)")
+    # No se pudo detectar → asumir ONE-WAY (lo que indica el error 109400)
+    _HEDGE_MODE = False
+    log.warning("[MODE] No se pudo detectar modo → asumiendo ONE-WAY (BOTH)")
 
 
-# ══════════════════════════════════════════════════════════════
-# FIRMA HMAC ✅ FIX#7 — SIN sorted(), timestamp al final
 # ══════════════════════════════════════════════════════════════
 
 def _sign(query_string: str) -> str:
@@ -288,11 +294,9 @@ def get_qty_precision(symbol: str) -> int:
 
 def get_balance() -> float:
     """
-    ✅ FIX#15 — Maneja múltiples formatos de respuesta de BingX:
-    - data.balance.availableMargin  (formato estándar v2)
-    - data.availableMargin          (formato plano)
-    - data como lista de assets
-    - campos alternativos: walletBalance, equity
+    ✅ FIX#16 — Maneja múltiples formatos de respuesta de BingX:
+    data.balance.availableMargin | data.availableMargin | data como lista
+    Campos alternativos: walletBalance, equity, balance
     """
     if config.MODO_DEMO:
         return 1000.0
@@ -302,19 +306,18 @@ def get_balance() -> float:
         if code not in (0, 200):
             log.warning(f"get_balance: code={code} msg={res.get('msg','')}")
             return 0.0
-
         data = res.get("data", {})
-
-        # Caso 1: data es una lista de assets
+        # Caso 1: data es lista de assets
         if isinstance(data, list):
             for item in data:
-                if isinstance(item, dict) and item.get("asset", "").upper() in ("USDT", ""):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("asset", "").upper() in ("USDT", ""):
                     for campo in ("availableMargin", "balance", "walletBalance", "equity"):
                         v = item.get(campo)
                         if v is not None:
                             return float(v or 0)
-
-        # Caso 2: data es un dict con sub-dict "balance"
+        # Caso 2: data es dict con sub-dict "balance"
         if isinstance(data, dict):
             bal = data.get("balance", data)
             if isinstance(bal, dict):
@@ -324,7 +327,6 @@ def get_balance() -> float:
                         return float(v or 0)
             elif isinstance(bal, (int, float, str)):
                 return float(bal or 0)
-
         log.warning(f"get_balance: estructura inesperada: {str(res)[:200]}")
         return 0.0
     except Exception as e:
@@ -451,17 +453,29 @@ def cancelar_ordenes_abiertas(symbol: str):
 # ══════════════════════════════════════════════════════════════
 
 def set_leverage(symbol: str, leverage: int) -> bool:
+    """
+    ✅ FIX#15 — En modo one-way (BOTH), BingX rechaza side=LONG/SHORT
+    con error 109400. En ese caso enviamos sin parámetro 'side'.
+    En modo hedge enviamos side=LONG y side=SHORT por separado.
+    """
     if config.MODO_DEMO:
         return True
     try:
-        for side in ("LONG", "SHORT"):
-            r = _post("/openApi/swap/v2/trade/leverage",
-                      {"symbol": symbol, "side": side, "leverage": leverage})
-            code = r.get("code", 0)
-            if code not in (0, 200):
-                # Código 80012 = ya estaba en ese leverage (no es error real)
-                if code != 80012:
+        if _HEDGE_MODE:
+            # Modo hedge: configurar leverage para cada lado
+            for side in ("LONG", "SHORT"):
+                r    = _post("/openApi/swap/v2/trade/leverage",
+                             {"symbol": symbol, "side": side, "leverage": leverage})
+                code = r.get("code", 0)
+                if code not in (0, 200, 80012):
                     log.warning(f"set_leverage {symbol} {side}: code={code} msg={r.get('msg')}")
+        else:
+            # ✅ FIX#15: Modo one-way — sin parámetro 'side'
+            r    = _post("/openApi/swap/v2/trade/leverage",
+                         {"symbol": symbol, "leverage": leverage})
+            code = r.get("code", 0)
+            if code not in (0, 200, 80012):
+                log.warning(f"set_leverage {symbol} one-way: code={code} msg={r.get('msg')}")
         return True
     except Exception as e:
         log.error(f"set_leverage {symbol}: {e}")
@@ -609,7 +623,7 @@ def abrir_long(symbol: str, qty: float, precio: float,
     qty_str = _fmt_qty(qty)
     log.info(f"[ORDER] LONG {symbol} qty={qty_str} @ ~{precio:.6f}")
 
-    # ✅ FIX#14 — positionSide dinámico según modo de la cuenta
+    # ✅ FIX#14 — positionSide dinámico: ONE-WAY="BOTH", HEDGE="LONG"
     params = {
         "symbol":       symbol,
         "side":         "BUY",
@@ -654,7 +668,7 @@ def abrir_short(symbol: str, qty: float, precio: float,
     qty_str = _fmt_qty(qty)
     log.info(f"[ORDER] SHORT {symbol} qty={qty_str} @ ~{precio:.6f}")
 
-    # ✅ FIX#14 — positionSide dinámico según modo de la cuenta
+    # ✅ FIX#14 — positionSide dinámico: ONE-WAY="BOTH", HEDGE="SHORT"
     params = {
         "symbol":       symbol,
         "side":         "SELL",
