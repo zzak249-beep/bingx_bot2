@@ -575,13 +575,21 @@ def main():
     if balance <= 0 and not config.MODO_DEMO:
         _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
 
+    # Pre-cargar contratos de futuros válidos (evita signature mismatch)
+    log.info("Cargando contratos de futuros perpetuos...")
+    exchange._cargar_contratos()
+    log.info(f"Contratos cargados: {len(exchange._CONTRATOS_FUTURES)} pares válidos")
+
     cargar_posiciones_desde_bingx()
 
     # ── Cargar pares ──
     log.info("Cargando pares de BingX...")
     pares_todos  = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
     bloq_config  = set(config.PARES_BLOQUEADOS)
-    pares_todos  = [p for p in pares_todos if p not in bloq_config]
+    # Filtrar solo futuros perpetuos válidos
+    futuros_validos = exchange._CONTRATOS_FUTURES
+    pares_todos  = [p for p in pares_todos if p not in bloq_config 
+                    and (not futuros_validos or p in futuros_validos)]
     prioritarios = [p for p in (PARES_FIJOS + config.PARES_PRIORITARIOS) if p in set(pares_todos)]
     top_memoria  = [p for p in memoria.get_top_pares(10) if p in set(pares_todos)]
     resto        = [p for p in pares_todos if p not in set(prioritarios) and p not in set(top_memoria)]
@@ -626,7 +634,9 @@ def main():
             # Refrescar pares cada hora
             if time.time() - last_scan_pares > 3600:
                 nuevos  = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
-                nuevos  = [p for p in nuevos if p not in bloq_config]
+                fv      = exchange._CONTRATOS_FUTURES
+                nuevos  = [p for p in nuevos if p not in bloq_config
+                           and (not fv or p in fv)]
                 bloq_m  = set(memoria.get_pares_bloqueados())
                 top_m   = [p for p in memoria.get_top_pares(10) if p in set(nuevos)]
                 resto_n = [p for p in nuevos if p not in set(top_m) and p not in bloq_m]
@@ -692,6 +702,7 @@ def main():
 
                     ejecutado = ejecutar_senal(s)
                     _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
+                    # Note: notif sent AFTER execution with real result
                     if ejecutado:
                         balance = exchange.get_balance()
                         time.sleep(2)
