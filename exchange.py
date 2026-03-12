@@ -161,7 +161,7 @@ def get_balance() -> float:
     return 0.0
 
 def get_available_margin() -> float:
-    """Margen disponible para nuevas posiciones (puede ser bajo si hay posiciones abiertas)."""
+    """Margen disponible para nuevas posiciones."""
     if config.MODO_DEMO:
         return 1000.0
     keys = ("availableMargin", "availableBalance", "crossAvailableBalance", "free")
@@ -300,7 +300,7 @@ def _load_contracts():
         log.warning(f"[CONTRACTS] {e}")
 
 def _cargar_contratos():
-    """Alias público de _load_contracts() — requerido por main.py."""
+    """Alias público requerido por main.py."""
     _load_contracts()
 
 def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
