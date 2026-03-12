@@ -22,7 +22,6 @@ _hedge_mode_cache: dict   = {}
 _contract_cache: dict     = {}
 _contract_cache_ts: float = 0
 _pares_no_soportados: set = set()  # pares que fallan siempre — nunca reintentar
-_CONTRATOS_FUTURES: set   = set()  # set de símbolos válidos en futuros perpetuos
 
 # ── Persistencia de pares no soportados ──────────────────────
 def _ns_file() -> str:
@@ -131,10 +130,16 @@ def _extract_float(data, keys) -> float:
     return -1.0
 
 def get_balance() -> float:
+    """
+    Devuelve el balance total (equity) de la cuenta.
+    Prioriza 'balance' y 'equity' sobre 'availableMargin' para no confundir
+    margen libre ($0.02) con el saldo real ($113+).
+    """
     if config.MODO_DEMO:
         return 1000.0
-    keys = ("availableMargin", "availableBalance", "crossAvailableBalance",
-            "walletBalance", "balance", "free", "equity")
+    # Prioridad: balance real > equity > margen disponible
+    keys_principal = ("balance", "walletBalance", "equity")
+    keys_fallback  = ("availableMargin", "availableBalance", "crossAvailableBalance", "free")
     endpoints = [
         "/openApi/swap/v2/user/balance",
         "/openApi/swap/v3/user/balance",
@@ -146,14 +151,40 @@ def get_balance() -> float:
             data = res.get("data")
             log.debug(f"[BAL] {ep}: {str(data)[:150]}")
             if data is not None:
-                val = _extract_float(data, keys)
-                if val > 0:
+                # Intentar primero con keys de balance real
+                val = _extract_float(data, keys_principal)
+                if val > 1.0:
                     log.info(f"[BALANCE] ${val:.2f} via {ep}")
                     return val
+                # Fallback a margen disponible si no hay balance real
+                val2 = _extract_float(data, keys_fallback)
+                if val2 > 0:
+                    log.info(f"[BALANCE] ${val2:.2f} (margen disp.) via {ep}")
+                    return val2
         except Exception as e:
             log.debug(f"[BAL] {ep}: {e}")
     log.warning("[BALANCE] No se pudo leer balance — verifica API key permisos")
     return 0.0
+
+
+def get_available_margin() -> float:
+    """Margen disponible para abrir nuevas posiciones (puede ser bajo si hay posiciones abiertas)."""
+    if config.MODO_DEMO:
+        return 1000.0
+    keys = ("availableMargin", "availableBalance", "crossAvailableBalance", "free")
+    endpoints = ["/openApi/swap/v2/user/balance", "/openApi/swap/v3/user/balance"]
+    for ep in endpoints:
+        try:
+            res  = _get(ep)
+            data = res.get("data")
+            if data is not None:
+                val = _extract_float(data, keys)
+                if val >= 0:
+                    return val
+        except Exception:
+            pass
+    return 0.0
+
 
 # ══════════════════════════════════════════════════════════════
 # PRECIO
@@ -262,7 +293,7 @@ def set_leverage(symbol: str, leverage: int) -> bool:
 # CONTRATOS + CANTIDAD
 # ══════════════════════════════════════════════════════════════
 def _load_contracts():
-    global _contract_cache, _contract_cache_ts, _CONTRATOS_FUTURES
+    global _contract_cache, _contract_cache_ts
     if _contract_cache and time.time() - _contract_cache_ts < 3600:
         return
     try:
@@ -272,15 +303,10 @@ def _load_contracts():
             step = float(c.get("tradeMinQuantity", 1) or 1)
             dec  = int(c.get("quantityPrecision", 0) or 0)
             _contract_cache[sym] = {"step": step, "dec": dec}
-        _CONTRATOS_FUTURES = set(_contract_cache.keys())
         _contract_cache_ts = time.time()
         log.info(f"[CONTRACTS] {len(_contract_cache)} pares cargados")
     except Exception as e:
         log.warning(f"[CONTRACTS] {e}")
-
-def _cargar_contratos():
-    """Alias público de _load_contracts() — requerido por main.py."""
-    _load_contracts()
 
 def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
     if precio <= 0 or trade_usdt <= 0:
