@@ -58,7 +58,7 @@ TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 6.0)   # cierra a las 6h sin TP/SL
 MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)  # pausa si pierde $20/día
 
 # ── Score / Señales ── v4.0 usa score /14 ────────────────────
-SCORE_MIN    = _int("SCORE_MIN",       5)     # mínimo 5/14
+SCORE_MIN    = _int("SCORE_MIN",       7)     # mínimo 7/14
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
@@ -71,7 +71,7 @@ KZ_LONDON_START = _int("KZ_LONDON_START",420)
 KZ_LONDON_END   = _int("KZ_LONDON_END",  600)
 KZ_NY_START     = _int("KZ_NY_START",    780)
 KZ_NY_END       = _int("KZ_NY_END",      960)
-KZ_REQUERIDA    = _bool("KZ_REQUERIDA",  False)  # False = opera fuera de KZ también
+KZ_REQUERIDA    = _bool("KZ_REQUERIDA",  True)   # True = opera SOLO en KZ Asia/London/NY
 
 # ── Indicadores ───────────────────────────────────────────────
 EMA_FAST       = _int("EMA_FAST",      21)
@@ -91,7 +91,7 @@ PINBAR_RATIO     = _float("PINBAR_RATIO",    0.55)  # mecha >= 55% del rango
 ENGULF_ACTIVO    = _bool("ENGULF_ACTIVO",    True)
 VWAP_ACTIVO      = _bool("VWAP_ACTIVO",      True)
 VWAP_PCT         = _float("VWAP_PCT",        0.20)  # proximidad VWAP ±0.20%
-COOLDOWN_VELAS   = _int("COOLDOWN_VELAS",    5)     # mínimo 5 velas entre señales mismo par
+COOLDOWN_VELAS   = _int("COOLDOWN_VELAS",    8)     # mínimo 8 velas entre señales mismo par (40min en 5m)
 MOMENTUM_ACTIVO  = _bool("MOMENTUM_ACTIVO",  True)
 
 # ── Timeframes ────────────────────────────────────────────────
