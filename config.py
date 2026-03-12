@@ -10,7 +10,7 @@ CAMBIOS v4.3:
 """
 import os
 
-VERSION = "SMC-Bot v4.3 [PRECISION+APRENDE+COMPOUNDING]"
+VERSION = "SMC-Bot v4.4 [PRECISION+APRENDE+COMPOUNDING]"
 
 def _int(var, default):
     try:
@@ -46,7 +46,7 @@ COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)
 
 # ── Posiciones ────────────────────────────────────────────────
 LEVERAGE       = _int("LEVERAGE",       10)
-MAX_POSICIONES = _int("MAX_POSICIONES",  3)
+MAX_POSICIONES = _int("MAX_POSICIONES",  5)   # FIX v4.4: solo cuenta trades del bot, no manuales
 
 # ── TP / SL ───────────────────────────────────────────────────
 TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)
