@@ -241,42 +241,8 @@ def get_balance() -> float:
         return 1000.0
     try:
         res = _get("/openApi/swap/v2/user/balance")
-        log.debug(f"[BALANCE-RAW] {str(res)[:300]}")
-        data = res.get("data", {})
-
-        # Estructura 1: data.balance.availableMargin (dict)
-        bal = data.get("balance", {})
-        if isinstance(bal, dict):
-            v = float(bal.get("availableMargin", bal.get("availableBalance", bal.get("balance", 0))) or 0)
-            if v > 0:
-                return v
-
-        # Estructura 2: data.availableMargin directo
-        for key in ("availableMargin", "availableBalance", "crossAvailableBalance", "balance"):
-            v = data.get(key)
-            if v is not None:
-                try:
-                    f = float(v)
-                    if f > 0:
-                        return f
-                except Exception:
-                    pass
-
-        # Estructura 3: lista en data
-        if isinstance(data, list) and len(data) > 0:
-            item = data[0]
-            for key in ("availableMargin", "availableBalance", "balance"):
-                v = item.get(key)
-                if v is not None:
-                    try:
-                        f = float(v)
-                        if f >= 0:
-                            return f
-                    except Exception:
-                        pass
-
-        log.warning(f"[BALANCE] No se pudo parsear respuesta: {str(data)[:200]}")
-        return 0.0
+        bal = res.get("data", {}).get("balance", {})
+        return float(bal.get("availableMargin", bal.get("balance", 0)) or 0)
     except Exception as e:
         log.error(f"get_balance: {e}")
         return 0.0
