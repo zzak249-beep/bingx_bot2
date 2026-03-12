@@ -1,5 +1,5 @@
 """
-main.py — SMC Bot BingX v4.3 [REAL MONEY | 24/7 | AUTO-LEARN]
+main.py — SMC Bot BingX v4.4 [REAL MONEY | 24/7 | AUTO-LEARN]
 $10 por trade × 10x | Compounding | OB+FVG confluencia | Sin parar
 
 BUGS CORREGIDOS:
@@ -124,7 +124,16 @@ def _notif(msg: str):
 
 def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
     lado  = "🟢 LONG" if s["lado"] == "LONG" else "🔴 SHORT"
-    ex    = "✅ *Ejecutado*" if ejecutado else "⚠️ *No ejecutado*"
+    if ejecutado == "ok":
+        ex = "✅ *Ejecutado*"
+    elif isinstance(ejecutado, str) and ejecutado.startswith("bloq:"):
+        razon = ejecutado[5:]
+        ex = f"⚠️ *No ejecutado* — `{razon}`"
+    elif isinstance(ejecutado, str) and ejecutado.startswith("error:"):
+        razon = ejecutado[6:]
+        ex = f"🚨 *Error API* — `{razon}`"
+    else:
+        ex = "⚠️ *No ejecutado*"
     motiv = " + ".join(s.get("motivos", []))
 
     extras = ""
@@ -432,39 +441,44 @@ def gestionar_posiciones():
 # EJECUTAR SEÑAL
 # ═══════════════════════════════════════════════════════
 
-def ejecutar_senal(s: dict) -> bool:
+
+def _pos_bot_count() -> int:
+    """Posiciones abiertas por el bot (excluye manuales con recuperada=True)."""
+    return sum(1 for v in estado.posiciones.values() if not v.get("recuperada", False))
+
+
+def ejecutar_senal(s: dict) -> str:
     par  = s["par"]
     lado = s["lado"]
 
     if par in estado.posiciones:
-        return False
+        return "skip"
     if hay_hedge(par, lado, estado.posiciones):
-        return False
+        return "bloq:anti-hedge activo"
     if hay_correlacion(par, lado, estado.posiciones):
-        return False
+        return "bloq:correlacion (par similar ya abierto)"
     if memoria.esta_bloqueado(par):
-        return False
-    if len(estado.posiciones) >= config.MAX_POSICIONES:
-        return False
+        return "bloq:par bloqueado por aprendizaje"
+    bot_pos = _pos_bot_count()
+    if bot_pos >= config.MAX_POSICIONES:
+        return f"bloq:MAX_POSICIONES ({bot_pos}/{config.MAX_POSICIONES} trades bot)"
     if estado.max_perdida_alcanzada():
-        log.warning("[BLOQUEO] Máx pérdida diaria")
-        return False
+        log.warning("[BLOQUEO] Max perdida diaria")
+        return f"bloq:circuit-breaker PnL={estado.pnl_hoy:.2f}"
 
     balance = exchange.get_balance()
     if balance < 5.0 and not config.MODO_DEMO:
         log.warning(f"Balance insuficiente: ${balance:.2f}")
-        return False
+        return f"bloq:balance insuficiente (${balance:.2f})"
 
     trade_usdt = memoria.get_trade_amount()
     qty        = exchange.calcular_cantidad(par, trade_usdt, s["precio"])
     if qty <= 0:
-        return False
+        return f"bloq:qty=0 precio={s['precio']:.8g}"
 
-    # En BingX cross margin, el balance total es colateral — no comprobar availableMargin
-    # BingX rechazará la orden si realmente no hay margen disponible
     if balance < trade_usdt and not config.MODO_DEMO:
-        log.warning(f"[{par}] Balance ${balance:.2f} < trade ${trade_usdt:.2f} — sin fondos")
-        return False
+        log.warning(f"[{par}] Balance ${balance:.2f} < trade ${trade_usdt:.2f}")
+        return f"bloq:margen (${balance:.2f} < ${trade_usdt:.2f})"
 
     if lado == "LONG":
         res = exchange.abrir_long(par, qty, s["precio"], s["sl"], s["tp"])
@@ -475,8 +489,7 @@ def ejecutar_senal(s: dict) -> bool:
         err = (res or {}).get("error", "respuesta vacía")
         log.error(f"Orden fallida {lado} {par}: {err}")
         memoria.registrar_error_api(par)
-        _notif(f"🚨 *Orden fallida {lado} `{par}`*\n❌ `{err}`")
-        return False
+        return f"error:{err[:80]}"
 
     entrada_real = float(res.get("fill_price", 0) or 0)
     if entrada_real <= 0:
@@ -524,7 +537,7 @@ def ejecutar_senal(s: dict) -> bool:
         f"SL:{sl_r:.6f} TP:{tp_r:.6f} score:{s['score']}/14 "
         f"{'🏆OB+FVG' if s.get('ob_fvg_bull') or s.get('ob_fvg_bear') else ''}"
     )
-    return True
+    return "ok"
 
 
 # ═══════════════════════════════════════════════════════
@@ -647,7 +660,7 @@ def main():
 
             log.info(
                 f"Ciclo {ciclo} | {datetime.now(timezone.utc).strftime('%H:%M UTC')} | "
-                f"Bal:${balance:.2f} | Pos:{len(estado.posiciones)} | "
+                f"Bal:${balance:.2f} | Pos:{_pos_bot_count()}bot/{len(estado.posiciones)}tot | "
                 f"PnL:${estado.pnl_hoy:+.4f} | KZ:{kz['nombre']} | "
                 f"Trade:${memoria.get_trade_amount():.2f}"
             )
@@ -683,7 +696,7 @@ def main():
                 gestionar_posiciones()
                 balance = exchange.get_balance()
 
-            if len(estado.posiciones) < config.MAX_POSICIONES:
+            if _pos_bot_count() < config.MAX_POSICIONES:
                 bloq_ahora = set(memoria.get_pares_bloqueados())
                 pares_scan = [
                     p for p in pares
@@ -707,7 +720,7 @@ def main():
                     log.info("Sin señales este ciclo")
 
                 for s in senales:
-                    if len(estado.posiciones) >= config.MAX_POSICIONES:
+                    if _pos_bot_count() >= config.MAX_POSICIONES:
                         break
                     if s["par"] in estado.posiciones:
                         continue
@@ -726,17 +739,28 @@ def main():
                         log.debug(f"[SKIP-API] {s['par']} bloqueado permanente")
                         continue
 
-                    ejecutado = ejecutar_senal(s)
+                    resultado = ejecutar_senal(s)
 
-                    # Si falló por API, bloquear permanentemente y NO enviar spam
-                    if not ejecutado and not exchange.par_es_soportado(s["par"]):
-                        log.warning(f"[BLOCKED] {s['par']} bloqueado tras fallo")
-                        memoria.registrar_error_api(s["par"])
-                        continue  # sin Telegram para este par
+                    # skip = par ya en estado, no notificar
+                    if resultado == "skip":
+                        continue
 
-                    # Notificar siempre — si no ejecutó el user puede operar manual
-                    _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
-                    if ejecutado:
+                    # Error de API → ya registrado en memoria, solo loguear
+                    if resultado and resultado.startswith("error:"):
+                        log.error(f"[API-ERR] {s['par']}: {resultado[6:]}")
+                        if not exchange.par_es_soportado(s["par"]):
+                            log.warning(f"[BLOCKED] {s['par']} bloqueado tras fallo")
+                        _notif(f"🚨 *Orden fallida {s['lado']} `{s['par']}`*\n❌ `{resultado[6:80]}`")
+                        continue
+
+                    # bloq:MAX_POSICIONES → no notificar señal (evitar spam)
+                    if resultado and "MAX_POSICIONES" in resultado:
+                        log.info(f"[SKIP] {s['par']} — {resultado}")
+                        continue
+
+                    # Para cualquier otro resultado: notificar (ejecutado o bloqueado con razón)
+                    _notif_entrada(s, memoria.get_trade_amount(), resultado)
+                    if resultado == "ok":
                         balance = exchange.get_balance()
                         time.sleep(2)
 
@@ -748,7 +772,7 @@ def main():
 
         except KeyboardInterrupt:
             log.info("Detenido (Ctrl+C)")
-            _notif("🛑 *SMC Bot v4.3 detenido manualmente.*")
+            _notif("🛑 *SMC Bot v4.4 detenido manualmente.*")
             break
         except Exception as e:
             log.error(f"ERROR CICLO {ciclo}: {e}\n{traceback.format_exc()}")
