@@ -116,7 +116,10 @@ def get_pares_cached(volumen_min: float = VOLUMEN_MIN_24H) -> list:
         log.info(f"[SCANNER] Cache actualizada: {len(_cache_pares)} pares")
         # Filtrar pares eliminados por aprendizaje (memoria)
     if _memoria:
-        _cache_pares = _memoria.filtrar_pares(_cache_pares)
+        try:
+            _cache_pares = _memoria.filtrar_pares(_cache_pares)
+        except Exception as e:
+            log.warning(f"[SCANNER] filtrar_pares error (ignorado): {e}")
 
     # Filtrar pares que fallaron en API (exchange)
     try:
