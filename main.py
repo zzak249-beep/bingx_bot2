@@ -460,11 +460,10 @@ def ejecutar_senal(s: dict) -> bool:
     if qty <= 0:
         return False
 
-    # Comprobar margen DISPONIBLE (no balance total) para abrir la posición
-    margen_disp = exchange.get_available_margin() if not config.MODO_DEMO else balance
-    margen_necesario = trade_usdt / config.LEVERAGE * 1.1  # margen real necesario + 10%
-    if margen_disp < margen_necesario and not config.MODO_DEMO:
-        log.warning(f"[{par}] Margen insuficiente ${margen_disp:.2f} < ${margen_necesario:.2f} necesario")
+    # En BingX cross margin, el balance total es colateral — no comprobar availableMargin
+    # BingX rechazará la orden si realmente no hay margen disponible
+    if balance < trade_usdt and not config.MODO_DEMO:
+        log.warning(f"[{par}] Balance ${balance:.2f} < trade ${trade_usdt:.2f} — sin fondos")
         return False
 
     if lado == "LONG":
