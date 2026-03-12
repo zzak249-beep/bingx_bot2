@@ -35,6 +35,41 @@ def calc_ema(prices: list, period: int):
     return ema
 
 
+
+def calc_macd(prices: list, fast: int = 12, slow: int = 26, signal: int = 9):
+    """MACD — retorna (macd_line, signal_line, histograma). Confirma momentum."""
+    if len(prices) < slow + signal:
+        return None, None, None
+    macd_series = []
+    for i in range(slow - 1, len(prices)):
+        ef = calc_ema(prices[:i+1], fast)
+        es = calc_ema(prices[:i+1], slow)
+        if ef is not None and es is not None:
+            macd_series.append(ef - es)
+    if len(macd_series) < signal:
+        return None, None, None
+    macd_line   = macd_series[-1]
+    signal_line = calc_ema(macd_series, signal)
+    if signal_line is None:
+        return None, None, None
+    return round(macd_line, 8), round(signal_line, 8), round(macd_line - signal_line, 8)
+
+
+def calc_volumen_ratio(candles: list, periodo: int = 20) -> float:
+    """Volumen actual / media últimas N velas. >1.5 = spike de volumen."""
+    if len(candles) < periodo + 1:
+        return 1.0
+    vols = [c["volume"] for c in candles[-(periodo+1):-1]]
+    avg  = sum(vols) / len(vols) if vols else 0
+    return (candles[-1]["volume"] / avg) if avg > 0 else 1.0
+
+
+def fvg_es_grande(fvg: dict, atr: float) -> bool:
+    """FVG de calidad: tamaño >= 0.3 ATR."""
+    gap = abs(fvg.get("fvg_top", 0) - fvg.get("fvg_bottom", 0))
+    return atr > 0 and gap >= atr * 0.3
+
+
 def calc_rsi(prices: list, period: int = 14):
     """RSI Wilder (RMA) — idéntico a TradingView."""
     if len(prices) < period + 1:
@@ -412,11 +447,7 @@ def volumen_ok(candles: list) -> bool:
 def analizar_par(par: str):
     try:
         candles = exchange.get_candles(par, config.TIMEFRAME, config.CANDLES_LIMIT)
-        if len(candles) < 60:
-            log.info(f"[SKIP] {par} — pocas velas: {len(candles)}")
-            return None
-        if not volumen_ok(candles):
-            log.info(f"[SKIP] {par} — volumen insuficiente")
+        if len(candles) < 60 or not volumen_ok(candles):
             return None
 
         closes = [c["close"] for c in candles]
@@ -437,10 +468,23 @@ def analizar_par(par: str):
         bear_trend_5m = ema_f is not None and ema_s is not None and ema_f < ema_s
         rsi           = calc_rsi(closes, config.RSI_PERIOD) or 50.0
 
+        # ── MACD + Volumen (entradas más precisas) ──
+        macd_line, macd_signal, macd_hist = calc_macd(closes)
+        macd_bull  = macd_hist is not None and macd_hist > 0
+        macd_bear  = macd_hist is not None and macd_hist < 0
+        vol_ratio  = calc_volumen_ratio(candles)
+        vol_spike  = vol_ratio >= 1.3
+
         # ── MTF 1h ──
         htf = tendencia_htf(par)
 
-        # ✅ FIX v3.2: solo HTF bloquea. EMA 5m ya suma +1 al score.
+        # ✅ FIX CRÍTICO: NEUTRAL en 1h ahora permite operar
+        # Antes: trend_ok_long = bull_trend_5m AND (htf in BULL/NEUTRAL)
+        # que era: True AND True cuando htf=NEUTRAL ✓ — parece correcto
+        # PERO bull_trend_1h = htf in ("BULL","NEUTRAL") era True incluso para NEUTRAL
+        # El problema real era que en un mercado NEUTRAL el 5m tampoco alineaba
+        # FIX: solo bloquear si HTF va EXPLÍCITAMENTE en contra
+        # v3.2: EMA 5m suma +1 al score; solo HTF bloquea
         trend_ok_long  = htf != "BEAR"
         trend_ok_short = htf != "BULL"
 
@@ -571,18 +615,41 @@ def analizar_par(par: str):
             sl_short += 1
             ml_short.append("VELA")
 
-        # ── Condiciones base obligatorias ──
-        # ✅ FIX v3.2: zona ampliada + KZ NO obligatoria (solo score)
+        # MACD histograma positivo +1 (confirma momentum)
+        if macd_bull:
+            sl_long  += 1
+            ml_long.append("MACD")
+        if macd_bear:
+            sl_short += 1
+            ml_short.append("MACD")
+
+        # Volumen spike +1 (confirma impulso real, evita falsas roturas)
+        if vol_spike:
+            sl_long  += 1
+            sl_short += 1
+            ml_long.append(f"VOL{vol_ratio:.1f}x")
+            ml_short.append(f"VOL{vol_ratio:.1f}x")
+
+        # FVG grande +1 (zona más fuerte)
+        if fvg_es_grande(fvg, atr):
+            if fvg["bull_fvg"]:
+                sl_long  += 1
+                ml_long.append("FVG+")
+            if fvg["bear_fvg"]:
+                sl_short += 1
+                ml_short.append("FVG+")
+
+        # ── Condiciones base ── v3.2: KZ no obligatoria, zona ampliada
         near_pp       = pivotes and abs(precio - pivotes["PP"]) / precio < (config.PIVOT_NEAR_PCT * 1.5) / 100
         near_s1_wide  = pivotes and abs(precio - pivotes["S1"]) / precio < (config.PIVOT_NEAR_PCT * 1.5) / 100
         near_r1_wide  = pivotes and abs(precio - pivotes["R1"]) / precio < (config.PIVOT_NEAR_PCT * 1.5) / 100
-        asia_break_low  = asia["valido"] and precio < asia["low"]  * 1.005
-        asia_break_high = asia["valido"] and precio > asia["high"] * 0.995
+        asia_brk_low  = asia["valido"] and precio < asia["low"]  * 1.005
+        asia_brk_high = asia["valido"] and precio > asia["high"] * 0.995
 
         zona_long  = (near_s1 or near_s2 or near_s1_wide or near_pp
-                      or eq["is_eql"] or near_asia_low or asia_break_low or ob["bull_ob"])
+                      or eq["is_eql"] or near_asia_low or asia_brk_low or ob["bull_ob"])
         zona_short = (near_r1 or near_r2 or near_r1_wide or near_pp
-                      or eq["is_eqh"] or near_asia_high or asia_break_high or ob["bear_ob"])
+                      or eq["is_eqh"] or near_asia_high or asia_brk_high or ob["bear_ob"])
 
         base_long  = fvg["bull_fvg"] and zona_long
         base_short = fvg["bear_fvg"] and zona_short
@@ -602,24 +669,14 @@ def analizar_par(par: str):
                 lado, score, motivos = "LONG", sl_long, ml_long
 
         if lado is None:
-            if sl_long == 0 and sl_short == 0:
-                log.info(
-                    f"[SCORE-0] {par} | "
-                    f"fvg+={fvg['bull_fvg']} fvg-={fvg['bear_fvg']} | "
-                    f"zona+={zona_long} zona-={zona_short} | "
-                    f"kz={kz['nombre']} htf={htf} rsi={rsi:.0f}"
-                )
-            if sl_long >= 1 or sl_short >= 1:
+            if sl_long >= 3 or sl_short >= 3:
                 log.info(
                     f"[NO-SE] {par} | "
                     f"L:{sl_long}pts({','.join(ml_long) or '-'}) "
                     f"S:{sl_short}pts({','.join(ml_short) or '-'}) | "
-                    f"base_L={base_long}(fvg={fvg['bull_fvg']},zona={zona_long}) "
-                    f"base_S={base_short}(fvg={fvg['bear_fvg']},zona={zona_short}) | "
-                    f"trend_L={trend_ok_long}(htf={htf}) "
-                    f"trend_S={trend_ok_short} | "
-                    f"scoreMin={score_min_eff} kz={kz['nombre']} "
-                    f"nearPP={near_pp} ob+={ob['bull_ob']} ob-={ob['bear_ob']}"
+                    f"bL={base_long}(fvg={fvg['bull_fvg']},zona={zona_long}) "
+                    f"bS={base_short} tL={trend_ok_long}(htf={htf}) "
+                    f"min={score_min_eff} kz={kz['nombre']} pp={near_pp}"
                 )
             return None
 
@@ -666,12 +723,14 @@ def analizar_par(par: str):
             "bos_bear":  bos["bos_bear"],
             "choch_bull":bos["choch_bull"],
             "choch_bear":bos["choch_bear"],
-            "vela_conf": vela_conf_long or vela_conf_short,
+            "vela_conf":  vela_conf_long or vela_conf_short,
+            "macd_hist":  macd_hist,
+            "vol_ratio":  round(vol_ratio, 2),
             "asia_valido":asia["valido"],
         }
 
     except Exception as e:
-        log.info(f"[ERROR-PAR] {par}: {type(e).__name__}: {e}")
+        log.info(f"[ERR-PAR] {par}: {type(e).__name__}: {e}")
         return None
 
 
