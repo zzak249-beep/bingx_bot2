@@ -1,20 +1,20 @@
 """
-exchange.py — BingX Perpetual Futures REST API v4.3 [TODOS LOS FIXES]
+exchange.py — BingX Perpetual Futures REST API v4.2 [FIX ERROR 109400]
 
 BUGS CORREGIDOS EN ESTA VERSION:
-  ✅ FIX#7  — _build_query sin sorted(), timestamp al final
-  ✅ FIX#8  — quantity como string limpio, nunca notación científica
-  ✅ FIX#9  — _place_sl_tp quantity también como string limpio
-  ✅ FIX#10 — set_leverage no crashea en error
-  ✅ FIX#11 — positionSide dinámico (hedge vs one-way)
-  ✅ FIX#12 — calcular_cantidad con log diagnóstico detallado
-  ✅ FIX#13 — detectar_modo_posicion() AÑADIDA (faltaba → AttributeError)
-  ✅ FIX#14 — positionSide dinámico en TODAS las órdenes:
-              One-way mode → "BOTH"  |  Hedge mode → "LONG"/"SHORT"
-              Causa raíz del error "Invalid parameters" en todas las órdenes
-  ✅ FIX#15 — set_leverage sin parámetro 'side' en modo one-way
-              (BingX rechaza side=LONG/SHORT con 109400 en one-way)
-  ✅ FIX#16 — get_balance() robusto: maneja todos los formatos de respuesta
+  ✅ FIX#7 — _build_query NO usa sorted() — BingX firma sobre el string
+             en el orden exacto de inserción. sorted() rompía la firma
+             cuando el orden alfabético difería del orden de inserción.
+             SOLUCIÓN: timestamp siempre al FINAL, sin sorted().
+  ✅ FIX#8 — quantity como string limpio sin notación científica ni .0
+             '5600.0' → '5600' | '0.001' se mantiene | nunca '5.6e3'
+  ✅ FIX#9 — _place_sl_tp: quantity también formateada igual (string limpio)
+  ✅ FIX#10 — set_leverage: verificar código respuesta, no crashear
+  ✅ FIX#11 — Modo hedge (BOTH) vs modo one-way: detectar y adaptar
+             positionSide solo se envía si la cuenta usa hedge mode
+  ✅ FIX#12 — calcular_cantidad: PIXEL-USDT y similares pueden tener
+             stepSize muy pequeño → log detallado para diagnóstico
+  ✅ FIX#1-6 — Todos los fixes anteriores se mantienen
 """
 
 import time, hmac, hashlib, logging, math
@@ -31,25 +31,48 @@ _CONTRATOS_FUTURES: set  = set()
 _CONTRATO_INFO:     dict = {}
 _CONTRATOS_TS:      float = 0
 
-# Modo de posición: True = hedge (LONG/SHORT), False = one-way (BOTH)
-_HEDGE_MODE: bool = False  # ✅ FIX#14: default one-way (BOTH) — más seguro
+# Modo de posición: True = hedge (LONG/SHORT), False = one-way (sin positionSide)
+_HEDGE_MODE: bool = False  # default one-way — más seguro
+
+
+def _add_pos_side(params: dict, lado: str) -> dict:
+    """
+    ✅ FIX#14 — Añade positionSide SOLO en modo hedge.
+    En modo one-way BingX rechaza positionSide aunque sea "BOTH".
+    La solución es omitirlo completamente.
+    """
+    if _HEDGE_MODE:
+        params["positionSide"] = lado
+    return params
 
 
 def detectar_modo_posicion():
     """
-    ✅ FIX#13 — Detecta si la cuenta BingX usa Hedge mode o One-way mode.
-    Hedge mode   → positionSide = "LONG" / "SHORT"
-    One-way mode → positionSide = "BOTH"
-
-    Llamada desde main.py al arrancar.
-    Sin ella el bot crasheaba con AttributeError en el primer ciclo.
+    ✅ FIX#13 — Detecta Hedge mode vs One-way mode.
+    Prioridad:
+    1. BINGX_MODE=hedge/oneway en Railway (manual, más fiable)
+    2. Endpoint API oficial
+    3. Inspección de posiciones abiertas
+    4. Default: one-way (sin positionSide)
     """
     global _HEDGE_MODE
-    if config.MODO_DEMO:
-        _HEDGE_MODE = False  # demo → one-way por defecto
+
+    # 1. Override manual desde env var
+    mode = getattr(config, "BINGX_MODE", "auto")
+    if mode == "hedge":
+        _HEDGE_MODE = True
+        log.info("[MODE] FORZADO HEDGE (BINGX_MODE=hedge) — positionSide=LONG/SHORT")
+        return
+    if mode == "oneway":
+        _HEDGE_MODE = False
+        log.info("[MODE] FORZADO ONE-WAY (BINGX_MODE=oneway) — sin positionSide")
         return
 
-    # Intentar endpoint oficial de modo de posición (v1 y v2)
+    if config.MODO_DEMO:
+        _HEDGE_MODE = False
+        return
+
+    # 2. Endpoint oficial de BingX
     for endpoint in (
         "/openApi/swap/v1/trade/positionSide/dual",
         "/openApi/swap/v2/trade/positionSide/dual",
@@ -64,35 +87,34 @@ def detectar_modo_posicion():
                     if dual is not None:
                         _HEDGE_MODE = bool(dual)
                         log.info(
-                            f"[MODE] Detectado vía {endpoint}: dualSide={dual} → "
-                            f"{'HEDGE (LONG/SHORT)' if _HEDGE_MODE else 'ONE-WAY (BOTH)'}"
+                            f"[MODE] API detectó: dualSide={dual} → "
+                            f"{'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}"
                         )
                         return
         except Exception as e:
             log.debug(f"detectar_modo_posicion {endpoint}: {e}")
 
-    # Fallback: inspeccionar posiciones abiertas existentes
+    # 3. Fallback: posiciones abiertas
     try:
         pos = get_posiciones_abiertas()
         if pos:
             side = str((pos[0] or {}).get("positionSide", "")).upper()
-            if side in ("LONG", "SHORT"):
-                _HEDGE_MODE = True
-            elif side == "BOTH":
-                _HEDGE_MODE = False
-            log.info(
-                f"[MODE] Detectado por posiciones: positionSide='{side}' → "
-                f"{'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}"
-            )
+            _HEDGE_MODE = side in ("LONG", "SHORT")
+            log.info(f"[MODE] Por posiciones: '{side}' → {'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}")
             return
-    except Exception as e:
-        log.debug(f"detectar_modo_posicion fallback: {e}")
+    except Exception:
+        pass
 
-    # No se pudo detectar → asumir ONE-WAY (lo que indica el error 109400)
+    # 4. Default: one-way (lo que indica el error 109400)
     _HEDGE_MODE = False
-    log.warning("[MODE] No se pudo detectar modo → asumiendo ONE-WAY (BOTH)")
+    log.warning(
+        "[MODE] No detectado → ONE-WAY (sin positionSide)\n"
+        "       Si tus órdenes siguen fallando, añade BINGX_MODE=hedge en Railway"
+    )
 
 
+# ══════════════════════════════════════════════════════════════
+# FIRMA HMAC ✅ FIX#7 — SIN sorted(), timestamp al final
 # ══════════════════════════════════════════════════════════════
 
 def _sign(query_string: str) -> str:
@@ -293,11 +315,7 @@ def get_qty_precision(symbol: str) -> int:
 # ══════════════════════════════════════════════════════════════
 
 def get_balance() -> float:
-    """
-    ✅ FIX#16 — Maneja múltiples formatos de respuesta de BingX:
-    data.balance.availableMargin | data.availableMargin | data como lista
-    Campos alternativos: walletBalance, equity, balance
-    """
+    """✅ FIX#16 — Maneja todos los formatos de respuesta de BingX."""
     if config.MODO_DEMO:
         return 1000.0
     try:
@@ -307,27 +325,23 @@ def get_balance() -> float:
             log.warning(f"get_balance: code={code} msg={res.get('msg','')}")
             return 0.0
         data = res.get("data", {})
-        # Caso 1: data es lista de assets
         if isinstance(data, list):
             for item in data:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("asset", "").upper() in ("USDT", ""):
-                    for campo in ("availableMargin", "balance", "walletBalance", "equity"):
-                        v = item.get(campo)
+                if isinstance(item, dict) and item.get("asset", "").upper() in ("USDT", ""):
+                    for f in ("availableMargin", "balance", "walletBalance", "equity"):
+                        v = item.get(f)
                         if v is not None:
                             return float(v or 0)
-        # Caso 2: data es dict con sub-dict "balance"
         if isinstance(data, dict):
             bal = data.get("balance", data)
             if isinstance(bal, dict):
-                for campo in ("availableMargin", "balance", "walletBalance", "equity"):
-                    v = bal.get(campo)
+                for f in ("availableMargin", "balance", "walletBalance", "equity"):
+                    v = bal.get(f)
                     if v is not None:
                         return float(v or 0)
             elif isinstance(bal, (int, float, str)):
                 return float(bal or 0)
-        log.warning(f"get_balance: estructura inesperada: {str(res)[:200]}")
+        log.warning(f"get_balance: respuesta inesperada: {str(res)[:200]}")
         return 0.0
     except Exception as e:
         log.error(f"get_balance: {e}")
@@ -453,16 +467,11 @@ def cancelar_ordenes_abiertas(symbol: str):
 # ══════════════════════════════════════════════════════════════
 
 def set_leverage(symbol: str, leverage: int) -> bool:
-    """
-    ✅ FIX#15 — En modo one-way (BOTH), BingX rechaza side=LONG/SHORT
-    con error 109400. En ese caso enviamos sin parámetro 'side'.
-    En modo hedge enviamos side=LONG y side=SHORT por separado.
-    """
+    """✅ FIX#15 — En one-way mode NO enviar 'side' (causa 109400)."""
     if config.MODO_DEMO:
         return True
     try:
         if _HEDGE_MODE:
-            # Modo hedge: configurar leverage para cada lado
             for side in ("LONG", "SHORT"):
                 r    = _post("/openApi/swap/v2/trade/leverage",
                              {"symbol": symbol, "side": side, "leverage": leverage})
@@ -470,12 +479,12 @@ def set_leverage(symbol: str, leverage: int) -> bool:
                 if code not in (0, 200, 80012):
                     log.warning(f"set_leverage {symbol} {side}: code={code} msg={r.get('msg')}")
         else:
-            # ✅ FIX#15: Modo one-way — sin parámetro 'side'
+            # One-way: sin parámetro 'side'
             r    = _post("/openApi/swap/v2/trade/leverage",
                          {"symbol": symbol, "leverage": leverage})
             code = r.get("code", 0)
             if code not in (0, 200, 80012):
-                log.warning(f"set_leverage {symbol} one-way: code={code} msg={r.get('msg')}")
+                log.warning(f"set_leverage {symbol}: code={code} msg={r.get('msg')}")
         return True
     except Exception as e:
         log.error(f"set_leverage {symbol}: {e}")
@@ -560,23 +569,21 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
                 tp = precio_actual * 0.98
 
     try:
-        close_side  = "SELL" if lado == "LONG" else "BUY"
-        pos_side    = lado if _HEDGE_MODE else "BOTH"   # ✅ FIX#14
-        pp          = get_price_precision(symbol)
-        qty_str     = _fmt_qty(qty)   # ✅ FIX#9: string limpio
-        sl_str      = _fmt_price(sl, pp)
-        tp_str      = _fmt_price(tp, pp)
+        close_side = "SELL" if lado == "LONG" else "BUY"
+        pp         = get_price_precision(symbol)
+        qty_str    = _fmt_qty(qty)
+        sl_str     = _fmt_price(sl, pp)
+        tp_str     = _fmt_price(tp, pp)
 
         # STOP LOSS
-        sl_params = {
-            "symbol":       symbol,
-            "side":         close_side,
-            "positionSide": pos_side,
-            "type":         "STOP_MARKET",
-            "quantity":     qty_str,
-            "stopPrice":    sl_str,
-            "workingType":  "MARK_PRICE",
-        }
+        sl_params = _add_pos_side({
+            "symbol":      symbol,
+            "side":        close_side,
+            "type":        "STOP_MARKET",
+            "quantity":    qty_str,
+            "stopPrice":   sl_str,
+            "workingType": "MARK_PRICE",
+        }, lado)
         r1 = _post("/openApi/swap/v2/trade/order", sl_params)
         if r1.get("code", 0) not in (0, 200):
             log.warning(f"SL order {symbol}: código={r1.get('code')} msg={r1.get('msg')}")
@@ -586,15 +593,14 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
         time.sleep(0.4)
 
         # TAKE PROFIT
-        tp_params = {
-            "symbol":       symbol,
-            "side":         close_side,
-            "positionSide": pos_side,
-            "type":         "TAKE_PROFIT_MARKET",
-            "quantity":     qty_str,
-            "stopPrice":    tp_str,
-            "workingType":  "MARK_PRICE",
-        }
+        tp_params = _add_pos_side({
+            "symbol":      symbol,
+            "side":        close_side,
+            "type":        "TAKE_PROFIT_MARKET",
+            "quantity":    qty_str,
+            "stopPrice":   tp_str,
+            "workingType": "MARK_PRICE",
+        }, lado)
         r2 = _post("/openApi/swap/v2/trade/order", tp_params)
         if r2.get("code", 0) not in (0, 200):
             log.warning(f"TP order {symbol}: código={r2.get('code')} msg={r2.get('msg')}")
@@ -621,16 +627,15 @@ def abrir_long(symbol: str, qty: float, precio: float,
     set_leverage(symbol, config.LEVERAGE)
 
     qty_str = _fmt_qty(qty)
-    log.info(f"[ORDER] LONG {symbol} qty={qty_str} @ ~{precio:.6f}")
+    log.info(f"[ORDER] LONG {symbol} qty={qty_str} @ ~{precio:.6f} mode={'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}")
 
-    # ✅ FIX#14 — positionSide dinámico: ONE-WAY="BOTH", HEDGE="LONG"
-    params = {
-        "symbol":       symbol,
-        "side":         "BUY",
-        "positionSide": "LONG" if _HEDGE_MODE else "BOTH",
-        "type":         "MARKET",
-        "quantity":     qty_str,
-    }
+    # ✅ FIX#14 — positionSide solo en hedge mode; omitir en one-way
+    params = _add_pos_side({
+        "symbol":   symbol,
+        "side":     "BUY",
+        "type":     "MARKET",
+        "quantity": qty_str,
+    }, "LONG")
     res   = _post("/openApi/swap/v2/trade/order", params)
     code  = res.get("code", -1)
     data  = res.get("data", {})
@@ -666,16 +671,15 @@ def abrir_short(symbol: str, qty: float, precio: float,
     set_leverage(symbol, config.LEVERAGE)
 
     qty_str = _fmt_qty(qty)
-    log.info(f"[ORDER] SHORT {symbol} qty={qty_str} @ ~{precio:.6f}")
+    log.info(f"[ORDER] SHORT {symbol} qty={qty_str} @ ~{precio:.6f} mode={'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}")
 
-    # ✅ FIX#14 — positionSide dinámico: ONE-WAY="BOTH", HEDGE="SHORT"
-    params = {
-        "symbol":       symbol,
-        "side":         "SELL",
-        "positionSide": "SHORT" if _HEDGE_MODE else "BOTH",
-        "type":         "MARKET",
-        "quantity":     qty_str,
-    }
+    # ✅ FIX#14 — positionSide solo en hedge mode; omitir en one-way
+    params = _add_pos_side({
+        "symbol":   symbol,
+        "side":     "SELL",
+        "type":     "MARKET",
+        "quantity": qty_str,
+    }, "SHORT")
     res   = _post("/openApi/swap/v2/trade/order", params)
     code  = res.get("code", -1)
     data  = res.get("data", {})
@@ -706,15 +710,15 @@ def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
     cancelar_ordenes_abiertas(symbol)
     time.sleep(0.3)
 
-    side     = "SELL" if lado == "LONG" else "BUY"
-    qty_str  = _fmt_qty(qty)
-    params   = {
-        "symbol":       symbol,
-        "side":         side,
-        "positionSide": lado if _HEDGE_MODE else "BOTH",   # ✅ FIX#14
-        "type":         "MARKET",
-        "quantity":     qty_str,
-    }
+    side    = "SELL" if lado == "LONG" else "BUY"
+    qty_str = _fmt_qty(qty)
+    # ✅ FIX#14 — positionSide solo en hedge mode
+    params  = _add_pos_side({
+        "symbol":   symbol,
+        "side":     side,
+        "type":     "MARKET",
+        "quantity": qty_str,
+    }, lado)
     res   = _post("/openApi/swap/v2/trade/order", params)
     code  = res.get("code", -1)
     data  = res.get("data", {})
