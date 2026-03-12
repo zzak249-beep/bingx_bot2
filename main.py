@@ -460,8 +460,11 @@ def ejecutar_senal(s: dict) -> bool:
     if qty <= 0:
         return False
 
-    if balance < trade_usdt * 1.1 and not config.MODO_DEMO:
-        log.warning(f"[{par}] Margen insuficiente ${balance:.2f} < ${trade_usdt*1.1:.2f}")
+    # Comprobar margen DISPONIBLE (no balance total) para abrir la posición
+    margen_disp = exchange.get_available_margin() if not config.MODO_DEMO else balance
+    margen_necesario = trade_usdt / config.LEVERAGE * 1.1  # margen real necesario + 10%
+    if margen_disp < margen_necesario and not config.MODO_DEMO:
+        log.warning(f"[{par}] Margen insuficiente ${margen_disp:.2f} < ${margen_necesario:.2f} necesario")
         return False
 
     if lado == "LONG":
