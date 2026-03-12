@@ -715,9 +715,22 @@ def main():
                         log.info(f"[APRENDE] {s['par']} score={s['score']} < {config.SCORE_MIN}")
                         continue
 
+                    # Saltar pares bloqueados permanentemente (sin Telegram)
+                    if not exchange.par_es_soportado(s["par"]):
+                        log.debug(f"[SKIP-API] {s['par']} bloqueado permanente")
+                        continue
+
                     ejecutado = ejecutar_senal(s)
-                    if ejecutado:  # ✅ Solo Telegram si se ejecuta
-                        _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
+
+                    # Si falló por API, bloquear permanentemente y NO enviar spam
+                    if not ejecutado and not exchange.par_es_soportado(s["par"]):
+                        log.warning(f"[BLOCKED] {s['par']} bloqueado tras fallo")
+                        memoria.registrar_error_api(s["par"])
+                        continue  # sin Telegram para este par
+
+                    # Notificar siempre — si no ejecutó el user puede operar manual
+                    _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
+                    if ejecutado:
                         balance = exchange.get_balance()
                         time.sleep(2)
 
