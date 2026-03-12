@@ -676,7 +676,7 @@ def analizar_par(par: str):
         bos   = detectar_bos_choch(candles)
         asia  = get_rango_asia(candles)
         sweep = detectar_sweep(candles)
-        kz    = en_killzone()
+        # kz already computed above for KZ_REQUERIDA check
 
         # ── Patrones de vela ──
         pat_long  = detectar_patron_vela(candles, "LONG")
@@ -709,6 +709,11 @@ def analizar_par(par: str):
 
         # ── Cooldown ──
         if not cooldown_ok(par):
+            return None
+
+        # ── Killzone obligatoria (si KZ_REQUERIDA=True) ──
+        kz = en_killzone()
+        if config.KZ_REQUERIDA and not kz["in_kz"]:
             return None
 
         # ── Confluencia OB+FVG  ← REGLA CLAVE ──
