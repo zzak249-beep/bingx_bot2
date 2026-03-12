@@ -22,6 +22,7 @@ _hedge_mode_cache: dict   = {}
 _contract_cache: dict     = {}
 _contract_cache_ts: float = 0
 _pares_no_soportados: set = set()  # pares que fallan siempre — nunca reintentar
+_CONTRATOS_FUTURES: set   = set()  # set de símbolos válidos en futuros perpetuos
 
 # ── Persistencia de pares no soportados ──────────────────────
 def _ns_file() -> str:
@@ -261,7 +262,7 @@ def set_leverage(symbol: str, leverage: int) -> bool:
 # CONTRATOS + CANTIDAD
 # ══════════════════════════════════════════════════════════════
 def _load_contracts():
-    global _contract_cache, _contract_cache_ts
+    global _contract_cache, _contract_cache_ts, _CONTRATOS_FUTURES
     if _contract_cache and time.time() - _contract_cache_ts < 3600:
         return
     try:
@@ -271,10 +272,15 @@ def _load_contracts():
             step = float(c.get("tradeMinQuantity", 1) or 1)
             dec  = int(c.get("quantityPrecision", 0) or 0)
             _contract_cache[sym] = {"step": step, "dec": dec}
+        _CONTRATOS_FUTURES = set(_contract_cache.keys())
         _contract_cache_ts = time.time()
         log.info(f"[CONTRACTS] {len(_contract_cache)} pares cargados")
     except Exception as e:
         log.warning(f"[CONTRACTS] {e}")
+
+def _cargar_contratos():
+    """Alias público de _load_contracts() — requerido por main.py."""
+    _load_contracts()
 
 def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
     if precio <= 0 or trade_usdt <= 0:
