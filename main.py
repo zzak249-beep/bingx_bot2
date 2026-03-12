@@ -716,8 +716,8 @@ def main():
                         continue
 
                     ejecutado = ejecutar_senal(s)
-                    _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
-                    if ejecutado:
+                    if ejecutado:  # ✅ Solo Telegram si se ejecuta
+                        _notif_entrada(s, memoria.get_trade_amount(), ejecutado)
                         balance = exchange.get_balance()
                         time.sleep(2)
 
