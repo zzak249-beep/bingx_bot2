@@ -605,7 +605,9 @@ def main():
     log.info(f"Balance inicial: ${balance:.2f} USDT")
 
     if balance <= 0 and not config.MODO_DEMO:
-        _notif("🚨 *Balance = $0*\nVerifica las API keys en Railway.")
+        # Solo notificar UNA vez al arrancar — no en cada ciclo
+        _notif("🚨 *Balance = $0 — arrancando de todos modos*\nVerifica API keys en Railway si el error persiste.")
+        # No salir — intentar continuar (las keys pueden tardar en activarse)
 
     # FIX v4.3: sincronizar reloj con BingX para evitar errores de timestamp en órdenes
     log.info("Sincronizando tiempo con servidor BingX...")
@@ -655,8 +657,11 @@ def main():
         try:
             ciclo += 1
             estado.reset_diario()
-            balance = exchange.get_balance()
-            kz      = analizar.en_killzone()
+            try:
+                balance = exchange.get_balance()
+            except Exception as e:
+                log.error(f"Error leyendo balance: {e}")
+            kz = analizar.en_killzone()
 
             log.info(
                 f"Ciclo {ciclo} | {datetime.now(timezone.utc).strftime('%H:%M UTC')} | "
