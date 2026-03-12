@@ -673,6 +673,7 @@ def main():
     while True:
         try:
             ciclo += 1
+            main._errores_ciclo = 0  # FIX: reset contador errores por ciclo
             estado.reset_diario()
             balance = exchange.get_balance()
             kz      = analizar.en_killzone()
@@ -764,12 +765,17 @@ def main():
                     if resultado == "skip":
                         continue
 
-                    # Error de API → ya registrado en memoria, solo loguear
+                    # Error de API → loguear, Telegram solo primeros 3 por ciclo
                     if resultado and resultado.startswith("error:"):
                         log.error(f"[API-ERR] {s['par']}: {resultado[6:]}")
                         if not exchange.par_es_soportado(s["par"]):
                             log.warning(f"[BLOCKED] {s['par']} bloqueado tras fallo")
-                        _notif(f"🚨 *Orden fallida {s['lado']} `{s['par']}`*\n❌ `{resultado[6:80]}`")
+                        # FIX anti-spam: máx 3 notificaciones de error por ciclo
+                        if not hasattr(main, '_errores_ciclo'):
+                            main._errores_ciclo = 0
+                        if main._errores_ciclo < 3:
+                            _notif(f"🚨 *Orden fallida {s['lado']} `{s['par']}`*\n❌ `{resultado[6:80]}`")
+                            main._errores_ciclo += 1
                         continue
 
                     # bloq:MAX_POSICIONES → no notificar señal (evitar spam)
