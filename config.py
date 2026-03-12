@@ -1,9 +1,16 @@
 """
-config.py — SMC Bot BingX v4.0 [REAL MONEY | 24/7 | AUTO-LEARN]
+config.py — SMC Bot BingX v4.3 [FIXES DEFAULTS]
+
+CAMBIOS v4.3:
+  ✅ KZ_REQUERIDA=False  → el bot operaba SOLO 10h/día (fuera de KZ = "Sin señales")
+  ✅ SCORE_MIN=5         → 7 era demasiado alto, apenas generaba señales
+  ✅ COOLDOWN_VELAS=5    → 8 bloqueaba señales válidas (25min vs 40min)
+  ✅ TIME_EXIT_HORAS=8   → coherente con Telegram (antes 6h)
+  ✅ VOLUMEN_MIN_24H=200k → más pares escaneados con liquidez suficiente
 """
 import os
 
-VERSION = "SMC-Bot v4.0 [PRECISION+APRENDE+COMPOUNDING]"
+VERSION = "SMC-Bot v4.3 [PRECISION+APRENDE+COMPOUNDING]"
 
 def _int(var, default):
     try:
@@ -28,70 +35,78 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── General ───────────────────────────────────────────────────
-MODO_DEMO    = _bool("MODO_DEMO",    False)   # FALSE = dinero real
-LOOP_SECONDS = _int("LOOP_SECONDS",  60)      # ciclo cada 60s (24/7)
+MODO_DEMO    = _bool("MODO_DEMO",    False)
+LOOP_SECONDS = _int("LOOP_SECONDS",  60)
 
 # ── Capital y Compounding ─────────────────────────────────────
-TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)  # $10 base siempre
-TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)  # máximo $50
-COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 30.0)  # cada $30 ganados
-COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)  # añade $1 al trade
+TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)
+TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)
+COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 30.0)
+COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)
 
 # ── Posiciones ────────────────────────────────────────────────
-LEVERAGE       = _int("LEVERAGE",       10)   # 10x fijo
-MAX_POSICIONES = _int("MAX_POSICIONES",  3)   # máx 3 abiertas simultáneas
+LEVERAGE       = _int("LEVERAGE",       10)
+MAX_POSICIONES = _int("MAX_POSICIONES",  3)
 
 # ── TP / SL ───────────────────────────────────────────────────
-TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)   # ATR x2.5 para TP
-SL_ATR_MULT       = _float("SL_ATR_MULT",      1.0)   # ATR x1.0 para SL
-PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 1.2)   # ATR x1.2 TP parcial
+TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)
+SL_ATR_MULT       = _float("SL_ATR_MULT",      1.0)
+PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 1.2)
 PARTIAL_TP_ACTIVO = _bool("PARTIAL_TP_ACTIVO",  True)
-MIN_RR            = _float("MIN_RR",            2.0)   # R:R mínimo 2:1
+MIN_RR            = _float("MIN_RR",            2.0)
 
 # ── Trailing Stop ─────────────────────────────────────────────
 TRAILING_ACTIVO    = _bool("TRAILING_ACTIVO",    True)
-TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.2)  # activa al llegar a 1.2 ATR
-TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.8)  # sigue a 0.8 ATR
+TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.2)
+TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.8)
 
 # ── Protección ────────────────────────────────────────────────
-TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 6.0)   # cierra a las 6h sin TP/SL
-MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)  # pausa si pierde $20/día
+TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)    # FIX: era 6h, Telegram muestra 8h
+MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 
-# ── Score / Señales ── v4.0 usa score /14 ────────────────────
-SCORE_MIN    = _int("SCORE_MIN",       7)     # mínimo 7/14
+# ── Score ─────────────────────────────────────────────────────
+# FIX: SCORE_MIN era 7, generaba muy pocas señales
+# Bajar a 5 permite operar con FVG + 3 confluencias adicionales
+SCORE_MIN    = _int("SCORE_MIN",       5)     # FIX: era 7 → 5
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
 EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN",    5)
 
-# ── Killzones (minutos UTC) ───────────────────────────────────
+# ── Killzones ─────────────────────────────────────────────────
 KZ_ASIA_START   = _int("KZ_ASIA_START",    0)
 KZ_ASIA_END     = _int("KZ_ASIA_END",    240)
 KZ_LONDON_START = _int("KZ_LONDON_START",420)
 KZ_LONDON_END   = _int("KZ_LONDON_END",  600)
 KZ_NY_START     = _int("KZ_NY_START",    780)
 KZ_NY_END       = _int("KZ_NY_END",      960)
-KZ_REQUERIDA    = _bool("KZ_REQUERIDA",  True)   # True = opera SOLO en KZ Asia/London/NY
+
+# FIX CRÍTICO: KZ_REQUERIDA era True → el bot no generaba señales de 16:00 a 0:00 UTC
+# Con False el bot opera las 24h; el score de KZ sigue sumando +1 cuando estamos en KZ
+KZ_REQUERIDA = _bool("KZ_REQUERIDA", False)   # FIX: era True → False
 
 # ── Indicadores ───────────────────────────────────────────────
 EMA_FAST       = _int("EMA_FAST",      21)
 EMA_SLOW       = _int("EMA_SLOW",      50)
-EMA_LOCAL_FAST = _int("EMA_LOCAL_FAST",  9)   # EMA rápida local (nuevo v4)
-EMA_LOCAL_SLOW = _int("EMA_LOCAL_SLOW", 21)   # EMA lenta local (nuevo v4)
+EMA_LOCAL_FAST = _int("EMA_LOCAL_FAST",  9)
+EMA_LOCAL_SLOW = _int("EMA_LOCAL_SLOW", 21)
 RSI_PERIOD     = _int("RSI_PERIOD",    14)
-RSI_BUY_MAX    = _float("RSI_BUY_MAX",  68.0)  # no comprar si RSI > 68
-RSI_SELL_MIN   = _float("RSI_SELL_MIN", 32.0)  # no vender si RSI < 32
+RSI_BUY_MAX    = _float("RSI_BUY_MAX",  70.0)   # FIX: era 68 → 70 (más permisivo)
+RSI_SELL_MIN   = _float("RSI_SELL_MIN", 30.0)   # FIX: era 32 → 30
 ATR_PERIOD     = _int("ATR_PERIOD",    14)
-ATR_FAST       = _int("ATR_FAST",       7)     # ATR rápido para SL en 5m
+ATR_FAST       = _int("ATR_FAST",       7)
 
-PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 1.50)  # zona ±1.5%
+PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 2.0)   # FIX: era 1.5% → 2.0% (zona más amplia)
 
-# ── Filtros de precisión v4.0 ─────────────────────────────────
-PINBAR_RATIO     = _float("PINBAR_RATIO",    0.55)  # mecha >= 55% del rango
+# ── Filtros de precisión ──────────────────────────────────────
+PINBAR_RATIO     = _float("PINBAR_RATIO",    0.50)   # FIX: era 0.55 → 0.50 (más detecciones)
 ENGULF_ACTIVO    = _bool("ENGULF_ACTIVO",    True)
 VWAP_ACTIVO      = _bool("VWAP_ACTIVO",      True)
-VWAP_PCT         = _float("VWAP_PCT",        0.20)  # proximidad VWAP ±0.20%
-COOLDOWN_VELAS   = _int("COOLDOWN_VELAS",    8)     # mínimo 8 velas entre señales mismo par (40min en 5m)
+VWAP_PCT         = _float("VWAP_PCT",        0.50)   # FIX: era 0.20% → 0.50% (menos restrictivo)
+
+# FIX: COOLDOWN_VELAS era 8 (40min en 5m) → 5 (25min)
+# Evitamos señales dobles sin bloquear setups válidos consecutivos
+COOLDOWN_VELAS   = _int("COOLDOWN_VELAS",    5)      # FIX: era 8 → 5
 MOMENTUM_ACTIVO  = _bool("MOMENTUM_ACTIVO",  True)
 
 # ── Timeframes ────────────────────────────────────────────────
@@ -109,16 +124,17 @@ ASIA_RANGE_ACTIVO  = _bool("ASIA_RANGE_ACTIVO",   True)
 VELA_CONFIRMACION  = _bool("VELA_CONFIRMACION",   True)
 CORRELACION_ACTIVO = _bool("CORRELACION_ACTIVO",  True)
 MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
-SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)  # detección sweeps (nuevo v4)
+SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)
 SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
 
 # ── Scanner ───────────────────────────────────────────────────
-VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 500_000.0)
+# FIX: VOLUMEN_MIN_24H era 500k → 200k para cubrir más pares con liquidez
+VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 200_000.0)
 MAX_PARES_SCAN   = _int("MAX_PARES_SCAN",    0)
 ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  6)
 
 # ── Dirección ─────────────────────────────────────────────────
-SOLO_LONG = _bool("SOLO_LONG", False)  # opera long y short
+SOLO_LONG = _bool("SOLO_LONG", False)
 
 # ── Listas ────────────────────────────────────────────────────
 PARES_BLOQUEADOS   = [p.strip() for p in os.getenv("PARES_BLOQUEADOS",   "RESOLV-USDT").split(",") if p.strip()]
@@ -128,9 +144,9 @@ PARES_PRIORITARIOS = [p.strip() for p in os.getenv("PARES_PRIORITARIOS", "").spl
 MEMORY_DIR = os.getenv("MEMORY_DIR", "")
 
 # ── Modo BingX ────────────────────────────────────────────────
-# "auto"  = detectar automáticamente al arrancar (recomendado)
-# "hedge" = forzar modo Hedge (positionSide=LONG/SHORT)
-# "oneway"= forzar modo One-Way (positionSide omitido)
+# "auto"   = detectar automáticamente al arrancar (recomendado)
+# "hedge"  = forzar modo Hedge (positionSide=LONG/SHORT)
+# "oneway" = forzar modo One-Way
 BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
 
 
