@@ -1,152 +1,734 @@
 """
-config.py — SMC Bot BingX v4.0 [REAL MONEY | 24/7 | AUTO-LEARN]
+exchange.py — BingX Perpetual Futures REST API v4.2 [FIX ERROR 109400]
+
+BUGS CORREGIDOS EN ESTA VERSION:
+  ✅ FIX#7 — _build_query NO usa sorted() — BingX firma sobre el string
+             en el orden exacto de inserción. sorted() rompía la firma
+             cuando el orden alfabético difería del orden de inserción.
+             SOLUCIÓN: timestamp siempre al FINAL, sin sorted().
+  ✅ FIX#8 — quantity como string limpio sin notación científica ni .0
+             '5600.0' → '5600' | '0.001' se mantiene | nunca '5.6e3'
+  ✅ FIX#9 — _place_sl_tp: quantity también formateada igual (string limpio)
+  ✅ FIX#10 — set_leverage: verificar código respuesta, no crashear
+  ✅ FIX#11 — Modo hedge (BOTH) vs modo one-way: detectar y adaptar
+             positionSide solo se envía si la cuenta usa hedge mode
+  ✅ FIX#12 — calcular_cantidad: PIXEL-USDT y similares pueden tener
+             stepSize muy pequeño → log detallado para diagnóstico
+  ✅ FIX#1-6 — Todos los fixes anteriores se mantienen
 """
-import os
 
-VERSION = "SMC-Bot v4.0 [PRECISION+APRENDE+COMPOUNDING]"
+import time, hmac, hashlib, logging, math
+import requests
+import config
 
-def _int(var, default):
+log      = logging.getLogger("exchange")
+BASE_URL = "https://open-api.bingx.com"
+_SESSION = requests.Session()
+_SESSION.headers.update({"Content-Type": "application/json"})
+
+# Cache de contratos futuros válidos
+_CONTRATOS_FUTURES: set  = set()
+_CONTRATO_INFO:     dict = {}
+_CONTRATOS_TS:      float = 0
+
+# Modo de posición: True = hedge (LONG/SHORT), False = one-way (sin positionSide)
+_HEDGE_MODE: bool = False  # default one-way — más seguro
+
+
+def _add_pos_side(params: dict, lado: str) -> dict:
+    """
+    ✅ FIX#14 — Añade positionSide SOLO en modo hedge.
+    En modo one-way BingX rechaza positionSide aunque sea "BOTH".
+    La solución es omitirlo completamente.
+    """
+    if _HEDGE_MODE:
+        params["positionSide"] = lado
+    return params
+
+
+def detectar_modo_posicion():
+    """
+    ✅ FIX#13 — Detecta Hedge mode vs One-way mode.
+    Prioridad:
+    1. BINGX_MODE=hedge/oneway en Railway (manual, más fiable)
+    2. Endpoint API oficial
+    3. Inspección de posiciones abiertas
+    4. Default: one-way (sin positionSide)
+    """
+    global _HEDGE_MODE
+
+    # 1. Override manual desde env var
+    mode = getattr(config, "BINGX_MODE", "auto")
+    if mode == "hedge":
+        _HEDGE_MODE = True
+        log.info("[MODE] FORZADO HEDGE (BINGX_MODE=hedge) — positionSide=LONG/SHORT")
+        return
+    if mode == "oneway":
+        _HEDGE_MODE = False
+        log.info("[MODE] FORZADO ONE-WAY (BINGX_MODE=oneway) — sin positionSide")
+        return
+
+    if config.MODO_DEMO:
+        _HEDGE_MODE = False
+        return
+
+    # 2. Endpoint oficial de BingX
+    for endpoint in (
+        "/openApi/swap/v1/trade/positionSide/dual",
+        "/openApi/swap/v2/trade/positionSide/dual",
+    ):
+        try:
+            res  = _get(endpoint)
+            code = res.get("code", -1)
+            if code in (0, 200):
+                data = res.get("data", {})
+                if isinstance(data, dict):
+                    dual = data.get("dualSidePosition", data.get("dualSide", None))
+                    if dual is not None:
+                        _HEDGE_MODE = bool(dual)
+                        log.info(
+                            f"[MODE] API detectó: dualSide={dual} → "
+                            f"{'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}"
+                        )
+                        return
+        except Exception as e:
+            log.debug(f"detectar_modo_posicion {endpoint}: {e}")
+
+    # 3. Fallback: posiciones abiertas
     try:
-        return int(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
+        pos = get_posiciones_abiertas()
+        if pos:
+            side = str((pos[0] or {}).get("positionSide", "")).upper()
+            _HEDGE_MODE = side in ("LONG", "SHORT")
+            log.info(f"[MODE] Por posiciones: '{side}' → {'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}")
+            return
     except Exception:
-        return default
+        pass
 
-def _float(var, default):
+    # 4. Default: one-way (lo que indica el error 109400)
+    _HEDGE_MODE = False
+    log.warning(
+        "[MODE] No detectado → ONE-WAY (sin positionSide)\n"
+        "       Si tus órdenes siguen fallando, añade BINGX_MODE=hedge en Railway"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# FIRMA HMAC ✅ FIX#7 — SIN sorted(), timestamp al final
+# ══════════════════════════════════════════════════════════════
+
+def _sign(query_string: str) -> str:
+    return hmac.new(
+        config.BINGX_SECRET_KEY.encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _build_query(params: dict) -> str:
+    """
+    Construye query string SIN ordenar.
+    BingX firma sobre el string exacto — sorted() cambia el orden
+    y puede provocar 'Signature verification failed' o 109400.
+    timestamp se añade FUERA de esta función, siempre al final.
+    """
+    return "&".join(f"{k}={v}" for k, v in params.items())
+
+
+def _headers() -> dict:
+    return {"X-BX-APIKEY": config.BINGX_API_KEY}
+
+
+def _ts() -> int:
+    return int(time.time() * 1000)
+
+
+def _get(path: str, params: dict = None, retries: int = 3) -> dict:
+    p = dict(params or {})
+    # timestamp SIEMPRE al final, luego signature
+    ts = _ts()
+    qs = _build_query(p) + (f"&timestamp={ts}" if p else f"timestamp={ts}")
+    qs_signed = qs + "&signature=" + _sign(qs)
+    for attempt in range(retries):
+        try:
+            r = _SESSION.get(
+                BASE_URL + path + "?" + qs_signed,
+                headers=_headers(), timeout=10,
+            )
+            return r.json()
+        except Exception as e:
+            log.error(f"GET {path} intento {attempt+1}: {e}")
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    return {}
+
+
+def _post(path: str, params: dict = None, retries: int = 3) -> dict:
+    p = dict(params or {})
+    ts = _ts()
+    qs = _build_query(p) + (f"&timestamp={ts}" if p else f"timestamp={ts}")
+    qs_signed = qs + "&signature=" + _sign(qs)
+    for attempt in range(retries):
+        try:
+            r = _SESSION.post(
+                BASE_URL + path + "?" + qs_signed,
+                headers=_headers(), timeout=10,
+            )
+            return r.json()
+        except Exception as e:
+            log.error(f"POST {path} intento {attempt+1}: {e}")
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════
+# FORMATEAR CANTIDAD ✅ FIX#8
+# ══════════════════════════════════════════════════════════════
+
+def _fmt_qty(qty) -> str:
+    """
+    Formatea cantidad para BingX:
+    - Nunca notación científica (1e-3 → '0.001')
+    - Enteros sin decimales ('5600' no '5600.0')
+    - Decimales limpios ('0.001' no '0.0010000')
+    """
+    if isinstance(qty, int):
+        return str(qty)
+    # Si es float con parte decimal cero → int
+    if isinstance(qty, float) and qty == int(qty):
+        return str(int(qty))
+    # Formatear con suficientes decimales, quitar trailing zeros
+    formatted = f"{qty:.10f}".rstrip("0").rstrip(".")
+    return formatted
+
+
+def _fmt_price(price: float, precision: int) -> str:
+    """Formatea precio con la precisión del contrato, sin trailing zeros."""
+    s = f"{price:.{precision}f}"
+    # Quitar trailing zeros después del punto decimal
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+# ══════════════════════════════════════════════════════════════
+# CACHE DE CONTRATOS FUTUROS
+# ══════════════════════════════════════════════════════════════
+
+def _cargar_contratos():
+    global _CONTRATOS_FUTURES, _CONTRATO_INFO, _CONTRATOS_TS
+    if time.time() - _CONTRATOS_TS < 21600 and _CONTRATOS_FUTURES:
+        return
     try:
-        return float(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
-    except Exception:
-        return default
+        res = _SESSION.get(
+            BASE_URL + "/openApi/swap/v2/quote/contracts",
+            timeout=15,
+        ).json()
+        contratos = res.get("data", []) or []
+        _CONTRATOS_FUTURES = set()
+        _CONTRATO_INFO     = {}
+        for c in contratos:
+            sym    = c.get("symbol", "")
+            status = c.get("status", 0)
+            if not sym.endswith("-USDT") or status != 1:
+                continue
+            _CONTRATOS_FUTURES.add(sym)
 
-def _bool(var, default):
-    raw = os.getenv(var, "true" if default else "false")
-    return raw.strip().lower().split()[0] in ("true", "1", "yes")
+            # Obtener stepSize y minQty con varios nombres posibles de campo
+            qty_step = None
+            for campo in ["tradeMinQuantity", "stepSize", "quantityStep", "lotSize"]:
+                val = c.get(campo)
+                if val is not None:
+                    try:
+                        qty_step = float(val)
+                        if qty_step > 0:
+                            break
+                    except Exception:
+                        pass
+            if not qty_step or qty_step <= 0:
+                qty_step = 0.001
 
-# ── Credenciales ──────────────────────────────────────────────
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+            min_qty = None
+            for campo in ["tradeMinQuantity", "minQty", "minOrderQty"]:
+                val = c.get(campo)
+                if val is not None:
+                    try:
+                        min_qty = float(val)
+                        if min_qty > 0:
+                            break
+                    except Exception:
+                        pass
+            if not min_qty or min_qty <= 0:
+                min_qty = qty_step
 
-# ── General ───────────────────────────────────────────────────
-MODO_DEMO    = _bool("MODO_DEMO",    False)   # FALSE = dinero real
-LOOP_SECONDS = _int("LOOP_SECONDS",  60)      # ciclo cada 60s (24/7)
+            price_prec = int(c.get("pricePrecision", 6))
+            qty_prec   = int(c.get("quantityPrecision", _decimals_from_step(qty_step)))
 
-# ── Capital y Compounding ─────────────────────────────────────
-TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)  # $10 base siempre
-TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)  # máximo $50
-COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 30.0)  # cada $30 ganados
-COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)  # añade $1 al trade
-
-# ── Posiciones ────────────────────────────────────────────────
-LEVERAGE       = _int("LEVERAGE",       10)   # 10x fijo
-MAX_POSICIONES = _int("MAX_POSICIONES",  3)   # máx 3 abiertas simultáneas
-
-# ── TP / SL ───────────────────────────────────────────────────
-TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)   # ATR x2.5 para TP
-SL_ATR_MULT       = _float("SL_ATR_MULT",      1.0)   # ATR x1.0 para SL
-PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 1.2)   # ATR x1.2 TP parcial
-PARTIAL_TP_ACTIVO = _bool("PARTIAL_TP_ACTIVO",  True)
-MIN_RR            = _float("MIN_RR",            2.0)   # R:R mínimo 2:1
-
-# ── Trailing Stop ─────────────────────────────────────────────
-TRAILING_ACTIVO    = _bool("TRAILING_ACTIVO",    True)
-TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.2)  # activa al llegar a 1.2 ATR
-TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.8)  # sigue a 0.8 ATR
-
-# ── Protección ────────────────────────────────────────────────
-TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 6.0)   # cierra a las 6h sin TP/SL
-MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)  # pausa si pierde $20/día
-
-# ── Score / Señales ── v4.0 usa score /14 ────────────────────
-SCORE_MIN    = _int("SCORE_MIN",       5)     # mínimo 5/14
-FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
-EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
-EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
-EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN",    5)
-
-# ── Killzones (minutos UTC) ───────────────────────────────────
-KZ_ASIA_START   = _int("KZ_ASIA_START",    0)
-KZ_ASIA_END     = _int("KZ_ASIA_END",    240)
-KZ_LONDON_START = _int("KZ_LONDON_START",420)
-KZ_LONDON_END   = _int("KZ_LONDON_END",  600)
-KZ_NY_START     = _int("KZ_NY_START",    780)
-KZ_NY_END       = _int("KZ_NY_END",      960)
-KZ_REQUERIDA    = _bool("KZ_REQUERIDA",  False)  # False = opera fuera de KZ también
-
-# ── Indicadores ───────────────────────────────────────────────
-EMA_FAST       = _int("EMA_FAST",      21)
-EMA_SLOW       = _int("EMA_SLOW",      50)
-EMA_LOCAL_FAST = _int("EMA_LOCAL_FAST",  9)   # EMA rápida local (nuevo v4)
-EMA_LOCAL_SLOW = _int("EMA_LOCAL_SLOW", 21)   # EMA lenta local (nuevo v4)
-RSI_PERIOD     = _int("RSI_PERIOD",    14)
-RSI_BUY_MAX    = _float("RSI_BUY_MAX",  68.0)  # no comprar si RSI > 68
-RSI_SELL_MIN   = _float("RSI_SELL_MIN", 32.0)  # no vender si RSI < 32
-ATR_PERIOD     = _int("ATR_PERIOD",    14)
-ATR_FAST       = _int("ATR_FAST",       7)     # ATR rápido para SL en 5m
-
-PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 1.50)  # zona ±1.5%
-
-# ── Filtros de precisión v4.0 ─────────────────────────────────
-PINBAR_RATIO     = _float("PINBAR_RATIO",    0.55)  # mecha >= 55% del rango
-ENGULF_ACTIVO    = _bool("ENGULF_ACTIVO",    True)
-VWAP_ACTIVO      = _bool("VWAP_ACTIVO",      True)
-VWAP_PCT         = _float("VWAP_PCT",        0.20)  # proximidad VWAP ±0.20%
-COOLDOWN_VELAS   = _int("COOLDOWN_VELAS",    5)     # mínimo 5 velas entre señales mismo par
-MOMENTUM_ACTIVO  = _bool("MOMENTUM_ACTIVO",  True)
-
-# ── Timeframes ────────────────────────────────────────────────
-TIMEFRAME     = os.getenv("TIMEFRAME",     "5m").strip()
-CANDLES_LIMIT = _int("CANDLES_LIMIT",     200)
-MTF_ACTIVO    = _bool("MTF_ACTIVO",        True)
-MTF_TIMEFRAME = os.getenv("MTF_TIMEFRAME", "1h").strip()
-MTF_CANDLES   = _int("MTF_CANDLES",        60)
-
-# ── Módulos activos ───────────────────────────────────────────
-OB_ACTIVO          = _bool("OB_ACTIVO",          True)
-OB_LOOKBACK        = _int("OB_LOOKBACK",          30)
-BOS_ACTIVO         = _bool("BOS_ACTIVO",          True)
-ASIA_RANGE_ACTIVO  = _bool("ASIA_RANGE_ACTIVO",   True)
-VELA_CONFIRMACION  = _bool("VELA_CONFIRMACION",   True)
-CORRELACION_ACTIVO = _bool("CORRELACION_ACTIVO",  True)
-MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
-SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)  # detección sweeps (nuevo v4)
-SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
-
-# ── Scanner ───────────────────────────────────────────────────
-VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 500_000.0)
-MAX_PARES_SCAN   = _int("MAX_PARES_SCAN",    0)
-ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  6)
-
-# ── Dirección ─────────────────────────────────────────────────
-SOLO_LONG = _bool("SOLO_LONG", False)  # opera long y short
-
-# ── Listas ────────────────────────────────────────────────────
-PARES_BLOQUEADOS   = [p.strip() for p in os.getenv("PARES_BLOQUEADOS",   "RESOLV-USDT").split(",") if p.strip()]
-PARES_PRIORITARIOS = [p.strip() for p in os.getenv("PARES_PRIORITARIOS", "").split(",") if p.strip()]
-
-# ── Persistencia ──────────────────────────────────────────────
-MEMORY_DIR = os.getenv("MEMORY_DIR", "")
-
-# ── Modo BingX ────────────────────────────────────────────────
-# "auto"  = detectar automáticamente al arrancar (recomendado)
-# "hedge" = forzar modo Hedge (positionSide=LONG/SHORT)
-# "oneway"= forzar modo One-Way (positionSide omitido)
-BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
+            _CONTRATO_INFO[sym] = {
+                "stepSize":        qty_step,
+                "minQty":          min_qty,
+                "pricePrecision":  price_prec,
+                "qtyPrecision":    qty_prec,
+            }
+        _CONTRATOS_TS = time.time()
+        log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} futuros perpetuos USDT cargados")
+    except Exception as e:
+        log.error(f"_cargar_contratos: {e}")
 
 
-def validar():
-    errores = []
-    if not MODO_DEMO:
-        if not BINGX_API_KEY:    errores.append("BINGX_API_KEY no configurada")
-        if not BINGX_SECRET_KEY: errores.append("BINGX_SECRET_KEY no configurada")
-    if not TELEGRAM_TOKEN:
-        errores.append("TELEGRAM_TOKEN no configurada")
-    if LEVERAGE < 1 or LEVERAGE > 125:
-        errores.append(f"LEVERAGE={LEVERAGE} fuera de rango")
-    if TRADE_USDT_BASE < 1:
-        errores.append(f"TRADE_USDT_BASE={TRADE_USDT_BASE} muy bajo")
-    if SCORE_MIN < 1 or SCORE_MIN > 14:
-        errores.append(f"SCORE_MIN={SCORE_MIN} debe ser 1-14")
-    if MIN_RR < 1.0:
-        errores.append(f"MIN_RR={MIN_RR} peligroso (mín 1.0)")
-    return errores
+def _decimals_from_step(step: float) -> int:
+    """Calcula decimales necesarios a partir del stepSize."""
+    if step >= 1:
+        return 0
+    s = f"{step:.10f}".rstrip("0")
+    return len(s.split(".")[-1]) if "." in s else 0
+
+
+def es_futuro_valido(symbol: str) -> bool:
+    if config.MODO_DEMO:
+        return True
+    _cargar_contratos()
+    valido = symbol in _CONTRATOS_FUTURES
+    if not valido:
+        log.warning(f"[SKIP] {symbol} no es un futuro perpetuo válido en BingX")
+    return valido
+
+
+def get_step_size(symbol: str) -> float:
+    _cargar_contratos()
+    return _CONTRATO_INFO.get(symbol, {}).get("stepSize", 0.001)
+
+
+def get_price_precision(symbol: str) -> int:
+    _cargar_contratos()
+    return _CONTRATO_INFO.get(symbol, {}).get("pricePrecision", 6)
+
+
+def get_qty_precision(symbol: str) -> int:
+    _cargar_contratos()
+    return _CONTRATO_INFO.get(symbol, {}).get("qtyPrecision", 3)
+
+
+# ══════════════════════════════════════════════════════════════
+# BALANCE
+# ══════════════════════════════════════════════════════════════
+
+def get_balance() -> float:
+    """✅ FIX#16 — Maneja todos los formatos de respuesta de BingX."""
+    if config.MODO_DEMO:
+        return 1000.0
+    try:
+        res  = _get("/openApi/swap/v2/user/balance")
+        code = res.get("code", -1)
+        if code not in (0, 200):
+            log.warning(f"get_balance: code={code} msg={res.get('msg','')}")
+            return 0.0
+        data = res.get("data", {})
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item.get("asset", "").upper() in ("USDT", ""):
+                    for f in ("availableMargin", "balance", "walletBalance", "equity"):
+                        v = item.get(f)
+                        if v is not None:
+                            return float(v or 0)
+        if isinstance(data, dict):
+            bal = data.get("balance", data)
+            if isinstance(bal, dict):
+                for f in ("availableMargin", "balance", "walletBalance", "equity"):
+                    v = bal.get(f)
+                    if v is not None:
+                        return float(v or 0)
+            elif isinstance(bal, (int, float, str)):
+                return float(bal or 0)
+        log.warning(f"get_balance: respuesta inesperada: {str(res)[:200]}")
+        return 0.0
+    except Exception as e:
+        log.error(f"get_balance: {e}")
+        return 0.0
+
+
+# ══════════════════════════════════════════════════════════════
+# PRECIO
+# ══════════════════════════════════════════════════════════════
+
+def get_precio(symbol: str) -> float:
+    for _ in range(2):
+        try:
+            res = _SESSION.get(
+                BASE_URL + "/openApi/swap/v2/quote/price",
+                params={"symbol": symbol}, timeout=8,
+            ).json()
+            p = float(res.get("data", {}).get("price", 0) or 0)
+            if p > 0:
+                return p
+        except Exception as e:
+            log.error(f"get_precio {symbol}: {e}")
+        time.sleep(0.5)
+    return 0.0
+
+
+# ══════════════════════════════════════════════════════════════
+# VELAS
+# ══════════════════════════════════════════════════════════════
+
+INTERVAL_MAP = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+    "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d",
+}
+
+def get_candles(symbol: str, interval: str = "5m", limit: int = 200) -> list:
+    iv = INTERVAL_MAP.get(interval, "5m")
+    try:
+        res = _SESSION.get(
+            BASE_URL + "/openApi/swap/v3/quote/klines",
+            params={"symbol": symbol, "interval": iv, "limit": limit},
+            timeout=15,
+        ).json()
+        raw = res.get("data", [])
+
+        if not raw:
+            res2 = _SESSION.get(
+                BASE_URL + "/openApi/swap/v2/quote/klines",
+                params={"symbol": symbol, "interval": iv, "limit": limit},
+                timeout=15,
+            ).json()
+            raw = res2.get("data", [])
+
+        candles = []
+        for c in raw:
+            try:
+                if isinstance(c, list):
+                    candles.append({
+                        "ts":     int(c[0]),
+                        "open":   float(c[1]),
+                        "high":   float(c[2]),
+                        "low":    float(c[3]),
+                        "close":  float(c[4]),
+                        "volume": float(c[5]),
+                    })
+                elif isinstance(c, dict):
+                    candles.append({
+                        "ts":     int(c.get("time", c.get("openTime", 0))),
+                        "open":   float(c.get("open", 0)),
+                        "high":   float(c.get("high", 0)),
+                        "low":    float(c.get("low", 0)),
+                        "close":  float(c.get("close", 0)),
+                        "volume": float(c.get("volume", 0)),
+                    })
+            except Exception:
+                continue
+        candles.sort(key=lambda x: x["ts"])
+        return candles
+    except Exception as e:
+        log.error(f"get_candles {symbol} {interval}: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════
+# POSICIONES ABIERTAS
+# ══════════════════════════════════════════════════════════════
+
+def get_posiciones_abiertas() -> list:
+    if config.MODO_DEMO:
+        return []
+    try:
+        res = _get("/openApi/swap/v2/user/positions")
+        return res.get("data", []) or []
+    except Exception as e:
+        log.error(f"get_posiciones_abiertas: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════
+# CANCELAR ÓRDENES ABIERTAS
+# ══════════════════════════════════════════════════════════════
+
+def cancelar_ordenes_abiertas(symbol: str):
+    if config.MODO_DEMO:
+        return
+    try:
+        res = _get("/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
+        ordenes = res.get("data", {}).get("orders", []) or []
+        if not ordenes:
+            return
+        for o in ordenes:
+            oid = o.get("orderId")
+            if oid:
+                _post("/openApi/swap/v2/trade/cancel",
+                      {"symbol": symbol, "orderId": oid})
+        log.info(f"[CANCEL] {len(ordenes)} orden(es) canceladas para {symbol}")
+    except Exception as e:
+        log.warning(f"cancelar_ordenes {symbol}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# APALANCAMIENTO ✅ FIX#10
+# ══════════════════════════════════════════════════════════════
+
+def set_leverage(symbol: str, leverage: int) -> bool:
+    """✅ FIX#15 — En one-way mode NO enviar 'side' (causa 109400)."""
+    if config.MODO_DEMO:
+        return True
+    try:
+        if _HEDGE_MODE:
+            for side in ("LONG", "SHORT"):
+                r    = _post("/openApi/swap/v2/trade/leverage",
+                             {"symbol": symbol, "side": side, "leverage": leverage})
+                code = r.get("code", 0)
+                if code not in (0, 200, 80012):
+                    log.warning(f"set_leverage {symbol} {side}: code={code} msg={r.get('msg')}")
+        else:
+            # One-way: sin parámetro 'side'
+            r    = _post("/openApi/swap/v2/trade/leverage",
+                         {"symbol": symbol, "leverage": leverage})
+            code = r.get("code", 0)
+            if code not in (0, 200, 80012):
+                log.warning(f"set_leverage {symbol}: code={code} msg={r.get('msg')}")
+        return True
+    except Exception as e:
+        log.error(f"set_leverage {symbol}: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
+# CALCULAR CANTIDAD ✅ FIX#12 — con log diagnóstico detallado
+# ══════════════════════════════════════════════════════════════
+
+def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
+    if precio <= 0 or trade_usdt <= 0:
+        return 0.0
+
+    qty_raw = (trade_usdt * config.LEVERAGE) / precio
+    step    = get_step_size(symbol)
+    info    = _CONTRATO_INFO.get(symbol, {})
+    min_qty = info.get("minQty", step)
+
+    log.debug(
+        f"[QTY] {symbol} precio={precio} usdt={trade_usdt} "
+        f"lev={config.LEVERAGE} raw={qty_raw:.6f} step={step} min={min_qty}"
+    )
+
+    if step > 0:
+        # Redondear hacia abajo al múltiplo de step más cercano
+        # Usar math.floor para evitar problemas de punto flotante
+        qty_steps = math.floor(qty_raw / step)
+        qty       = qty_steps * step
+        decimals  = _decimals_from_step(step)
+        if decimals == 0:
+            qty = int(round(qty, 0))
+        else:
+            qty = round(qty, decimals)
+    else:
+        # Fallback por precio
+        if precio >= 10000:
+            qty = round(qty_raw, 3)
+        elif precio >= 100:
+            qty = round(qty_raw, 2)
+        elif precio >= 1:
+            qty = round(qty_raw, 1)
+        else:
+            qty = int(qty_raw)
+
+    min_valid = max(step if step > 0 else 0.001, min_qty if min_qty > 0 else 0.001)
+
+    if qty < min_valid:
+        log.warning(
+            f"[QTY] {symbol} qty={qty} < min_valid={min_valid} "
+            f"(necesitas más USDT o reducir precio mín. ${precio * min_valid / config.LEVERAGE:.2f})"
+        )
+        return 0.0
+
+    log.debug(f"[QTY] {symbol} qty final={qty} ({_fmt_qty(qty)})")
+    return qty
+
+
+# ══════════════════════════════════════════════════════════════
+# SL / TP COMO ÓRDENES SEPARADAS ✅ FIX#9 — qty como string limpio
+# ══════════════════════════════════════════════════════════════
+
+def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
+    if config.MODO_DEMO:
+        return
+
+    precio_actual = get_precio(symbol)
+    if precio_actual > 0:
+        if lado == "LONG":
+            if sl >= precio_actual:
+                log.warning(f"SL {symbol} LONG ({sl:.8f}) >= precio ({precio_actual:.8f}) — ajustando")
+                sl = precio_actual * 0.99
+            if tp <= precio_actual:
+                log.warning(f"TP {symbol} LONG ({tp:.8f}) <= precio ({precio_actual:.8f}) — ajustando")
+                tp = precio_actual * 1.02
+        else:
+            if sl <= precio_actual:
+                log.warning(f"SL {symbol} SHORT ({sl:.8f}) <= precio ({precio_actual:.8f}) — ajustando")
+                sl = precio_actual * 1.01
+            if tp >= precio_actual:
+                log.warning(f"TP {symbol} SHORT ({tp:.8f}) >= precio ({precio_actual:.8f}) — ajustando")
+                tp = precio_actual * 0.98
+
+    try:
+        close_side = "SELL" if lado == "LONG" else "BUY"
+        pp         = get_price_precision(symbol)
+        qty_str    = _fmt_qty(qty)
+        sl_str     = _fmt_price(sl, pp)
+        tp_str     = _fmt_price(tp, pp)
+
+        # STOP LOSS
+        sl_params = _add_pos_side({
+            "symbol":      symbol,
+            "side":        close_side,
+            "type":        "STOP_MARKET",
+            "quantity":    qty_str,
+            "stopPrice":   sl_str,
+            "workingType": "MARK_PRICE",
+        }, lado)
+        r1 = _post("/openApi/swap/v2/trade/order", sl_params)
+        if r1.get("code", 0) not in (0, 200):
+            log.warning(f"SL order {symbol}: código={r1.get('code')} msg={r1.get('msg')}")
+        else:
+            log.info(f"  SL colocado {symbol} {lado} @ {sl_str}")
+
+        time.sleep(0.4)
+
+        # TAKE PROFIT
+        tp_params = _add_pos_side({
+            "symbol":      symbol,
+            "side":        close_side,
+            "type":        "TAKE_PROFIT_MARKET",
+            "quantity":    qty_str,
+            "stopPrice":   tp_str,
+            "workingType": "MARK_PRICE",
+        }, lado)
+        r2 = _post("/openApi/swap/v2/trade/order", tp_params)
+        if r2.get("code", 0) not in (0, 200):
+            log.warning(f"TP order {symbol}: código={r2.get('code')} msg={r2.get('msg')}")
+        else:
+            log.info(f"  TP colocado {symbol} {lado} @ {tp_str}")
+
+    except Exception as e:
+        log.error(f"_place_sl_tp {symbol}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# ABRIR LONG ✅ FIX#7 + FIX#8 + FIX#11
+# ══════════════════════════════════════════════════════════════
+
+def abrir_long(symbol: str, qty: float, precio: float,
+               sl: float, tp: float) -> dict:
+    if config.MODO_DEMO:
+        log.info(f"[DEMO] LONG {symbol} qty={qty} @ {precio:.6f} SL={sl:.6f} TP={tp:.6f}")
+        return {"fill_price": precio, "executedQty": qty, "orderId": "demo_long"}
+
+    if not es_futuro_valido(symbol):
+        return {"error": f"{symbol} no es un futuro perpetuo válido"}
+
+    set_leverage(symbol, config.LEVERAGE)
+
+    qty_str = _fmt_qty(qty)
+    log.info(f"[ORDER] LONG {symbol} qty={qty_str} @ ~{precio:.6f} mode={'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}")
+
+    # ✅ FIX#14 — positionSide solo en hedge mode; omitir en one-way
+    params = _add_pos_side({
+        "symbol":   symbol,
+        "side":     "BUY",
+        "type":     "MARKET",
+        "quantity": qty_str,
+    }, "LONG")
+    res   = _post("/openApi/swap/v2/trade/order", params)
+    code  = res.get("code", -1)
+    data  = res.get("data", {})
+    order = data.get("order", data) if isinstance(data, dict) else {}
+
+    if code not in (0, 200):
+        msg = res.get("msg", "unknown")
+        log.error(f"abrir_long {symbol}: code={code} msg={msg} | qty={qty_str}")
+        return {"error": msg}
+
+    fill = float(order.get("avgPrice", order.get("price", precio)) or precio)
+    eqty = float(order.get("executedQty", qty) or qty)
+
+    time.sleep(0.5)
+    _place_sl_tp(symbol, "LONG", eqty, sl, tp)
+
+    return {"fill_price": fill, "executedQty": eqty, "orderId": order.get("orderId")}
+
+
+# ══════════════════════════════════════════════════════════════
+# ABRIR SHORT ✅ FIX#7 + FIX#8 + FIX#11
+# ══════════════════════════════════════════════════════════════
+
+def abrir_short(symbol: str, qty: float, precio: float,
+                sl: float, tp: float) -> dict:
+    if config.MODO_DEMO:
+        log.info(f"[DEMO] SHORT {symbol} qty={qty} @ {precio:.6f} SL={sl:.6f} TP={tp:.6f}")
+        return {"fill_price": precio, "executedQty": qty, "orderId": "demo_short"}
+
+    if not es_futuro_valido(symbol):
+        return {"error": f"{symbol} no es un futuro perpetuo válido"}
+
+    set_leverage(symbol, config.LEVERAGE)
+
+    qty_str = _fmt_qty(qty)
+    log.info(f"[ORDER] SHORT {symbol} qty={qty_str} @ ~{precio:.6f} mode={'HEDGE' if _HEDGE_MODE else 'ONE-WAY'}")
+
+    # ✅ FIX#14 — positionSide solo en hedge mode; omitir en one-way
+    params = _add_pos_side({
+        "symbol":   symbol,
+        "side":     "SELL",
+        "type":     "MARKET",
+        "quantity": qty_str,
+    }, "SHORT")
+    res   = _post("/openApi/swap/v2/trade/order", params)
+    code  = res.get("code", -1)
+    data  = res.get("data", {})
+    order = data.get("order", data) if isinstance(data, dict) else {}
+
+    if code not in (0, 200):
+        msg = res.get("msg", "unknown")
+        log.error(f"abrir_short {symbol}: code={code} msg={msg} | qty={qty_str}")
+        return {"error": msg}
+
+    fill = float(order.get("avgPrice", order.get("price", precio)) or precio)
+    eqty = float(order.get("executedQty", qty) or qty)
+
+    time.sleep(0.5)
+    _place_sl_tp(symbol, "SHORT", eqty, sl, tp)
+
+    return {"fill_price": fill, "executedQty": eqty, "orderId": order.get("orderId")}
+
+
+# ══════════════════════════════════════════════════════════════
+# CERRAR POSICIÓN
+# ══════════════════════════════════════════════════════════════
+
+def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
+    if config.MODO_DEMO:
+        return {"precio_salida": get_precio(symbol)}
+
+    cancelar_ordenes_abiertas(symbol)
+    time.sleep(0.3)
+
+    side    = "SELL" if lado == "LONG" else "BUY"
+    qty_str = _fmt_qty(qty)
+    # ✅ FIX#14 — positionSide solo en hedge mode
+    params  = _add_pos_side({
+        "symbol":   symbol,
+        "side":     side,
+        "type":     "MARKET",
+        "quantity": qty_str,
+    }, lado)
+    res   = _post("/openApi/swap/v2/trade/order", params)
+    code  = res.get("code", -1)
+    data  = res.get("data", {})
+    order = data.get("order", data) if isinstance(data, dict) else {}
+
+    if code not in (0, 200):
+        log.error(f"cerrar_posicion {symbol}: code={code} msg={res.get('msg')} | qty={qty_str}")
+        return {"precio_salida": get_precio(symbol)}
+
+    fill = float(order.get("avgPrice", order.get("price", 0)) or 0)
+    if fill <= 0:
+        fill = get_precio(symbol)
+    return {"precio_salida": fill}
