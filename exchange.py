@@ -1,11 +1,11 @@
 """
-exchange.py — BingX Perpetual Futures REST API v2.1
-Mejoras vs v2.0:
-  ✅ Retry automático en errores de red (3 intentos)
-  ✅ Rate limiting básico con sleep entre llamadas
-  ✅ Mejor logging de errores con código HTTP
-  ✅ get_precio con fallback a ticker
-  ✅ calcular_cantidad con precisión dinámica por par
+exchange.py — BingX Perpetual Futures REST API v3.2
+Fixes:
+  ✅ Firma HMAC corregida (sin stopLoss/takeProfit en params de orden)
+  ✅ SL/TP como órdenes separadas STOP_MARKET + TAKE_PROFIT_MARKET
+  ✅ Intervalo velas corregido a "5m" (era "5" → 0 velas)
+  ✅ Fallback v2 si v3 klines falla
+  ✅ Retry con backoff en GET/POST
 """
 
 import time, hmac, hashlib, logging
@@ -73,6 +73,50 @@ def _post(path: str, params: dict = None, retries: int = 3) -> dict:
     return {}
 
 
+def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
+    """
+    Coloca SL y TP como órdenes separadas después de abrir posición.
+    Así la firma de la orden de entrada es limpia y no falla.
+    """
+    if config.MODO_DEMO:
+        return
+    try:
+        close_side = "SELL" if lado == "LONG" else "BUY"
+        pos_side   = lado
+
+        sl_params = {
+            "symbol":       symbol,
+            "side":         close_side,
+            "positionSide": pos_side,
+            "type":         "STOP_MARKET",
+            "quantity":     qty,
+            "stopPrice":    str(round(sl, 8)),
+            "workingType":  "MARK_PRICE",
+        }
+        r1 = _post("/openApi/swap/v2/trade/order", sl_params)
+        if r1.get("code", 0) != 0:
+            log.warning(f"SL order {symbol}: {r1.get('msg')}")
+
+        time.sleep(0.3)
+
+        tp_params = {
+            "symbol":       symbol,
+            "side":         close_side,
+            "positionSide": pos_side,
+            "type":         "TAKE_PROFIT_MARKET",
+            "quantity":     qty,
+            "stopPrice":    str(round(tp, 8)),
+            "workingType":  "MARK_PRICE",
+        }
+        r2 = _post("/openApi/swap/v2/trade/order", tp_params)
+        if r2.get("code", 0) != 0:
+            log.warning(f"TP order {symbol}: {r2.get('msg')}")
+        else:
+            log.info(f"✅ SL/TP colocados {symbol} {lado} SL={sl:.6f} TP={tp:.6f}")
+    except Exception as e:
+        log.error(f"_place_sl_tp {symbol}: {e}")
+
+
 # ══════════════════════════════════════════════════════════════
 # BALANCE
 # ══════════════════════════════════════════════════════════════
@@ -110,19 +154,18 @@ def get_precio(symbol: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════
-# VELAS
+# VELAS — intervalo corregido a "5m" (no "5")
 # ══════════════════════════════════════════════════════════════
 
 INTERVAL_MAP = {
-    "1m": "1m",   "3m": "3m",   "5m": "5m",  "15m": "15m",
-    "30m": "30m", "1h": "1h",   "2h": "2h",  "4h": "4h",
+    "1m": "1m",  "3m": "3m",  "5m": "5m",  "15m": "15m",
+    "30m": "30m","1h": "1h",  "2h": "2h",  "4h": "4h",
     "1d": "1d",
 }
 
 def get_candles(symbol: str, interval: str = "5m", limit: int = 200) -> list:
     iv = INTERVAL_MAP.get(interval, "5m")
     try:
-        # Intentar v3 primero, fallback a v2
         res = _SESSION.get(
             BASE_URL + "/openApi/swap/v3/quote/klines",
             params={"symbol": symbol, "interval": iv, "limit": limit},
@@ -130,9 +173,7 @@ def get_candles(symbol: str, interval: str = "5m", limit: int = 200) -> list:
         ).json()
         raw = res.get("data", [])
 
-        # Si v3 falla o devuelve vacío, intentar v2
         if not raw:
-            log.debug(f"get_candles {symbol}: v3 vacío, probando v2")
             res2 = _SESSION.get(
                 BASE_URL + "/openApi/swap/v2/quote/klines",
                 params={"symbol": symbol, "interval": iv, "limit": limit},
@@ -208,15 +249,9 @@ def set_leverage(symbol: str, leverage: int) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
-    """
-    qty = (trade_usdt × leverage) / precio
-    Ajusta la precisión decimal según el precio del activo.
-    """
     if precio <= 0 or trade_usdt <= 0:
         return 0.0
     qty = (trade_usdt * config.LEVERAGE) / precio
-
-    # Precisión dinámica según precio
     if precio >= 10000:
         qty = round(qty, 3)
     elif precio >= 100:
@@ -225,18 +260,17 @@ def calcular_cantidad(symbol: str, trade_usdt: float, precio: float) -> float:
         qty = round(qty, 1)
     else:
         qty = round(qty, 0)
-
     return max(qty, 0.001)
 
 
 # ══════════════════════════════════════════════════════════════
-# ABRIR LONG
+# ABRIR LONG — firma limpia, SL/TP separados
 # ══════════════════════════════════════════════════════════════
 
 def abrir_long(symbol: str, qty: float, precio: float,
                sl: float, tp: float) -> dict:
     if config.MODO_DEMO:
-        log.info(f"[DEMO] ABRIR LONG {symbol} qty={qty} @ {precio:.6f}")
+        log.info(f"[DEMO] LONG {symbol} qty={qty} @ {precio:.6f} SL={sl:.6f} TP={tp:.6f}")
         return {"fill_price": precio, "executedQty": qty, "orderId": "demo_long"}
 
     set_leverage(symbol, config.LEVERAGE)
@@ -246,8 +280,6 @@ def abrir_long(symbol: str, qty: float, precio: float,
         "positionSide": "LONG",
         "type":         "MARKET",
         "quantity":     qty,
-        "stopLoss":     str(round(sl, 8)),
-        "takeProfit":   str(round(tp, 8)),
     }
     res   = _post("/openApi/swap/v2/trade/order", params)
     data  = res.get("data", {})
@@ -258,17 +290,21 @@ def abrir_long(symbol: str, qty: float, precio: float,
 
     fill = float(order.get("avgPrice", order.get("price", precio)) or precio)
     eqty = float(order.get("executedQty", qty) or qty)
+
+    time.sleep(0.5)
+    _place_sl_tp(symbol, "LONG", eqty, sl, tp)
+
     return {"fill_price": fill, "executedQty": eqty, "orderId": order.get("orderId")}
 
 
 # ══════════════════════════════════════════════════════════════
-# ABRIR SHORT
+# ABRIR SHORT — firma limpia, SL/TP separados
 # ══════════════════════════════════════════════════════════════
 
 def abrir_short(symbol: str, qty: float, precio: float,
                 sl: float, tp: float) -> dict:
     if config.MODO_DEMO:
-        log.info(f"[DEMO] ABRIR SHORT {symbol} qty={qty} @ {precio:.6f}")
+        log.info(f"[DEMO] SHORT {symbol} qty={qty} @ {precio:.6f} SL={sl:.6f} TP={tp:.6f}")
         return {"fill_price": precio, "executedQty": qty, "orderId": "demo_short"}
 
     set_leverage(symbol, config.LEVERAGE)
@@ -278,8 +314,6 @@ def abrir_short(symbol: str, qty: float, precio: float,
         "positionSide": "SHORT",
         "type":         "MARKET",
         "quantity":     qty,
-        "stopLoss":     str(round(sl, 8)),
-        "takeProfit":   str(round(tp, 8)),
     }
     res   = _post("/openApi/swap/v2/trade/order", params)
     data  = res.get("data", {})
@@ -290,6 +324,10 @@ def abrir_short(symbol: str, qty: float, precio: float,
 
     fill = float(order.get("avgPrice", order.get("price", precio)) or precio)
     eqty = float(order.get("executedQty", qty) or qty)
+
+    time.sleep(0.5)
+    _place_sl_tp(symbol, "SHORT", eqty, sl, tp)
+
     return {"fill_price": fill, "executedQty": eqty, "orderId": order.get("orderId")}
 
 
@@ -299,8 +337,7 @@ def abrir_short(symbol: str, qty: float, precio: float,
 
 def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
     if config.MODO_DEMO:
-        precio = get_precio(symbol)
-        return {"precio_salida": precio}
+        return {"precio_salida": get_precio(symbol)}
 
     side     = "SELL" if lado == "LONG" else "BUY"
     pos_side = lado
