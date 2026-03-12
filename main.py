@@ -1,12 +1,6 @@
 """
-main.py — SMC Bot BingX v3.1 [CORREGIDO + MEJORADO]
-Mejoras vs v3.0:
-  ✅ Mensaje de arranque con resumen de todos los fixes
-  ✅ Anti-hedge mejorado: verifica posición contraria en mismo par
-  ✅ Manejo de señales con score ajustado por memoria
-  ✅ Sincronización de posiciones más robusta
-  ✅ Reporte de ciclo más informativo
-  ✅ Comando /status mejorado via Telegram webhook (próxima versión)
+main.py — SMC Bot BingX v4.0 [REAL MONEY | 24/7 | AUTO-LEARN]
+$10 por trade × 10x | Compounding | Aprende errores | Sin parar
 """
 
 import sys, os, time, traceback
@@ -19,35 +13,35 @@ logging.basicConfig(
     stream=sys.stdout,
     force=True,
 )
-# Subir a DEBUG para ver logs de no-señal
 if os.getenv("LOG_LEVEL", "").upper() == "DEBUG":
     logging.getLogger().setLevel(logging.DEBUG)
 
 log = logging.getLogger("main")
-log.info("=== ARRANQUE SMC BOT v3.2 ===")
+log.info("=== ARRANQUE SMC BOT v4.0 ===")
 
 try:
     import config, exchange, analizar, memoria, scanner_pares
+    from config_pares import PARES as PARES_FIJOS
 except Exception as e:
     log.error(f"ERROR importando módulos: {e}\n{traceback.format_exc()}")
     sys.exit(1)
 
-log.info(f"Módulos OK | {config.VERSION}")
 errores_config = config.validar()
 for err in errores_config:
     log.warning(f"⚠️  CONFIG: {err}")
 
+log.info(f"Módulos OK | {config.VERSION}")
+
 
 # ═══════════════════════════════════════════════════════
-# GRUPOS DE CORRELACIÓN
+# CORRELACIÓN
 # ═══════════════════════════════════════════════════════
 
 GRUPOS_CORRELACION = [
     {"BTC-USDT", "ETH-USDT"},
     {"SOL-USDT", "AVAX-USDT", "APT-USDT", "SUI-USDT"},
     {"ARB-USDT", "OP-USDT"},
-    {"DOGE-USDT", "SHIB-USDT", "PEPE-USDT", "WIF-USDT"},
-    {"LINK-USDT", "BAND-USDT"},
+    {"DOGE-USDT", "PEPE-USDT", "WIF-USDT", "BONK-USDT"},
     {"BNB-USDT", "TRX-USDT"},
 ]
 
@@ -57,21 +51,16 @@ def hay_correlacion(par: str, lado: str, posiciones: dict) -> bool:
     for grupo in GRUPOS_CORRELACION:
         if par not in grupo:
             continue
-        for par_abierto, pos in posiciones.items():
-            if par_abierto in grupo and par_abierto != par:
-                if pos["lado"] == lado:
-                    log.info(f"[CORR] {par} {lado} bloqueado — {par_abierto} ya abierto en mismo grupo/lado")
-                    return True
+        for p_ab, pos in posiciones.items():
+            if p_ab in grupo and p_ab != par and pos["lado"] == lado:
+                log.info(f"[CORR] {par} {lado} bloqueado — {p_ab} ya abierto")
+                return True
     return False
 
-
 def hay_hedge(par: str, lado: str, posiciones: dict) -> bool:
-    """Bloquea si ya hay una posición contraria abierta en el mismo par."""
-    if par in posiciones:
-        pos_actual = posiciones[par]
-        if pos_actual["lado"] != lado:
-            log.info(f"[ANTI-HEDGE] {par} {lado} bloqueado — ya hay {pos_actual['lado']} abierto")
-            return True
+    if par in posiciones and posiciones[par]["lado"] != lado:
+        log.info(f"[ANTI-HEDGE] {par} {lado} — ya hay {posiciones[par]['lado']}")
+        return True
     return False
 
 
@@ -92,7 +81,7 @@ class Estado:
         if hoy != self.dia_actual:
             self.dia_actual = hoy
             self.pnl_hoy    = 0.0
-            log.info(f"[RESET DIARIO] {hoy} — PnL reseteado")
+            log.info(f"[RESET] Nuevo día {hoy} — PnL reseteado")
 
     def registrar_cierre(self, pnl: float):
         self.pnl_hoy += pnl
@@ -134,6 +123,10 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
     motiv = " + ".join(s.get("motivos", []))
 
     extras = ""
+    if s.get("sweep_bull") or s.get("sweep_bear"):
+        extras += "💧 `Liquidity Sweep`\n"
+    if s.get("patron"):
+        extras += f"🕯️ `{s['patron']}`\n"
     if s.get("ob_bull") or s.get("ob_bear"):
         extras += "📦 `Order Block`\n"
     if s.get("choch_bull") or s.get("choch_bear"):
@@ -142,10 +135,11 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
         extras += "🔨 `Break of Structure`\n"
     if s.get("htf") in ("BULL", "BEAR"):
         extras += f"📈 MTF 1h: `{s['htf']}`\n"
-    if s.get("vela_conf"):
-        extras += "🕯️ `Vela confirmadora`\n"
     if s.get("asia_valido"):
         extras += "🌙 `Rango Asia activo`\n"
+    if s.get("vwap"):
+        vwap_pos = "sobre" if s.get("sobre_vwap") else "bajo"
+        extras += f"📊 VWAP: `{s['vwap']:.6f}` ({vwap_pos})\n"
 
     _notif(
         f"{lado} — `{s['par']}` [{s.get('kz', '')}]\n"
@@ -155,7 +149,7 @@ def _notif_entrada(s: dict, trade_usdt: float, ejecutado: bool):
         f"✅ TP2     : `{s['tp']:.6f}`\n"
         f"🛑 SL      : `{s['sl']:.6f}`\n"
         f"📊 R:R     : `{s['rr']:.2f}x`\n"
-        f"🏅 Score   : `{s['score']}/12`\n"
+        f"🏅 Score   : `{s['score']}/14`\n"
         f"📉 RSI     : `{s['rsi']:.1f}`\n"
         f"🧩 Señales : `{motiv}`\n"
         f"{extras}"
@@ -183,7 +177,6 @@ def _notif_cierre(par, lado, entrada, salida, pnl, razon="", trade_usdt=0):
 
 def cargar_posiciones_desde_bingx():
     if config.MODO_DEMO:
-        log.info("[ARRANQUE] DEMO — posiciones reseteadas")
         return
     try:
         pos_reales = exchange.get_posiciones_abiertas()
@@ -199,35 +192,31 @@ def cargar_posiciones_desde_bingx():
             par    = symbol if "-" in symbol else symbol.replace("USDT", "-USDT")
             if par in estado.posiciones:
                 continue
-            lado   = "LONG" if amt > 0 else "SHORT"
-            entry  = float(p.get("entryPrice", 0) or 0)
-            qty    = abs(amt)
+            lado  = "LONG" if amt > 0 else "SHORT"
+            entry = float(p.get("entryPrice", 0) or 0)
+            qty   = abs(amt)
             if entry <= 0 or qty <= 0:
                 continue
             estado.posiciones[par] = {
-                "lado":        lado,
-                "entrada":     entry,
-                "qty":         qty,
-                "sl":          float(p.get("stopLoss",    0) or 0),
-                "tp":          float(p.get("takeProfit",  0) or 0),
-                "tp1":         0.0,
-                "atr":         0.0,
-                "sl_trailing": float(p.get("stopLoss",    0) or 0),
-                "tp1_hit":     False,
-                "ts":          datetime.now(timezone.utc).isoformat(),
-                "recuperada":  True,
-                "trade_usdt":  config.TRADE_USDT_BASE,
+                "lado": lado, "entrada": entry, "qty": qty,
+                "sl": float(p.get("stopLoss", 0) or 0),
+                "tp": float(p.get("takeProfit", 0) or 0),
+                "tp1": 0.0, "atr": 0.0,
+                "sl_trailing": float(p.get("stopLoss", 0) or 0),
+                "tp1_hit": False,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "recuperada": True,
+                "trade_usdt": config.TRADE_USDT_BASE,
             }
             cargadas += 1
-            log.info(f"[ARRANQUE] ✅ {lado} {par} entry={entry:.6f} qty={qty}")
+            log.info(f"[ARRANQUE] ✅ {lado} {par} @ {entry:.6f} qty={qty}")
 
         if cargadas:
             _notif(
                 f"♻️ *Bot reiniciado — {cargadas} posición(es) recuperada(s)*\n"
                 + "\n".join(
                     f"  {'🟢' if v['lado']=='LONG' else '🔴'} `{k}` {v['lado']} @ `{v['entrada']:.6f}`"
-                    for k, v in estado.posiciones.items()
-                    if v.get("recuperada")
+                    for k, v in estado.posiciones.items() if v.get("recuperada")
                 )
             )
     except Exception as e:
@@ -276,15 +265,11 @@ def sincronizar_posiciones():
                 pnl = qty * ((precio - entry) if lado == "LONG" else (entry - precio))
 
             estado.registrar_cierre(pnl)
-            memoria.registrar_resultado(
-                par, pnl, lado,
-                kz=pos.get("kz", ""),
-                motivos=pos.get("motivos", []),
-            )
+            memoria.registrar_resultado(par, pnl, lado,
+                kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
             del estado.posiciones[par]
             _notif_cierre(par, lado, entry, salida, pnl, f"BingX-{razon}")
             log.info(f"[SYNC] {par} cerrado ({razon}) PnL≈{pnl:+.4f}")
-
     except Exception as e:
         log.error(f"[SYNC] {e}")
 
@@ -306,12 +291,14 @@ def actualizar_trailing(par, pos, precio):
         nuevo = precio - atr * config.TRAILING_DISTANCIA
         if nuevo > pos.get("sl_trailing", pos["sl"]):
             pos["sl_trailing"] = nuevo
+            log.debug(f"[TRAIL] {par} SL → {nuevo:.6f}")
     else:
         if pos["entrada"] - precio < atr * config.TRAILING_ACTIVAR:
             return
         nuevo = precio + atr * config.TRAILING_DISTANCIA
         if nuevo < pos.get("sl_trailing", pos["sl"]):
             pos["sl_trailing"] = nuevo
+            log.debug(f"[TRAIL] {par} SL → {nuevo:.6f}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -337,10 +324,7 @@ def gestionar_partial_tp(par, pos, precio):
         salida_real = precio
 
     entrada = pos["entrada"]
-    pnl_p   = qty_tp1 * (
-        (salida_real - entrada) if lado == "LONG"
-        else (entrada - salida_real)
-    )
+    pnl_p   = qty_tp1 * ((salida_real - entrada) if lado == "LONG" else (entrada - salida_real))
     estado.pnl_hoy += pnl_p
     memoria.registrar_ganancia_compounding(pnl_p)
 
@@ -354,7 +338,8 @@ def gestionar_partial_tp(par, pos, precio):
         f"🔶 *TP1* — `{par}` {lado}\n"
         f"50% @ `{salida_real:.6f}` | PnL: `${pnl_p:+.4f}`\n"
         f"🔄 SL → `{be:.6f}` (breakeven)\n"
-        f"📈 Próx trade: `${memoria.get_trade_amount():.2f} USDT`"
+        f"📊 Pool: `${memoria._data['compounding']['ganancias']:.2f}` | "
+        f"Próx: `${memoria.get_trade_amount():.2f} USDT`"
     )
 
 
@@ -371,12 +356,9 @@ def check_time_exit(par, pos) -> bool:
         ahora = datetime.now(timezone.utc)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        if (ahora - ts).total_seconds() / 3600 >= config.TIME_EXIT_HORAS:
-            log.warning(f"[TIME_EXIT] {par} lleva más de {config.TIME_EXIT_HORAS}h")
-            return True
+        return (ahora - ts).total_seconds() / 3600 >= config.TIME_EXIT_HORAS
     except Exception:
-        pass
-    return False
+        return False
 
 
 # ═══════════════════════════════════════════════════════
@@ -392,19 +374,12 @@ def gestionar_posiciones():
             lado = pos["lado"]
             qty  = pos["qty"]
 
-            if pos.get("recuperada") and pos.get("sl", 0) <= 0:
-                actualizar_trailing(par, pos, precio)
-                continue
-
             gestionar_partial_tp(par, pos, precio)
 
             if check_time_exit(par, pos):
                 res         = exchange.cerrar_posicion(par, qty, lado)
                 salida_real = (res or {}).get("precio_salida", precio) or precio
-                pnl = qty * (
-                    (salida_real - pos["entrada"]) if lado == "LONG"
-                    else (pos["entrada"] - salida_real)
-                )
+                pnl = qty * ((salida_real - pos["entrada"]) if lado == "LONG" else (pos["entrada"] - salida_real))
                 estado.registrar_cierre(pnl)
                 memoria.registrar_resultado(par, pnl, lado,
                     kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
@@ -429,10 +404,7 @@ def gestionar_posiciones():
             if razon:
                 res         = exchange.cerrar_posicion(par, qty, lado)
                 salida_real = (res or {}).get("precio_salida", salida) or salida
-                pnl = qty * (
-                    (salida_real - pos["entrada"]) if lado == "LONG"
-                    else (pos["entrada"] - salida_real)
-                )
+                pnl = qty * ((salida_real - pos["entrada"]) if lado == "LONG" else (pos["entrada"] - salida_real))
                 estado.registrar_cierre(pnl)
                 memoria.registrar_resultado(par, pnl, lado,
                     kz=pos.get("kz", ""), motivos=pos.get("motivos", []))
@@ -455,7 +427,6 @@ def ejecutar_senal(s: dict) -> bool:
     lado = s["lado"]
 
     if par in estado.posiciones:
-        log.warning(f"[BLOQUEO] {par} ya tiene {estado.posiciones[par]['lado']}")
         return False
     if hay_hedge(par, lado, estado.posiciones):
         return False
@@ -464,10 +435,9 @@ def ejecutar_senal(s: dict) -> bool:
     if memoria.esta_bloqueado(par):
         return False
     if len(estado.posiciones) >= config.MAX_POSICIONES:
-        log.debug(f"[BLOQUEO] Máx posiciones {config.MAX_POSICIONES} alcanzadas")
         return False
     if estado.max_perdida_alcanzada():
-        log.warning("[BLOQUEO] Máx pérdida diaria alcanzada")
+        log.warning("[BLOQUEO] Máx pérdida diaria")
         return False
 
     balance = exchange.get_balance()
@@ -478,12 +448,10 @@ def ejecutar_senal(s: dict) -> bool:
     trade_usdt = memoria.get_trade_amount()
     qty        = exchange.calcular_cantidad(par, trade_usdt, s["precio"])
     if qty <= 0:
-        log.warning(f"[{par}] Cantidad calculada = 0")
         return False
 
-    margen_necesario = trade_usdt * 1.1
-    if balance < margen_necesario and not config.MODO_DEMO:
-        log.warning(f"[{par}] Margen insuficiente: ${balance:.2f} < ${margen_necesario:.2f}")
+    if balance < trade_usdt * 1.1 and not config.MODO_DEMO:
+        log.warning(f"[{par}] Margen insuficiente ${balance:.2f} < ${trade_usdt*1.1:.2f}")
         return False
 
     if lado == "LONG":
@@ -502,7 +470,7 @@ def ejecutar_senal(s: dict) -> bool:
     if entrada_real <= 0:
         entrada_real = exchange.get_precio(par) or s["precio"]
 
-    atr    = s.get("atr", 0)
+    atr   = s.get("atr", 0)
     precio = s["precio"]
     if atr > 0:
         sl_r  = (entrada_real - atr * config.SL_ATR_MULT)  if lado == "LONG" else (entrada_real + atr * config.SL_ATR_MULT)
@@ -539,10 +507,8 @@ def ejecutar_senal(s: dict) -> bool:
     log.info(
         f"✅ {lado} {par} fill:{entrada_real:.6f} "
         f"{'⚠️ SLIP:'+str(round(slip,1))+'%' if slip > 0.5 else ''} "
-        f"trade:${trade_usdt:.2f} SL:{sl_r:.6f} TP2:{tp_r:.6f} "
-        f"score:{s['score']}/12 HTF:{s.get('htf','?')} "
-        f"OB:{s.get('ob_bull') or s.get('ob_bear')} "
-        f"BOS:{s.get('bos_bull') or s.get('bos_bear')}"
+        f"${trade_usdt:.2f}×{config.LEVERAGE}x "
+        f"SL:{sl_r:.6f} TP:{tp_r:.6f} score:{s['score']}/14"
     )
     return True
 
@@ -555,21 +521,20 @@ def enviar_reporte(balance: float):
     pos_txt = ""
     for par, pos in estado.posiciones.items():
         p_actual = exchange.get_precio(par)
+        pnl_est  = 0
         if p_actual > 0:
             pnl_est = pos["qty"] * (
                 (p_actual - pos["entrada"]) if pos["lado"] == "LONG"
                 else (pos["entrada"] - p_actual)
             )
-        else:
-            pnl_est = 0
         fase = "🔶→TP2" if pos.get("tp1_hit") else "▶️→TP1"
         ico  = "🟢" if pos["lado"] == "LONG" else "🔴"
-        pos_txt += f"  {ico} `{par}` est:${pnl_est:+.2f} {fase} [{pos.get('score','?')}/12]\n"
+        pos_txt += f"  {ico} `{par}` est:${pnl_est:+.2f} {fase} [{pos.get('score','?')}/14]\n"
     if not pos_txt:
         pos_txt = "  _(sin posiciones)_\n"
 
     w, l = estado.wins, estado.losses
-    wr   = f"{w/(w+l)*100:.1f}%" if (w + l) > 0 else "N/A"
+    wr   = f"{w/(w+l)*100:.1f}%" if (w+l) > 0 else "N/A"
     comp = memoria._data["compounding"]
     kz   = analizar.en_killzone()
 
@@ -580,28 +545,28 @@ def enviar_reporte(balance: float):
         f"📈 Sesión     : `{w}W / {l}L` WR:`{wr}`\n"
         f"PnL hoy       : `${estado.pnl_hoy:+.4f}` USDT\n"
         f"🕐 Killzone   : `{kz['nombre']}`\n"
-        f"💵 Trade size : `${memoria.get_trade_amount():.2f}`\n"
+        f"💵 Trade base : `$10.00` × {config.LEVERAGE}x\n"
+        f"📊 Próx trade : `${memoria.get_trade_amount():.2f}`\n"
         f"💹 Pool reinv.: `${comp['ganancias']:.2f}` USDT\n"
         f"📊 Total PnL  : `${comp['total_ganado']:+.4f}`\n"
+        f"🏆 Trades tot.: `{comp['total_trades']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📋 Posiciones:\n{pos_txt}"
     )
 
 
 # ═══════════════════════════════════════════════════════
-# MAIN LOOP
+# MAIN LOOP — 24/7 sin parar
 # ═══════════════════════════════════════════════════════
 
 def main():
     log.info("=" * 65)
     log.info(f"  {config.VERSION}")
-    log.info(f"  TRADE: ${config.TRADE_USDT_BASE} base + compounding (máx ${config.TRADE_USDT_MAX})")
+    log.info(f"  TRADE: $10 base | COMPOUNDING cada ${config.COMPOUND_STEP_USDT} ganados")
     log.info(f"  LEV:{config.LEVERAGE}x | MAX_POS:{config.MAX_POSICIONES} | TF:{config.TIMEFRAME} | MTF:{config.MTF_TIMEFRAME}")
-    log.info(f"  SCORE≥{config.SCORE_MIN}/12 | PIVOT_PCT:{config.PIVOT_NEAR_PCT}% | MIN_RR:{config.MIN_RR}")
-    log.info(f"  SOLO_LONG:{config.SOLO_LONG} | DEMO:{config.MODO_DEMO}")
-    log.info(f"  MTF={config.MTF_ACTIVO} OB={config.OB_ACTIVO} BOS={config.BOS_ACTIVO}")
-    log.info(f"  ASIA={config.ASIA_RANGE_ACTIVO} VELA={config.VELA_CONFIRMACION} CORR={config.CORRELACION_ACTIVO}")
-    log.info(f"  MEMORY: {memoria.MEMORY_FILE}")
+    log.info(f"  SCORE≥{config.SCORE_MIN}/14 | PIVOT_PCT:{config.PIVOT_NEAR_PCT}% | MIN_RR:{config.MIN_RR}")
+    log.info(f"  PIN_BAR:{config.PINBAR_RATIO} | VWAP:{config.VWAP_ACTIVO} | SWEEP:{config.SWEEP_ACTIVO}")
+    log.info(f"  COOLDOWN:{config.COOLDOWN_VELAS} velas | DEMO:{config.MODO_DEMO}")
     log.info("=" * 65)
 
     balance = exchange.get_balance()
@@ -612,34 +577,32 @@ def main():
 
     cargar_posiciones_desde_bingx()
 
+    # ── Cargar pares ──
     log.info("Cargando pares de BingX...")
     pares_todos  = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
     bloq_config  = set(config.PARES_BLOQUEADOS)
     pares_todos  = [p for p in pares_todos if p not in bloq_config]
-    prioritarios = [p for p in config.PARES_PRIORITARIOS if p in set(pares_todos)]
+    prioritarios = [p for p in (PARES_FIJOS + config.PARES_PRIORITARIOS) if p in set(pares_todos)]
     top_memoria  = [p for p in memoria.get_top_pares(10) if p in set(pares_todos)]
-    resto        = [p for p in pares_todos
-                    if p not in set(prioritarios) and p not in set(top_memoria)]
+    resto        = [p for p in pares_todos if p not in set(prioritarios) and p not in set(top_memoria)]
     pares        = prioritarios + top_memoria + resto
-
     if config.MAX_PARES_SCAN > 0:
         pares = pares[:config.MAX_PARES_SCAN]
 
-    log.info(f"Total pares a escanear: {len(pares)}")
+    log.info(f"Total pares: {len(pares)} ({len(prioritarios)} prioritarios + {len(top_memoria)} top memoria)")
 
     _notif(
-        f"🤖 *{config.VERSION}*\narrancado\n"
+        f"🤖 *{config.VERSION}* arrancado\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance    : `${balance:.2f} USDT`\n"
-        f"💵 Trade size : `${memoria.get_trade_amount():.2f} USDT` (base ${config.TRADE_USDT_BASE})\n"
-        f"📊 Pares      : `{len(pares)}` (todos BingX >${config.VOLUMEN_MIN_24H/1e6:.0f}M vol)\n"
-        f"🏅 Score≥`{config.SCORE_MIN}/12` | Lev:`{config.LEVERAGE}x` | Max:`{config.MAX_POSICIONES}` pos\n"
-        f"📐 Pivot zone : `±{config.PIVOT_NEAR_PCT}%` | Min R:R `{config.MIN_RR}x`\n"
-        f"🔄 Compounding: cada ${config.COMPOUND_STEP_USDT:.0f} ganados → +${config.COMPOUND_ADD_USDT:.0f}/trade\n"
-        f"🧠 Aprendizaje: blacklist automático + score dinámico\n"
-        f"🔁 Anti-hedge: activo\n"
-        f"⏱️ Time exit: {config.TIME_EXIT_HORAS}h\n"
-        f"{'🔇 *DEMO*' if config.MODO_DEMO else '🟢 *LIVE — DINERO REAL*'}"
+        f"💵 Trade      : `$10.00` × {config.LEVERAGE}x (real)\n"
+        f"📊 Pares      : `{len(pares)}` (vol >${config.VOLUMEN_MIN_24H/1e6:.0f}M)\n"
+        f"🏅 Score≥`{config.SCORE_MIN}/14` | Min R:R `{config.MIN_RR}x`\n"
+        f"💹 Compounding: cada ${config.COMPOUND_STEP_USDT:.0f} ganados → +${config.COMPOUND_ADD_USDT:.0f}/trade\n"
+        f"🧠 Pin Bar + Engulfing + Sweeps + VWAP\n"
+        f"⏱️ Cooldown: {config.COOLDOWN_VELAS} velas | Time exit: {config.TIME_EXIT_HORAS}h\n"
+        f"🔁 Anti-hedge + Correlación\n"
+        f"🔴 *LIVE — DINERO REAL — 24/7*"
     )
 
     ciclo           = 0
@@ -657,29 +620,30 @@ def main():
                 f"Ciclo {ciclo} | {datetime.now(timezone.utc).strftime('%H:%M UTC')} | "
                 f"Bal:${balance:.2f} | Pos:{len(estado.posiciones)} | "
                 f"PnL:${estado.pnl_hoy:+.4f} | KZ:{kz['nombre']} | "
-                f"Score≥{config.SCORE_MIN} | Trade:${memoria.get_trade_amount():.2f}"
+                f"Trade:${memoria.get_trade_amount():.2f}"
             )
 
-            # Refrescar lista de pares cada hora
+            # Refrescar pares cada hora
             if time.time() - last_scan_pares > 3600:
-                nuevos   = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
-                nuevos   = [p for p in nuevos if p not in bloq_config]
-                bloq_mem = set(memoria.get_pares_bloqueados())
-                top_m    = [p for p in memoria.get_top_pares(10) if p in set(nuevos)]
-                resto_n  = [p for p in nuevos if p not in set(top_m) and p not in bloq_mem]
-                pares    = prioritarios + top_m + resto_n
+                nuevos  = scanner_pares.get_pares_cached(config.VOLUMEN_MIN_24H)
+                nuevos  = [p for p in nuevos if p not in bloq_config]
+                bloq_m  = set(memoria.get_pares_bloqueados())
+                top_m   = [p for p in memoria.get_top_pares(10) if p in set(nuevos)]
+                resto_n = [p for p in nuevos if p not in set(top_m) and p not in bloq_m]
+                pares   = prioritarios + top_m + resto_n
                 if config.MAX_PARES_SCAN > 0:
                     pares = pares[:config.MAX_PARES_SCAN]
                 log.info(f"Pares actualizados: {len(pares)}")
                 last_scan_pares = time.time()
 
+            # Circuit breaker diario
             if estado.max_perdida_alcanzada():
-                log.warning(f"🛑 Máx pérdida diaria (${estado.pnl_hoy:.2f})")
+                log.warning(f"🛑 Máx pérdida diaria (${estado.pnl_hoy:.2f}) — pausa 30min")
                 _notif(
                     f"🛑 *Máx pérdida diaria* `${estado.pnl_hoy:.2f}`\n"
-                    f"Bot en pausa hasta mañana"
+                    f"Pausa 30 minutos (retoma automáticamente)"
                 )
-                time.sleep(config.LOOP_SECONDS * 30)
+                time.sleep(1800)
                 continue
 
             sincronizar_posiciones()
@@ -695,21 +659,17 @@ def main():
                     if p not in estado.posiciones and p not in bloq_ahora
                 ]
 
-                log.info(
-                    f"Escaneando {len(pares_scan)} pares | "
-                    f"KZ:{kz['nombre']} | Score≥{config.SCORE_MIN}/12"
-                )
+                log.info(f"Escaneando {len(pares_scan)} pares | Score≥{config.SCORE_MIN}/14 | KZ:{kz['nombre']}")
                 senales = analizar.analizar_todos(pares_scan, workers=config.ANALISIS_WORKERS)
 
                 if senales:
-                    log.info(f"✓ {len(senales)} señal(es) encontradas:")
-                    for s in senales[:10]:
+                    log.info(f"✓ {len(senales)} señal(es):")
+                    for s in senales[:5]:
                         log.info(
                             f"  {s['lado']:5s} {s['par']:15s} "
-                            f"score={s['score']}/12 RSI={s['rsi']:.1f} "
+                            f"score={s['score']}/14 RSI={s['rsi']:.1f} "
                             f"R:R={s['rr']:.2f} KZ={s['kz']} HTF={s.get('htf','?')} "
-                            f"OB={s.get('ob_bull') or s.get('ob_bear')} "
-                            f"BOS={s.get('bos_bull') or s.get('bos_bear')}"
+                            f"patron={s.get('patron','-')} sweep={s.get('sweep_bull') or s.get('sweep_bear')}"
                         )
                 else:
                     log.info("Sin señales este ciclo")
@@ -720,17 +680,14 @@ def main():
                     if s["par"] in estado.posiciones:
                         continue
 
-                    # Ajustar score con aprendizaje
+                    # Ajuste de score con aprendizaje
                     s["score"] = memoria.ajustar_score(
                         s["par"], s["score"],
                         kz=s.get("kz", ""),
                         motivos=s.get("motivos", []),
                     )
                     if s["score"] < config.SCORE_MIN:
-                        log.info(
-                            f"[MEMORIA] {s['par']} score={s['score']} "
-                            f"< {config.SCORE_MIN} (ajustado por historial)"
-                        )
+                        log.info(f"[APRENDE] {s['par']} score={s['score']} < {config.SCORE_MIN}")
                         continue
 
                     ejecutado = ejecutar_senal(s)
@@ -746,8 +703,8 @@ def main():
                 last_reporte = time.time()
 
         except KeyboardInterrupt:
-            log.info("Detenido manualmente (Ctrl+C)")
-            _notif("🛑 *SMC Bot v3.1 detenido manualmente.*")
+            log.info("Detenido (Ctrl+C)")
+            _notif("🛑 *SMC Bot v4.0 detenido manualmente.*")
             break
         except Exception as e:
             log.error(f"ERROR CICLO {ciclo}: {e}\n{traceback.format_exc()}")

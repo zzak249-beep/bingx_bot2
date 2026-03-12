@@ -1,154 +1,148 @@
-# ⚡ SMC Bot BingX v3.1 [CORREGIDO + MEJORADO]
+# ⚡ SMC Bot BingX v4.0 — REAL MONEY | 24/7 | AUTO-LEARN
 
-## 🔧 Fixes críticos aplicados (v3.0 → v3.1)
+## 🧠 Novedades v4.0 vs v3.1
 
-| # | Bug | Causa | Fix |
-|---|-----|-------|-----|
-| 1 | **Sin señales nunca** | `PIVOT_NEAR_PCT=0.20%` → BTC necesitaba estar a ±$160 de un pivot | Subido a `0.80%` → ±$640 de margen real |
-| 2 | **Tendencia MTF bloquea todo** | `trend_ok = EMA_5m AND EMA_1h` — mercados laterales nunca alineaban ambos | Ahora solo bloquea si 1h va en contra (`htf != BEAR` para LONG) |
-| 3 | **SCORE_MIN=5 inalcanzable** | Base obligatoria (FVG+KZ+zona) ya vale 4 pts, con mín 5 nunca pasaba | Bajado a `4` — exige confluencia real sin ser imposible |
-| 4 | **RSI demasiado estricto** | BUY_MAX=50 / SELL_MIN=50 dejaba muy poco margen | BUY_MAX=55 / SELL_MIN=45 |
-| 5 | **Sin debug visible** | No había logging de por qué fallaban las señales | Log DEBUG cuando score≥3 pero no genera señal |
-| 6 | **Backup de memoria** | Sin backup → memoria.json corrompida = pérdida de datos | Backup automático antes de cada guardado |
-| 7 | **Retry en API** | Sin reintentos → errores de red mataban el ciclo | 3 reintentos con backoff en GET/POST |
+| # | Mejora | Descripción |
+|---|--------|-------------|
+| 1 | **Pin Bar + Engulfing** | Detección de patrones de reversión de alta precisión |
+| 2 | **Liquidity Sweeps** | Detecta barrida de stops antes del movimiento real |
+| 3 | **VWAP como filtro** | LONG solo sobre VWAP, SHORT solo bajo VWAP |
+| 4 | **EMA 9/21 local** | Tendencia inmediata de la vela actual |
+| 5 | **Cooldown por par** | Evita señales consecutivas (mín 5 velas = 25min en 5m) |
+| 6 | **ATR7 para SL** | Stop loss más ajustado y preciso en 5m |
+| 7 | **Score /14** | Sistema ampliado de 12 → 14 puntos máximos |
+| 8 | **Momentum confirmador** | Al menos 1 de 2 velas previas debe ir en dirección |
+| 9 | **Compounding mejorado** | Cada $30 ganados → +$1/trade (antes $50) |
+| 10 | **Notificación VWAP** | Telegram muestra posición respecto a VWAP |
 
 ---
 
-## 🚀 Despliegue en Railway
+## 💰 Lógica de Capital
 
-### 1. Subir a GitHub
-```bash
-git init
-git add .
-git commit -m "SMC Bot v3.1 fixed"
-git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
-git push -u origin main
+```
+Base fija:    $10 USDT × 10x = $100 de exposición
+Compounding:  cada $30 ganados netos → +$1 por trade
+Máximo:       $50 USDT × 10x = $500 de exposición
+Capital base: NUNCA se toca, solo se reinvierten ganancias
 ```
 
-### 2. Variables de entorno en Railway
+Ejemplo de progresión:
+- 0 ganado → $10/trade
+- $30 ganado → $11/trade
+- $60 ganado → $12/trade
+- $300 ganado → $20/trade
+
+---
+
+## 🎯 Sistema de Score v4.0 (máximo 14 puntos)
+
+| Confluencia | Puntos | Descripción |
+|-------------|--------|-------------|
+| FVG activo | +2 | Fair Value Gap (obligatorio) |
+| FVG grande | +1 | FVG ≥ 0.3 ATR |
+| Liquidity Sweep | +2 | Barrida de stops + cierre dentro ← NUEVO |
+| Order Block | +2 | Precio dentro del OB |
+| BOS / CHoCH | +1 | Break of Structure / Change of Character |
+| Pin Bar / Engulfing | +2 | Patrón de reversión de alta calidad ← NUEVO |
+| Bull/Bear strong | +1 | Vela de cuerpo >50% |
+| MTF 1h alineado | +1 | EMA21 > EMA50 en 1h |
+| EMA9 + VWAP | +1 | EMA9>21 local Y precio sobre/bajo VWAP ← NUEVO |
+| EMA21/50 5m | +1 | Tendencia en timeframe operativo |
+| RSI favorable | +1 | RSI <68 para LONG, >32 para SHORT |
+| MACD confirmado | +1 | Histograma positivo/negativo |
+| Volumen spike | +1 | Volumen actual ≥1.3× media |
+| Killzone activa | +1 | Asia/London/NY |
+| Zonas S/R | +1 cada | S1/S2/EQL/PP/ASIA_LOW (acumulativas) |
+
+---
+
+## 🔒 Filtros obligatorios para ejecutar
+
+Además del score mínimo, la señal debe cumplir **TODOS**:
+
+1. ✅ Vela confirmadora (cierra en dirección correcta)
+2. ✅ Mecha no excesiva (<40% en dirección contraria)
+3. ✅ Momentum: al menos 1 de las 2 velas previas va en dirección
+4. ✅ RSI < 68 para LONG | RSI > 32 para SHORT
+5. ✅ Cooldown: ≥25 minutos desde última señal en el mismo par
+6. ✅ R:R ≥ 2.0 (recompensa doble del riesgo mínima)
+7. ✅ HTF 1h no va explícitamente en contra
+
+---
+
+## 🚀 Despliegue Railway
+
+### Variables de entorno obligatorias
 
 | Variable | Valor | Descripción |
 |----------|-------|-------------|
 | `BINGX_API_KEY` | `tu_key` | API Key BingX |
-| `BINGX_SECRET_KEY` | `tu_secret` | Secret Key BingX |
-| `TELEGRAM_TOKEN` | `123:ABC...` | Token bot Telegram |
-| `TELEGRAM_CHAT_ID` | `tu_chat_id` | Tu Chat ID |
-| `MODO_DEMO` | `false` | Live trading |
+| `BINGX_SECRET_KEY` | `tu_secret` | Secret Key |
+| `TELEGRAM_TOKEN` | `123:ABC...` | Bot token |
+| `TELEGRAM_CHAT_ID` | `tu_id` | Tu chat ID |
+| `MODO_DEMO` | `false` | LIVE real |
+| `MEMORY_DIR` | `/data` | Railway Volume |
+
+### Variables opcionales (ya tienen defaults óptimos)
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
 | `LEVERAGE` | `10` | Apalancamiento |
-| `MAX_POSICIONES` | `3` | Máx simultáneas |
-| `SCORE_MIN` | `4` | Score mínimo (4-6) |
-| `PIVOT_NEAR_PCT` | `0.80` | ✅ FIX: zona pivot % |
-| `SOLO_LONG` | `false` | Solo longs |
-| `MEMORY_DIR` | `/data` | Dir persistente Railway |
-| `LOG_LEVEL` | `DEBUG` | Para ver no-señales |
+| `SCORE_MIN` | `5` | Puntos mínimos (5-14) |
+| `MAX_POSICIONES` | `3` | Simultáneas |
+| `TRADE_USDT_BASE` | `10.0` | Base por trade |
+| `MIN_RR` | `2.0` | R:R mínimo |
+| `COOLDOWN_VELAS` | `5` | Velas entre señales |
+| `PINBAR_RATIO` | `0.55` | % mecha para Pin Bar |
+| `PARES_BLOQUEADOS` | `RESOLV-USDT` | Separados por coma |
 
-### 3. ✅ Volume para persistencia de memoria
-
-Sin Volume, `memoria.json` se borra en cada redeploy.
-
+### Configurar Railway Volume (persistencia de memoria)
 1. Railway → tu servicio → **Volumes**
 2. **Add Volume** → Mount Path: `/data`
 3. Variable de entorno: `MEMORY_DIR=/data`
 
 ---
 
-## 📊 Sistema de Score v3.1 (máximo 12 puntos)
+## 🧠 Sistema de aprendizaje
 
-### LONG (base obligatoria: FVG + KZ + Zona)
+El bot guarda en `/data/memoria.json`:
 
-| Condición | Puntos | Obligatorio |
-|-----------|--------|-------------|
-| FVG alcista (últimas 20 velas) | +2 | ✅ Base |
-| En Killzone London/NY | +1 | ✅ Base |
-| Cerca de S1/S2/EQL/AsiaLow/OB | +1-2 | ✅ Base (1 mínimo) |
-| Order Block alcista | +2 | Opcional |
-| BOS / CHoCH alcista | +1 | Opcional |
-| MTF 1h = BULL | +1 | Opcional |
-| EMA21 > EMA50 en 5m | +1 | Opcional |
-| RSI ≤ 55 | +1 | Opcional |
-| Vela confirmadora | +1 | Opcional |
+- **Por par**: gana/pierde, PnL acumulado, racha
+  - Blacklist 2h si 3 pérdidas seguidas
+  - Blacklist 4h si WR ≤ 25% (≥6 trades)
+- **Por killzone**: qué sesión tiene mejor historial
+- **Por patrón**: qué combinación de señales funciona mejor
 
-> Con SCORE_MIN=4: necesitas FVG+KZ+zona como base mínima.
-> Con SCORE_MIN=5: necesitas además EMA o RSI o vela.
-> Con SCORE_MIN=6: señales muy selectivas (recomendado para cuentas >$500).
-
-### SHORT (simétrico)
-
-Mismo sistema con FVG bajista + KZ + R1/R2/EQH/AsiaHigh/OB bajista.
+Ajuste dinámico de score:
+- WR ≥ 70% → +2 puntos (par confiable)
+- WR ≥ 60% → +1 punto
+- WR ≤ 35% → -1 punto
+- WR ≤ 25% → -2 puntos (par problemático)
 
 ---
 
-## ⚠️ Gestión de riesgo recomendada
-
-| Parámetro | Inicio | Intermedio | Agresivo |
-|-----------|--------|------------|---------|
-| `LEVERAGE` | 5 | 10 | 15 |
-| `SCORE_MIN` | 5 | 4 | 4 |
-| `MAX_POSICIONES` | 2 | 3 | 5 |
-| `SOLO_LONG` | true | false | false |
-| `MAX_PERDIDA_DIA` | 15 | 25 | 40 |
-| `MIN_RR` | 2.0 | 1.5 | 1.2 |
-
----
-
-## 🕐 Killzones (UTC)
-
-| Sesión | UTC | Para señales | Notas |
-|--------|-----|-------------|-------|
-| 🌙 Asia | 00:00–04:00 | ❌ Solo rango S/R | Se usa como zona de referencia |
-| 🇬🇧 Londres | 07:00–10:00 | ✅ Activo | Mejor con pares EUR/cripto |
-| 🗽 Nueva York | 13:00–16:00 | ✅ Activo | Mayor volumen |
-
----
-
-## 🧠 Sistema de aprendizaje (memoria.py)
-
-El bot aprende de cada trade:
-- **Por par**: ajusta score ±2 según win rate histórico
-- **Por killzone**: ajusta ±1 según rentabilidad por sesión
-- **Por patrón de señales**: ajusta ±1 según combinación de indicadores
-- **Blacklist automática**: 2h si 3 pérdidas seguidas, 4h si 75%+ pérdida ratio
-
-El compounding es conservador: base $10, +$1 por cada $50 ganados, máximo $50.
-
----
-
-## 📁 Estructura de archivos
+## 📁 Archivos
 
 ```
-├── main.py           # Loop principal + gestión de posiciones
-├── analizar.py       # Motor de señales SMC (score 0-12)
-├── config.py         # Todos los parámetros configurables
-├── exchange.py       # API BingX con retry
-├── memoria.py        # Aprendizaje + compounding + persistencia
-├── scanner_pares.py  # Obtiene pares dinámicamente de BingX
-├── config_pares.py   # Pares prioritarios (opcionales)
-├── Procfile          # Railway: worker process
-├── railway.toml      # Configuración Railway
+├── main.py           # Loop 24/7 + gestión posiciones
+├── analizar.py       # Motor SMC v4.0 (score /14 + sweeps + pinbar + vwap)
+├── config.py         # Configuración completa
+├── exchange.py       # API BingX (SL/TP separados, retry)
+├── memoria.py        # Aprendizaje + compounding $10 base
+├── scanner_pares.py  # Pares dinámicos por volumen
+├── config_pares.py   # Pares prioritarios
+├── Procfile          # Railway worker
+├── railway.toml      # Railway config
 └── requirements.txt  # requests + python-dotenv
 ```
 
 ---
 
-## 🐛 Debug de señales
+## ⚠️ Gestión de riesgo
 
-Si el bot escanea pero no da señales, activa `LOG_LEVEL=DEBUG` en Railway.
-Verás logs como:
-```
-[NO-SEÑAL] BTC-USDT | L:3pts(FVG,KZ_NY,EMA) S:2pts(FVG,KZ_NY) |
-base_L=False(fvg=True,kz=True,zona=False) ...
-```
-
-Esto indica qué condición específica falla para cada par.
-
----
-
-## 📈 Historial de versiones
-
-| Versión | Cambios principales |
-|---------|---------------------|
-| v1.0 | Base: FVG + Killzones |
-| v2.0 | Equal Highs/Lows + Pivotes diarios |
-| v2.1 | Fix HMAC + RSI Wilder + SL/TP separados |
-| v3.0 | MTF + Order Blocks + BOS/CHoCH + Rango Asia |
-| **v3.1** | **Fix PIVOT_NEAR_PCT + Fix MTF NEUTRAL + Score min 4 + Debug logging + Retry API** |
+- **Circuit breaker**: pausa 30min si pierde >$20 en el día
+- **Time exit**: cierra posición si lleva >6h sin tocar TP/SL
+- **Anti-hedge**: no abre posición contraria en el mismo par
+- **Anti-correlación**: no abre el mismo lado en pares correlacionados
+- **Trailing stop**: activa cuando el trade avanza 1.2 ATR, sigue a 0.8 ATR
+- **Partial TP**: cierra 50% en TP1 y mueve SL a breakeven
