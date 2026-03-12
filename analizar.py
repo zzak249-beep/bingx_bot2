@@ -885,11 +885,12 @@ def analizar_par(par: str):
 
         # Filtros de precisión obligatorios
         rng_vela      = max(candles[-1]["high"] - candles[-1]["low"], 1e-10)
-        # FIX: mech_ok_long usa CLOSE - LOW (mecha inferior para LONG)
-        mech_ok_long  = (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > 0.40  # cierra en mitad superior
-        mech_ok_short = (candles[-1]["high"] - candles[-1]["close"]) / rng_vela < 0.60  # no mecha superior excesiva
-        conf_long     = candles[-1]["close"] > candles[-1]["open"] and candles[-1]["close"] > candles[-2]["low"]
-        conf_short    = candles[-1]["close"] < candles[-1]["open"] and candles[-1]["close"] < candles[-2]["high"]
+        # v4.1: mech_ok suma +1 al score pero NO bloquea (era demasiado restrictivo)
+        mech_ok_long  = (candles[-1]["close"] - candles[-1]["low"]) / rng_vela > 0.40
+        mech_ok_short = (candles[-1]["high"] - candles[-1]["close"]) / rng_vela < 0.60
+        # v4.1: conf solo requiere vela en dirección (cierre alcista/bajista)
+        conf_long     = candles[-1]["close"] > candles[-1]["open"]
+        conf_short    = candles[-1]["close"] < candles[-1]["open"]
         mom_long      = momentum_ok(candles, "LONG")
         mom_short     = momentum_ok(candles, "SHORT")
         rsi_ok_long   = rsi < config.RSI_BUY_MAX
@@ -903,12 +904,12 @@ def analizar_par(par: str):
 
         if (not config.SOLO_LONG and base_short and
                 sl_short >= score_min and trend_ok_short and
-                conf_short and mech_ok_short and mom_short and rsi_ok_short):
+                conf_short and mom_short and rsi_ok_short):
             if sl_short > sl_long:
                 lado, score, motivos = "SHORT", sl_short, ml_short
 
         if (base_long and sl_long >= score_min and trend_ok_long and
-                conf_long and mech_ok_long and mom_long and rsi_ok_long):
+                conf_long and mom_long and rsi_ok_long):
             if lado is None or sl_long >= sl_short:
                 lado, score, motivos = "LONG", sl_long, ml_long
 
