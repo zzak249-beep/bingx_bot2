@@ -345,7 +345,19 @@ def _detect_hedge_mode(symbol: str) -> bool:
         _hedge_mode_cache[symbol] = False
         return False
 
-    # Auto-detect: intentar leer posiciones y ver el campo positionSide
+    # Auto-detect via BingX dual-side endpoint (más fiable que inferir por posiciones)
+    try:
+        r = _get("/openApi/swap/v2/trade/positionSide/dual")
+        dual = (r.get("data") or {}).get("dualSidePosition", False)
+        is_hedge = bool(dual)
+        # Cachear para TODOS los pares (es configuración de cuenta, no de par)
+        _hedge_mode_cache[symbol] = is_hedge
+        log.info(f"[MODE] Cuenta: {'HEDGE (dual)' if is_hedge else 'ONE-WAY'} via /trade/positionSide/dual")
+        return is_hedge
+    except Exception:
+        pass
+
+    # Fallback: inferir por posiciones abiertas
     try:
         pos = _get("/openApi/swap/v2/user/positions").get("data") or []
         if pos:
@@ -357,10 +369,10 @@ def _detect_hedge_mode(symbol: str) -> bool:
     except Exception:
         pass
 
-    # Fallback: asumir hedge (más seguro)
-    _hedge_mode_cache[symbol] = True
-    log.debug(f"[MODE] {symbol}: asumiendo HEDGE por defecto")
-    return True
+    # FIX: default ONE-WAY (es el default de BingX al crear cuenta nueva)
+    _hedge_mode_cache[symbol] = False
+    log.debug(f"[MODE] {symbol}: asumiendo ONE-WAY por defecto")
+    return False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -509,7 +521,7 @@ def _send_order(symbol: str, side: str, pos_side: str, qty_str: str) -> dict:
 def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
     if config.MODO_DEMO:
         return
-    hedge = _hedge_mode_cache.get(symbol, True)
+    hedge = _hedge_mode_cache.get(symbol, False)  # FIX: default ONE-WAY
     qty_s = _qty_str(qty, symbol)
     close = "SELL" if lado == "LONG" else "BUY"
 
@@ -641,7 +653,7 @@ def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
     cancelar_ordenes_abiertas(symbol)
     time.sleep(0.3)
 
-    hedge  = _hedge_mode_cache.get(symbol, True)
+    hedge  = _hedge_mode_cache.get(symbol, False)  # FIX: default ONE-WAY
     side   = "SELL" if lado == "LONG" else "BUY"
     qty_s  = _qty_str(qty, symbol)
 
@@ -701,7 +713,7 @@ def actualizar_sl(symbol: str, lado: str, qty: float, nuevo_sl: float):
         return
     cancelar_ordenes_abiertas(symbol)
     time.sleep(0.3)
-    hedge = _hedge_mode_cache.get(symbol, True)
+    hedge = _hedge_mode_cache.get(symbol, False)  # FIX: default ONE-WAY
     qty_s = _qty_str(qty, symbol)
     close = "SELL" if lado == "LONG" else "BUY"
     p = {
