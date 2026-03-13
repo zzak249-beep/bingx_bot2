@@ -381,20 +381,32 @@ def set_leverage(symbol: str, leverage: int) -> bool:
     if config.MODO_DEMO:
         return True
     hedge = _detect_hedge_mode(symbol)
+
     if hedge:
         sides = ["LONG", "SHORT"]
     else:
-        sides = ["LONG"]  # en one-way solo importa uno
+        # ONE-WAY: algunos endpoints de BingX aceptan solo LONG en oneway
+        sides = ["LONG"]
 
     ok = True
     for side in sides:
-        r = _post("/openApi/swap/v2/trade/leverage",
-                  {"symbol": symbol, "side": side, "leverage": str(leverage)})
+        r    = _post("/openApi/swap/v2/trade/leverage",
+                     {"symbol": symbol, "side": side, "leverage": str(leverage)})
         code = r.get("code", 0)
-        if code != 0 and code not in (80012, 80014, 109400):
-            # 80012 = leverage ya está seteado, ignorar
-            log.debug(f"set_leverage {symbol} {side}: code={code} msg={r.get('msg','')[:60]}")
-            ok = False
+        if code not in (0, 80012, 80014, 109400):
+            # 80012 = leverage ya seteado, 80014 = leverage sin cambios
+            log.debug(f"set_leverage {symbol} {side} {leverage}x: code={code} {r.get('msg','')[:60]}")
+            # Intentar leverage menor si excede el máximo del par
+            for lev in (5, 3, 2, 1):
+                if lev >= leverage:
+                    continue
+                r2 = _post("/openApi/swap/v2/trade/leverage",
+                           {"symbol": symbol, "side": side, "leverage": str(lev)})
+                if r2.get("code", 0) in (0, 80012):
+                    log.info(f"[LEV] {symbol} usando {lev}x (máximo del par)")
+                    break
+            else:
+                ok = False
     return ok
 
 
@@ -470,47 +482,58 @@ def _price_str(price: float, symbol: str = "") -> str:
 # ORDEN PRINCIPAL  (con fallback hedge → one-way)
 # ══════════════════════════════════════════════════════════════
 def _send_order(symbol: str, side: str, pos_side: str, qty_str: str) -> dict:
+    """
+    FIX CRÍTICO: BingX ONE-WAY no acepta positionSide en absoluto (ni BOTH ni LONG/SHORT).
+    En ONE-WAY: enviar SOLO symbol+side+type+quantity.
+    En HEDGE: enviar positionSide=LONG/SHORT.
+    """
     if symbol in _pares_no_soportados:
         return {"code": -999, "msg": f"{symbol} no soportado por API"}
 
     hedge = _detect_hedge_mode(symbol)
 
     if not hedge:
-        # ONE-WAY MODE
+        # ONE-WAY MODE — NO enviar positionSide
         r = _post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": side,
-            "positionSide": "BOTH",
-            "type": "MARKET", "quantity": qty_str,
+            "symbol":   symbol,
+            "side":     side,
+            "type":     "MARKET",
+            "quantity": qty_str,
         })
-        if r.get("code", 0) != 0:
-            _bloquear_par(symbol, f"oneway code={r.get('code')}")
+        code = r.get("code", 0)
+        if code != 0:
+            msg = r.get("msg", "")
+            log.warning(f"[ORDER] {symbol} oneway falló code={code} msg={msg[:80]}")
+            # Solo bloquear permanente si el par explícitamente no existe
+            if code in (-999, 80017, 100001):
+                _bloquear_par(symbol, f"par inválido code={code}")
         return r
 
-    # HEDGE MODE
-    params = {
-        "symbol": symbol, "side": side,
+    # HEDGE MODE — enviar positionSide=LONG/SHORT
+    res  = _post("/openApi/swap/v2/trade/order", {
+        "symbol":       symbol,
+        "side":         side,
         "positionSide": pos_side,
-        "type": "MARKET", "quantity": qty_str,
-    }
-    res  = _post("/openApi/swap/v2/trade/order", params)
+        "type":         "MARKET",
+        "quantity":     qty_str,
+    })
     code = res.get("code", 0)
 
-    if code in (109400, 80001, 80014, 100400, -1, 80012):
-        # Probablemente one-way — actualizar caché y reintentar
-        log.info(f"[ORDER] {symbol} hedge→BOTH fallback (code={code})")
+    if code != 0:
+        # Posiblemente la cuenta es one-way — reintentar sin positionSide
+        log.info(f"[ORDER] {symbol} hedge falló code={code}, probando one-way sin positionSide")
         _hedge_mode_cache[symbol] = False
         res2 = _post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": side,
-            "positionSide": "BOTH",
-            "type": "MARKET", "quantity": qty_str,
+            "symbol":   symbol,
+            "side":     side,
+            "type":     "MARKET",
+            "quantity": qty_str,
         })
         if res2.get("code", 0) != 0:
-            _bloquear_par(symbol, f"hedge={code} both={res2.get('code')}")
+            log.warning(f"[ORDER] {symbol} también falló en one-way: {res2.get('msg','')[:60]}")
         return res2
 
-    if code == 0:
-        _hedge_mode_cache[symbol] = True
-
+    _hedge_mode_cache[symbol] = True
     return res
 
 
@@ -525,32 +548,28 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
     close = "SELL" if lado == "LONG" else "BUY"
 
     for order_type, price in [("STOP_MARKET", sl), ("TAKE_PROFIT_MARKET", tp)]:
+        # Intento 1: con reduceOnly (funciona en ambos modos si no hay positionSide en one-way)
         p = {
             "symbol":      symbol,
             "side":        close,
             "type":        order_type,
-            "quantity":    qty_s,
-            "stopPrice":   _price_str(price, symbol),   # FIX#10
+            "stopPrice":   _price_str(price, symbol),
             "workingType": "MARK_PRICE",
-            "reduceOnly":  "true",                      # FIX#3 — CRÍTICO
+            "reduceOnly":  "true",
         }
         if hedge:
             p["positionSide"] = lado
+            p.pop("reduceOnly", None)  # HEDGE no usa reduceOnly, usa positionSide
+        else:
+            # ONE-WAY: NO enviar positionSide
+            p["quantity"] = qty_s
 
         r = _post("/openApi/swap/v2/trade/order", p)
         code = r.get("code", 0)
 
-        if code != 0 and hedge:
-            # Reintentar sin positionSide (one-way fallback)
-            p2 = dict(p)
-            p2.pop("positionSide", None)
-            p2["positionSide"] = "BOTH"
-            r = _post("/openApi/swap/v2/trade/order", p2)
-            code = r.get("code", 0)
-
         if code != 0:
-            # Último intento: closePosition en lugar de quantity
-            p3 = {
+            # Intento 2: closePosition=true (más simple, funciona en ambos modos)
+            p2 = {
                 "symbol":        symbol,
                 "side":          close,
                 "type":          order_type,
@@ -559,13 +578,14 @@ def _place_sl_tp(symbol: str, lado: str, qty: float, sl: float, tp: float):
                 "workingType":   "MARK_PRICE",
             }
             if hedge:
-                p3["positionSide"] = lado
-            r = _post("/openApi/swap/v2/trade/order", p3)
+                p2["positionSide"] = lado
+            r = _post("/openApi/swap/v2/trade/order", p2)
+            code = r.get("code", 0)
 
         if r.get("code", 0) == 0:
             log.info(f"  ✅ {order_type} {symbol} {lado} @ {price:.8g}")
         else:
-            log.error(f"  ❌ {order_type} {symbol}: {r.get('msg','')[:80]}")
+            log.warning(f"  ⚠️ {order_type} {symbol} no colocado (bot gestiona via polling): {r.get('msg','')[:60]}")
 
     log.info(f"✅ SL/TP colocados {symbol} {lado} | SL={sl:.8g} TP={tp:.8g}")
 
@@ -648,50 +668,36 @@ def cerrar_posicion(symbol: str, qty: float, lado: str) -> dict:
     if config.MODO_DEMO:
         return {"precio_salida": get_precio(symbol)}
 
-    # Cancelar SL/TP pendientes primero para evitar conflictos
     cancelar_ordenes_abiertas(symbol)
     time.sleep(0.3)
 
-    hedge  = _hedge_mode_cache.get(symbol, False)
-    side   = "SELL" if lado == "LONG" else "BUY"
-    qty_s  = _qty_str(qty, symbol)
+    hedge = _hedge_mode_cache.get(symbol, False)
+    side  = "SELL" if lado == "LONG" else "BUY"
+    qty_s = _qty_str(qty, symbol)
 
-    # Intento 1: con positionSide y reduceOnly
-    p = {
-        "symbol":     symbol,
-        "side":       side,
-        "type":       "MARKET",
-        "quantity":   qty_s,
-        "reduceOnly": "true",           # FIX#3
-    }
+    # Intento 1: reduceOnly (one-way) o positionSide (hedge)
     if hedge:
-        p["positionSide"] = lado
+        p = {"symbol": symbol, "side": side, "type": "MARKET",
+             "quantity": qty_s, "positionSide": lado}
+    else:
+        # ONE-WAY: NO positionSide, usar reduceOnly
+        p = {"symbol": symbol, "side": side, "type": "MARKET",
+             "quantity": qty_s, "reduceOnly": "true"}
 
     res  = _post("/openApi/swap/v2/trade/order", p)
     code = res.get("code", 0)
 
     if code != 0:
-        # Intento 2: closePosition=true (FIX#4)
-        p2 = {
-            "symbol":        symbol,
-            "side":          side,
-            "type":          "MARKET",
-            "closePosition": "true",
-        }
+        # Intento 2: closePosition=true sin positionSide (funciona en one-way)
+        p2 = {"symbol": symbol, "side": side, "type": "MARKET", "closePosition": "true"}
         if hedge:
             p2["positionSide"] = lado
         res  = _post("/openApi/swap/v2/trade/order", p2)
         code = res.get("code", 0)
 
-    if code != 0 and hedge:
-        # Intento 3: one-way fallback
-        p3 = {
-            "symbol":        symbol,
-            "side":          side,
-            "type":          "MARKET",
-            "closePosition": "true",
-            "positionSide":  "BOTH",
-        }
+    if code != 0:
+        # Intento 3: closePosition sin nada más (último recurso)
+        p3 = {"symbol": symbol, "side": side, "type": "MARKET", "closePosition": "true"}
         res  = _post("/openApi/swap/v2/trade/order", p3)
         code = res.get("code", 0)
 
