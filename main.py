@@ -765,17 +765,11 @@ def main():
                     if resultado == "skip":
                         continue
 
-                    # Error de API → loguear, Telegram solo primeros 3 por ciclo
+                    # Error de API → SOLO log, NO Telegram (evitar spam masivo)
                     if resultado and resultado.startswith("error:"):
                         log.error(f"[API-ERR] {s['par']}: {resultado[6:]}")
                         if not exchange.par_es_soportado(s["par"]):
-                            log.warning(f"[BLOCKED] {s['par']} bloqueado tras fallo")
-                        # FIX anti-spam: máx 3 notificaciones de error por ciclo
-                        if not hasattr(main, '_errores_ciclo'):
-                            main._errores_ciclo = 0
-                        if main._errores_ciclo < 3:
-                            _notif(f"🚨 *Orden fallida {s['lado']} `{s['par']}`*\n❌ `{resultado[6:80]}`")
-                            main._errores_ciclo += 1
+                            log.warning(f"[BLOCKED] {s['par']} bloqueado permanentemente")
                         continue
 
                     # bloq:MAX_POSICIONES → no notificar señal (evitar spam)
