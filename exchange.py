@@ -101,8 +101,9 @@ _cargar_no_soportados()
 # FIRMA  ← FIX#1: recvWindow incluido en todas las peticiones
 # ══════════════════════════════════════════════════════════════
 def _sign(params: dict) -> str:
-    # FIX: NO sorted() — BingX verifica sobre el query string TAL COMO llega en la URL
-    # sorted() produce orden diferente al que requests envia → code=100001 "Signature mismatch"
+    # BingX firma sobre el query string en el orden exacto de los parámetros.
+    # requests.get/post con params= reordena alfabéticamente → firma inválida.
+    # Solución: construir el query string manualmente y ponerlo en la URL directamente.
     query = "&".join(f"{k}={v}" for k, v in params.items())
     return hmac.new(
         config.BINGX_SECRET_KEY.encode(),
@@ -113,22 +114,28 @@ def _sign(params: dict) -> str:
 def _headers() -> dict:
     return {"X-BX-APIKEY": config.BINGX_API_KEY}
 
+def _build_url(path: str, params: dict) -> str:
+    """Construye la URL con firma, manteniendo el orden exacto de params."""
+    p = dict(params)
+    p["timestamp"]  = _ts()
+    p["recvWindow"] = 5000
+    p["signature"]  = _sign(p)
+    qs = "&".join(f"{k}={v}" for k, v in p.items())
+    return f"{BASE_URL}{path}?{qs}"
+
 def _add_auth(params: dict) -> dict:
     """Añade timestamp, recvWindow y signature. Modifica y devuelve params."""
     params["timestamp"]  = _ts()
-    params["recvWindow"] = 5000          # FIX#1 — 5 segundos de ventana
+    params["recvWindow"] = 5000
     params["signature"]  = _sign(params)
     return params
 
 
 def _get(path: str, params: dict = None, retries: int = 3) -> dict:
-    params = _add_auth(params or {})
+    url = _build_url(path, params or {})
     for attempt in range(retries):
         try:
-            r = _SESSION.get(
-                BASE_URL + path, params=params,
-                headers=_headers(), timeout=12,
-            )
+            r    = _SESSION.get(url, headers=_headers(), timeout=12)
             data = r.json()
             if data.get("code", 0) != 0 and attempt == 0:
                 log.debug(f"GET {path} code={data.get('code')} msg={data.get('msg','')[:80]}")
@@ -137,30 +144,29 @@ def _get(path: str, params: dict = None, retries: int = 3) -> dict:
             log.error(f"GET {path} [{attempt+1}/{retries}]: {e}")
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
+                url = _build_url(path, params or {})  # regenerar con nuevo timestamp
     return {}
 
 
 def _post(path: str, params: dict = None, retries: int = 3) -> dict:
-    params = _add_auth(params or {})
+    url = _build_url(path, params or {})
     for attempt in range(retries):
         try:
-            r = _SESSION.post(
-                BASE_URL + path, params=params,
-                headers=_headers(), timeout=12,
-            )
+            r    = _SESSION.post(url, headers=_headers(), timeout=12)
             data = r.json()
-            # FIX#5: log completo en errores para diagnóstico
+            # log completo en errores para diagnóstico
             if data.get("code", 0) != 0:
                 log.warning(
                     f"POST {path} ERROR code={data.get('code')} "
                     f"msg='{data.get('msg','')[:120]}' "
-                    f"params_keys={list(params.keys())}"
+                    f"params_keys={list((params or {}).keys())}"
                 )
             return data
         except Exception as e:
             log.error(f"POST {path} [{attempt+1}/{retries}]: {e}")
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
+                url = _build_url(path, params or {})  # regenerar con nuevo timestamp
     return {}
 
 
@@ -382,30 +388,33 @@ def set_leverage(symbol: str, leverage: int) -> bool:
         return True
     hedge = _detect_hedge_mode(symbol)
 
-    if hedge:
-        sides = ["LONG", "SHORT"]
-    else:
-        # ONE-WAY: algunos endpoints de BingX aceptan solo LONG en oneway
-        sides = ["LONG"]
+    # ONE-WAY: BingX no requiere setear leverage por lado — solo LONG es suficiente
+    # HEDGE: hay que setear LONG y SHORT por separado
+    sides = ["LONG", "SHORT"] if hedge else ["LONG"]
 
     ok = True
     for side in sides:
         r    = _post("/openApi/swap/v2/trade/leverage",
                      {"symbol": symbol, "side": side, "leverage": str(leverage)})
         code = r.get("code", 0)
-        if code not in (0, 80012, 80014, 109400):
-            # 80012 = leverage ya seteado, 80014 = leverage sin cambios
-            log.debug(f"set_leverage {symbol} {side} {leverage}x: code={code} {r.get('msg','')[:60]}")
-            # Intentar leverage menor si excede el máximo del par
-            for lev in (5, 3, 2, 1):
-                if lev >= leverage:
-                    continue
-                r2 = _post("/openApi/swap/v2/trade/leverage",
-                           {"symbol": symbol, "side": side, "leverage": str(lev)})
-                if r2.get("code", 0) in (0, 80012):
-                    log.info(f"[LEV] {symbol} usando {lev}x (máximo del par)")
-                    break
-            else:
+        if code in (0, 80012, 80014):
+            # 0=ok, 80012=leverage ya seteado, 80014=sin cambios — todo bien
+            continue
+        # 109400 ya NO es aceptable — significa parámetros inválidos
+        log.warning(f"set_leverage {symbol} {side} {leverage}x: code={code} {r.get('msg','')[:80]}")
+        # Intentar leverage menor si el par tiene límite inferior
+        for lev in (5, 3, 2, 1):
+            if lev >= leverage:
+                continue
+            r2 = _post("/openApi/swap/v2/trade/leverage",
+                       {"symbol": symbol, "side": side, "leverage": str(lev)})
+            if r2.get("code", 0) in (0, 80012):
+                log.info(f"[LEV] {symbol} {side} usando {lev}x (máximo del par)")
+                break
+        else:
+            # Si ningún leverage funciona, marcar el par como no soportado
+            if code == 109400:
+                log.warning(f"[LEV] {symbol} no acepta leverage — posible par inválido, saltando")
                 ok = False
     return ok
 
@@ -613,8 +622,18 @@ def abrir_long(symbol: str, qty: float, precio: float, sl: float, tp: float) -> 
         return {"fill_price": precio, "executedQty": qty, "orderId": "demo_long"}
     if symbol in _pares_no_soportados:
         return {"error": f"{symbol} no soportado por API"}
+    # Guardia: precio/sl/tp deben ser positivos y coherentes
+    if precio <= 0 or sl <= 0 or tp <= 0:
+        return {"error": f"precio/SL/TP inválidos: precio={precio:.8g} sl={sl:.8g} tp={tp:.8g}"}
+    if sl >= precio:
+        return {"error": f"SL={sl:.8g} >= precio={precio:.8g} — señal inválida LONG"}
+    if tp <= precio:
+        return {"error": f"TP={tp:.8g} <= precio={precio:.8g} — señal inválida LONG"}
 
-    set_leverage(symbol, config.LEVERAGE)
+    lev_ok = set_leverage(symbol, config.LEVERAGE)
+    if not lev_ok:
+        return {"error": f"set_leverage falló para {symbol} — par posiblemente inválido"}
+
     qty_s = _qty_str(qty, symbol)
     log.info(f"[ORDER] LONG {symbol} qty={qty_s} @ ~{precio:.8g} | SL={sl:.8g} TP={tp:.8g}")
 
@@ -641,8 +660,18 @@ def abrir_short(symbol: str, qty: float, precio: float, sl: float, tp: float) ->
         return {"fill_price": precio, "executedQty": qty, "orderId": "demo_short"}
     if symbol in _pares_no_soportados:
         return {"error": f"{symbol} no soportado por API"}
+    # Guardia: precio/sl/tp deben ser positivos y coherentes
+    if precio <= 0 or sl <= 0 or tp <= 0:
+        return {"error": f"precio/SL/TP inválidos: precio={precio:.8g} sl={sl:.8g} tp={tp:.8g}"}
+    if sl <= precio:
+        return {"error": f"SL={sl:.8g} <= precio={precio:.8g} — señal inválida SHORT"}
+    if tp >= precio:
+        return {"error": f"TP={tp:.8g} >= precio={precio:.8g} — señal inválida SHORT"}
 
-    set_leverage(symbol, config.LEVERAGE)
+    lev_ok = set_leverage(symbol, config.LEVERAGE)
+    if not lev_ok:
+        return {"error": f"set_leverage falló para {symbol} — par posiblemente inválido"}
+
     qty_s = _qty_str(qty, symbol)
     log.info(f"[ORDER] SHORT {symbol} qty={qty_s} @ ~{precio:.8g} | SL={sl:.8g} TP={tp:.8g}")
 
