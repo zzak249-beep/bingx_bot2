@@ -825,6 +825,17 @@ def analizar_par(par: str):
             log.debug(f"[R:R] {par} {rr:.2f} < mín {config.MIN_RR}")
             return None
 
+        # ── Guardia final: valores coherentes ──────────────────
+        if precio <= 0 or sl <= 0 or tp <= 0:
+            log.warning(f"[GUARD] {par} precio/SL/TP inválidos: p={precio} sl={sl} tp={tp}")
+            return None
+        if lado == "LONG" and (sl >= precio or tp <= precio):
+            log.warning(f"[GUARD] {par} LONG incoherente: p={precio:.8g} sl={sl:.8g} tp={tp:.8g}")
+            return None
+        if lado == "SHORT" and (sl <= precio or tp >= precio):
+            log.warning(f"[GUARD] {par} SHORT incoherente: p={precio:.8g} sl={sl:.8g} tp={tp:.8g}")
+            return None
+
         registrar_senal_ts(par)
 
         return {
