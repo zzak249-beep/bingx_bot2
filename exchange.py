@@ -28,7 +28,8 @@ _contract_cache: dict     = {}   # par → {step, dec, price_dec}
 _contract_cache_ts: float = 0
 _pares_no_soportados: set = set()
 _CONTRATOS_FUTURES: set   = set()
-_time_offset: int         = 0    # FIX#2: offset ms entre reloj local y BingX
+_time_offset: int         = 0    # offset ms entre reloj local y BingX
+_leverage_ok: dict        = {}   # par → leverage seteado (caché para no repetir llamadas)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -386,10 +387,14 @@ def _detect_hedge_mode(symbol: str) -> bool:
 def set_leverage(symbol: str, leverage: int) -> bool:
     if config.MODO_DEMO:
         return True
-    hedge = _detect_hedge_mode(symbol)
+    # Caché: si ya seteamos este leverage para este par, no repetir la llamada
+    if _leverage_ok.get(symbol) == leverage:
+        return True
+    # Si el par está bloqueado, no intentar
+    if symbol in _pares_no_soportados:
+        return False
 
-    # ONE-WAY: BingX no requiere setear leverage por lado — solo LONG es suficiente
-    # HEDGE: hay que setear LONG y SHORT por separado
+    hedge = _detect_hedge_mode(symbol)
     sides = ["LONG", "SHORT"] if hedge else ["LONG"]
 
     ok = True
@@ -398,11 +403,11 @@ def set_leverage(symbol: str, leverage: int) -> bool:
                      {"symbol": symbol, "side": side, "leverage": str(leverage)})
         code = r.get("code", 0)
         if code in (0, 80012, 80014):
-            # 0=ok, 80012=leverage ya seteado, 80014=sin cambios — todo bien
+            # 0=ok, 80012=ya seteado, 80014=sin cambios — todo bien
             continue
-        # 109400 ya NO es aceptable — significa parámetros inválidos
         log.warning(f"set_leverage {symbol} {side} {leverage}x: code={code} {r.get('msg','')[:80]}")
         # Intentar leverage menor si el par tiene límite inferior
+        lev_usado = None
         for lev in (5, 3, 2, 1):
             if lev >= leverage:
                 continue
@@ -410,12 +415,16 @@ def set_leverage(symbol: str, leverage: int) -> bool:
                        {"symbol": symbol, "side": side, "leverage": str(lev)})
             if r2.get("code", 0) in (0, 80012):
                 log.info(f"[LEV] {symbol} {side} usando {lev}x (máximo del par)")
+                lev_usado = lev
                 break
-        else:
-            # Si ningún leverage funciona, marcar el par como no soportado
-            if code == 109400:
-                log.warning(f"[LEV] {symbol} no acepta leverage — posible par inválido, saltando")
-                ok = False
+        if lev_usado is None:
+            # Ningún leverage funcionó — par inválido, bloquear permanentemente
+            _bloquear_par(symbol, f"leverage imposible code={code}")
+            ok = False
+            break
+
+    if ok:
+        _leverage_ok[symbol] = leverage
     return ok
 
 
