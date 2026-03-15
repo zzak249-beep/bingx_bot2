@@ -102,3 +102,7 @@ def validar() -> list:
     if not BINGX_SECRET_KEY: e.append("BINGX_SECRET_KEY no configurada")
     if TRADE_USDT_BASE <= 0: e.append("TRADE_USDT_BASE debe ser > 0")
     return e
+
+# ─── Modo hedge/oneway BingX ────────────────────────
+BINGX_MODE = os.getenv("BINGX_MODE", "hedge")  # "hedge" o "oneway"
+

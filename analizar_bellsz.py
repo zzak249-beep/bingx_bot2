@@ -9,6 +9,7 @@ Lógica replicada exactamente del Pine Script "Liquidez Lateral [Bellsz]"
 """
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
 import concurrent.futures
@@ -510,11 +511,13 @@ def analizar_par(par: str):
             return None
 
         atr = calc_atr(hi, lo, cl, config.ATR_PERIOD)
-        if atr <= 0 or atr / precio * 100 < 0.03:
+        atr_min_pct = float(os.getenv("ATR_MIN_PCT", "0.02"))
+        if atr <= 0 or atr / precio * 100 < atr_min_pct:
             return None
 
         adx = calc_adx(hi, lo, cl)
-        if adx < 12:
+        adx_min = float(os.getenv("ADX_MIN", "8"))
+        if adx < adx_min:
             return None
 
         # ── CAPA 1: PURGAS (primero — filtro principal) ────
