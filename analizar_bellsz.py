@@ -237,7 +237,8 @@ def detectar_purga(candles: list, niveles: dict, precio: float) -> dict:
                 "purga_nivel": "", "purga_peso": 0}
 
     c = candles[-1]
-    margen = precio * config.LIQ_MARGEN / 100
+    # LIQ_MARGEN = 0.001 significa 0.1% → multiplicar directo, sin /100
+    margen = precio * config.LIQ_MARGEN
 
     purga_alcista = False
     purga_bajista = False
@@ -245,51 +246,65 @@ def detectar_purga(candles: list, niveles: dict, precio: float) -> dict:
     purga_peso    = 0
 
     # ── PURGAS ALCISTAS (compra) ──────────────────────────────
+    purga_nivel_l = ""
+    purga_nivel_s = ""
+
     # H1 ssl
     ssl_h1 = niveles.get("ssl_h1", 0)
-    if ssl_h1 > 0 and c["low"] <= ssl_h1 * (1 + margen) and c["close"] > ssl_h1:
+    if ssl_h1 > 0 and c["low"] <= ssl_h1 + margen and c["close"] > ssl_h1:
         purga_alcista = True
-        purga_nivel  += "SSL_H1 "
+        purga_nivel_l += "SSL_H1 "
         purga_peso   += 1
 
     # H4 ssl — más peso
     ssl_h4 = niveles.get("ssl_h4", 0)
-    if ssl_h4 > 0 and c["low"] <= ssl_h4 * (1 + margen) and c["close"] > ssl_h4:
+    if ssl_h4 > 0 and c["low"] <= ssl_h4 + margen and c["close"] > ssl_h4:
         purga_alcista = True
-        purga_nivel  += "SSL_H4 "
+        purga_nivel_l += "SSL_H4 "
         purga_peso   += 2
 
     # Diario ssl — máximo peso
     ssl_d = niveles.get("ssl_d", 0)
-    if ssl_d > 0 and c["low"] <= ssl_d * (1 + margen) and c["close"] > ssl_d:
+    if ssl_d > 0 and c["low"] <= ssl_d + margen and c["close"] > ssl_d:
         purga_alcista = True
-        purga_nivel  += "SSL_D "
+        purga_nivel_l += "SSL_D "
         purga_peso   += 3
 
     # ── PURGAS BAJISTAS (venta) ───────────────────────────────
     bsl_h1 = niveles.get("bsl_h1", 0)
-    if bsl_h1 > 0 and c["high"] >= bsl_h1 * (1 - margen) and c["close"] < bsl_h1:
+    if bsl_h1 > 0 and c["high"] >= bsl_h1 - margen and c["close"] < bsl_h1:
         purga_bajista = True
-        purga_nivel  += "BSL_H1 "
+        purga_nivel_s += "BSL_H1 "
         purga_peso   += 1
 
     bsl_h4 = niveles.get("bsl_h4", 0)
-    if bsl_h4 > 0 and c["high"] >= bsl_h4 * (1 - margen) and c["close"] < bsl_h4:
+    if bsl_h4 > 0 and c["high"] >= bsl_h4 - margen and c["close"] < bsl_h4:
         purga_bajista = True
-        purga_nivel  += "BSL_H4 "
+        purga_nivel_s += "BSL_H4 "
         purga_peso   += 2
 
     bsl_d = niveles.get("bsl_d", 0)
-    if bsl_d > 0 and c["high"] >= bsl_d * (1 - margen) and c["close"] < bsl_d:
+    if bsl_d > 0 and c["high"] >= bsl_d - margen and c["close"] < bsl_d:
         purga_bajista = True
-        purga_nivel  += "BSL_D "
+        purga_nivel_s += "BSL_D "
         purga_peso   += 3
 
+    # Nivel combinado para log/notif — el más relevante gana
+    if purga_alcista and purga_bajista:
+        # Doble purga — usar la de más peso para el log
+        purga_nivel = purga_nivel_l.strip() if purga_peso >= 2 else purga_nivel_s.strip()
+    elif purga_alcista:
+        purga_nivel = purga_nivel_l.strip()
+    else:
+        purga_nivel = purga_nivel_s.strip()
+
     return {
-        "purga_alcista": purga_alcista,
-        "purga_bajista": purga_bajista,
-        "purga_nivel":   purga_nivel.strip(),
-        "purga_peso":    purga_peso,
+        "purga_alcista":  purga_alcista,
+        "purga_bajista":  purga_bajista,
+        "purga_nivel":    purga_nivel,
+        "purga_nivel_l":  purga_nivel_l.strip(),
+        "purga_nivel_s":  purga_nivel_s.strip(),
+        "purga_peso":     purga_peso,
     }
 
 
@@ -352,9 +367,11 @@ def confirmar_rsi(closes: list) -> dict:
     momentum_bull = rsi_ema3 is not None and rsi_val > rsi_ema3
     momentum_bear = rsi_ema3 is not None and rsi_val < rsi_ema3
 
+    # ok_long/ok_short son INDEPENDIENTES del momentum
+    # El momentum suma puntos extra en el score, pero no bloquea la señal base
     return {
-        "ok_long":       ok_long and momentum_bull,
-        "ok_short":      ok_short and momentum_bear,
+        "ok_long":       ok_long,
+        "ok_short":      ok_short,
         "momentum_bull": momentum_bull,
         "momentum_bear": momentum_bear,
         "valor":         rsi_val,
@@ -669,17 +686,24 @@ def analizar_par(par: str):
         if atr <= 0 or atr / precio * 100 < 0.03:
             return None
 
-        # ── ADX: evitar mercados completamente planos ──────────
-        adx = calc_adx(hi, lo, cl)
-        if adx < 15:
-            log.debug(f"[SKIP] {par} ADX={adx:.1f} — demasiado lateral")
-            return None
-
         # ══════════════════════════════════════════════════════
         # CAPA 1 — LIQUIDEZ (purga de BSL/SSL)
         # ══════════════════════════════════════════════════════
+        # Inyectar margen adaptativo en config temporal para esta llamada
+        _atr_pct = atr / precio  # p.ej 0.003 = 0.3%
+        _margen_orig = config.LIQ_MARGEN
+        # Usar el mayor entre el margen config y 0.5× ATR%
+        # Así en coins muy volátiles (ATR 1%) el margen se adapta
+        config.LIQ_MARGEN = max(config.LIQ_MARGEN, _atr_pct * 0.5)
         niveles = get_niveles_liquidez(par)
         purga   = detectar_purga(candles, niveles, precio)
+        config.LIQ_MARGEN = _margen_orig  # restaurar
+
+        # ── ADX: evitar mercados completamente planos ──────────
+        adx = calc_adx(hi, lo, cl)
+        if adx < 12:
+            log.debug(f"[SKIP] {par} ADX={adx:.1f} — demasiado lateral")
+            return None
 
         # Sin purga = sin señal (núcleo de Bellsz)
         if not purga["purga_alcista"] and not purga["purga_bajista"]:
@@ -739,12 +763,14 @@ def analizar_par(par: str):
                 if side in ("S", "B"): ss_pts += pts; ms.append(lbl)
 
         # Capa 1 — purgas (núcleo Bellsz)
-        add(purga["purga_alcista"] and "H1" in purga["purga_nivel"], 1, "PURGA_SSL_H1", "L")
-        add(purga["purga_alcista"] and "H4" in purga["purga_nivel"], 2, "PURGA_SSL_H4", "L")
-        add(purga["purga_alcista"] and "_D"  in purga["purga_nivel"], 3, "PURGA_SSL_D",  "L")
-        add(purga["purga_bajista"] and "H1" in purga["purga_nivel"], 1, "PURGA_BSL_H1", "S")
-        add(purga["purga_bajista"] and "H4" in purga["purga_nivel"], 2, "PURGA_BSL_H4", "S")
-        add(purga["purga_bajista"] and "_D"  in purga["purga_nivel"], 3, "PURGA_BSL_D",  "S")
+        pnl = purga.get("purga_nivel_l", "")
+        pns = purga.get("purga_nivel_s", "")
+        add(purga["purga_alcista"] and "H1" in pnl, 1, "PURGA_SSL_H1", "L")
+        add(purga["purga_alcista"] and "H4" in pnl, 2, "PURGA_SSL_H4", "L")
+        add(purga["purga_alcista"] and "_D"  in pnl, 3, "PURGA_SSL_D",  "L")
+        add(purga["purga_bajista"] and "H1" in pns, 1, "PURGA_BSL_H1", "S")
+        add(purga["purga_bajista"] and "H4" in pns, 2, "PURGA_BSL_H4", "S")
+        add(purga["purga_bajista"] and "_D"  in pns, 3, "PURGA_BSL_D",  "S")
 
         # Capa 2 — EMA
         add(ema_conf["cruce_bull"],                      2, "CRUCE_EMA_BULL", "L")
@@ -817,11 +843,13 @@ def analizar_par(par: str):
 
         if lado is None:
             if sl_pts >= 3 or ss_pts >= 3:
-                log.debug(
+                log.info(
                     f"[NO-SENAL] {par} L:{sl_pts}({','.join(ml[:5])}) "
                     f"S:{ss_pts}({','.join(ms[:5])}) "
-                    f"purga_L={purga['purga_alcista']} purga_S={purga['purga_bajista']} "
-                    f"ema_L={ema_conf['bull']} rsi_L={rsi_conf['ok_long']} htf={htf}"
+                    f"purga_L={purga['purga_alcista']}({purga.get('purga_nivel_l','')}) "
+                    f"purga_S={purga['purga_bajista']}({purga.get('purga_nivel_s','')}) "
+                    f"ema_bull={ema_conf['bull']} ema_bear={ema_conf['bear']} "
+                    f"rsi={rsi_conf['valor']:.1f} htf={htf}"
                 )
             return None
 
