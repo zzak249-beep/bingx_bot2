@@ -585,6 +585,7 @@ def enviar_reporte(balance):
 # ══════════════════════════════════════════════════════
 
 def main():
+    global _opt_ok
     log.info("=" * 65)
     log.info(f"  {config.VERSION}")
     log.info(f"  TRADE: ${config.TRADE_USDT_BASE} × {config.LEVERAGE}x | MAX: ${config.TRADE_USDT_MAX}")
