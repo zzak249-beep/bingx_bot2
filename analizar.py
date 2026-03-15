@@ -13,6 +13,11 @@ FIXES v4.3:
 import logging
 from datetime import datetime, timezone
 import concurrent.futures
+try:
+    import liquidez as _liq
+    _LIQ_OK = True
+except ImportError:
+    _LIQ_OK = False
 import time
 
 import config
@@ -175,8 +180,19 @@ def momentum_ok(candles: list, lado: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 def detectar_sweep(candles: list) -> dict:
+    """v2: usa liquidez.py si disponible (RVOL + ATR depth + MSS)."""
+    if not config.SWEEP_ACTIVO:
+        return {"sweep_bull": False, "sweep_bear": False}
+    if _LIQ_OK:
+        return _liq.detectar_sweep_v2(
+            candles,
+            pivot_length=5,
+            rvol_min=float(getattr(config, "LIQ_RVOL_MIN", 1.2)),
+            atr_depth_min=float(getattr(config, "LIQ_ATR_DEPTH", 0.25)),
+        )
+    # fallback original
     result = {"sweep_bull": False, "sweep_bear": False}
-    if not config.SWEEP_ACTIVO or len(candles) < config.SWEEP_LOOKBACK + 2:
+    if len(candles) < config.SWEEP_LOOKBACK + 2:
         return result
     c   = candles[-1]
     rng = c["high"] - c["low"]
