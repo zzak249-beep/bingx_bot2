@@ -80,7 +80,20 @@ def _get(path: str, params: Optional[dict] = None) -> dict:
         return {}
 
 
-def _post(path: str, params: Optional[dict] = None) -> dict:
+def _delete(path: str, params: Optional[dict] = None) -> dict:
+    p = dict(params or {})
+    p["timestamp"] = _ts()
+    qs = _praseParam(p)
+    sig = _sign(qs)
+    url = f"{BASE_URL}{path}?{qs}&signature={sig}"
+    try:
+        r = requests.delete(url, headers=_headers(), timeout=12)
+        return r.json()
+    except Exception as e:
+        log.error(f"DELETE {path}: {e}")
+        return {}
+
+
     p = dict(params or {})
     p["timestamp"] = _ts()
     qs = _praseParam(p)
@@ -165,27 +178,34 @@ def get_precio(par: str) -> float:
 # ═══════════════════════════════════════════════════════
 
 def get_candles(par: str, tf: str = "5m", limit: int = 200) -> list:
-    try:
-        data   = _get("/openApi/swap/v3/quote/klines",
-                      {"symbol": par, "interval": tf, "limit": limit})
-        raw    = data.get("data", []) or []
-        candles = []
-        for c in raw:
-            try:
-                candles.append({
-                    "ts":     int(c[0]),
-                    "open":   float(c[1]),
-                    "high":   float(c[2]),
-                    "low":    float(c[3]),
-                    "close":  float(c[4]),
-                    "volume": float(c[5]),
-                })
-            except Exception:
-                continue
-        return candles
-    except Exception as e:
-        log.error(f"get_candles {par} {tf}: {e}")
-        return []
+    for intento in range(2):
+        try:
+            data   = _get("/openApi/swap/v3/quote/klines",
+                          {"symbol": par, "interval": tf, "limit": limit})
+            raw    = data.get("data", []) or []
+            candles = []
+            for c in raw:
+                try:
+                    candles.append({
+                        "ts":     int(c[0]),
+                        "open":   float(c[1]),
+                        "high":   float(c[2]),
+                        "low":    float(c[3]),
+                        "close":  float(c[4]),
+                        "volume": float(c[5]),
+                    })
+                except Exception:
+                    continue
+            if candles:
+                return candles
+            if intento == 0:
+                log.debug(f"[CANDLES] {par} {tf} vacío, reintentando...")
+                time.sleep(0.5)
+        except Exception as e:
+            log.error(f"get_candles {par} {tf}: {e}")
+            if intento == 0:
+                time.sleep(0.5)
+    return []
 
 
 # ═══════════════════════════════════════════════════════
@@ -554,7 +574,9 @@ def _actualizar_sl_cancel_replace(par: str, nuevo_sl: float, lado: str):
     try:
         cl_side  = "SELL" if lado == "LONG" else "BUY"
         pos_side = "LONG" if lado == "LONG" else "SHORT"
-        _post("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
+        # BingX usa DELETE para cancelar todas las órdenes abiertas de un par
+        _delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": par})
+        time.sleep(0.5)
         _post("/openApi/swap/v2/trade/order", {
             "symbol":        par,
             "side":          cl_side,
