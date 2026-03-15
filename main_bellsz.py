@@ -465,6 +465,37 @@ def gestionar_posiciones():
             lado = pos["lado"]
             qty  = pos["qty"]
 
+            # Verificar si BingX ya cerró la posición (SL/TP ejecutado en exchange)
+            # Esto evita gestionar una posición que ya no existe
+            if not config.MODO_DEMO and not pos.get("recuperada"):
+                try:
+                    pos_reales = exchange.get_posiciones_abiertas()
+                    simbolos   = {p.get("symbol", "") for p in pos_reales}
+                    simbolos  |= {s.replace("-", "") for s in simbolos}
+                    par_clean  = par.replace("-", "")
+                    if par not in simbolos and par_clean not in simbolos:
+                        # Posición cerrada por BingX — registrar y limpiar
+                        sl_ef = pos.get("sl_trailing", pos["sl"])
+                        tp    = pos["tp"]
+                        if tp > 0 and sl_ef > 0:
+                            if lado == "LONG":
+                                salida = tp if precio >= tp * 0.98 else sl_ef
+                            else:
+                                salida = tp if precio <= tp * 1.02 else sl_ef
+                        else:
+                            salida = precio
+                        pnl = qty * ((salida - pos["entrada"]) if lado == "LONG" else (pos["entrada"] - salida))
+                        razon = "TP-BINGX" if (lado == "LONG" and salida >= tp * 0.98) or (lado == "SHORT" and salida <= tp * 1.02) else "SL-BINGX"
+                        estado.registrar_cierre(pnl)
+                        memoria.registrar_resultado(par, pnl, lado, kz=pos.get("kz",""), motivos=pos.get("motivos",[]))
+                        _mcl_aprender(pos, pnl)
+                        del estado.posiciones[par]
+                        _notif_cierre(par, lado, pos["entrada"], salida, pnl, razon)
+                        log.info(f"[SYNC-GES] {par} cerrado en BingX ({razon}) PnL≈{pnl:+.4f}")
+                        continue
+                except Exception as e_sync:
+                    log.debug(f"[SYNC-GES] {par}: {e_sync}")
+
             gestionar_partial_tp(par, pos, precio)
 
             if _check_sin_movimiento(par, pos, precio):
@@ -762,11 +793,12 @@ def main():
     log.info("=" * 65)
     log.info(f"  {config.VERSION}")
     log.info(f"  TRADE: ${config.TRADE_USDT_BASE} base × {config.LEVERAGE}x | MAX: ${config.TRADE_USDT_MAX}")
-    log.info(f"  TF:{config.TIMEFRAME} | HTF: H1/H4/D | LIQ_LOOKBACK:{config.LIQ_LOOKBACK}")
+    log.info(f"  TF:{config.TIMEFRAME} | HTF: H1/H4/D | LIQ_LOOKBACK:{config.LIQ_LOOKBACK} | LIQ_MARGEN:{config.LIQ_MARGEN}")
     log.info(f"  SCORE≥{config.SCORE_MIN} | MIN_RR:{config.MIN_RR} | TP={config.TP_DIST_MULT}×dist_SL")
     log.info(f"  EMA:{config.EMA_FAST}/{config.EMA_SLOW} | RSI:{config.RSI_SELL_MIN}/{config.RSI_BUY_MAX}")
     log.info(f"  MetaClaw: {'✅ ACTIVO' if config.METACLAW_ACTIVO else '❌ INACTIVO'}")
-    log.info(f"  DEMO:{config.MODO_DEMO}")
+    log.info(f"  MODO: {'🟡 DEMO' if config.MODO_DEMO else '🔴 LIVE — DINERO REAL'}")
+    log.info(f"  WORKERS:{config.ANALISIS_WORKERS} | LOOP:{config.LOOP_SECONDS}s | MAX_POS:{config.MAX_POSICIONES}")
     log.info("=" * 65)
 
     if config.MEMORY_DIR:
@@ -891,8 +923,13 @@ def main():
                 pares_scan  = [p for p in pares
                                if p not in estado.posiciones and p not in bloq_ahora]
 
-                log.info(f"Escaneando {len(pares_scan)} pares | Score≥{config.SCORE_MIN} | KZ:{kz['nombre']}")
-                senales = analizar.analizar_todos(pares_scan, workers=config.ANALISIS_WORKERS)
+                log.info(
+                    f"Escaneando {len(pares_scan)} pares | "
+                    f"Score≥{config.SCORE_MIN} | KZ:{kz['nombre']} | "
+                    f"Pos:{_pos_bot_count()}/{config.MAX_POSICIONES} | "
+                    f"Bloqueados:{len(bloq_ahora)}"
+                )
+                senales = analizar.analizar_todos(pares_scan, workers=min(config.ANALISIS_WORKERS, len(pares_scan), 8))
 
                 if senales:
                     log.info(f"✓ {len(senales)} señal(es) Bellsz:")
