@@ -754,45 +754,51 @@ def analizar_par(par: str):
 
         score_min = config.SCORE_MIN
 
-        # RSI extremo solo bloquea si score es bajo
-        rsi_bloquea_long  = rsi >= config.RSI_BUY_MAX  and sl_long  < 6
-        rsi_bloquea_short = rsi <= config.RSI_SELL_MIN and sl_short < 6
+        # ══════════════════════════════════════════════════════
+        # SCORE EFECTIVO: cuando HTF bloquea un lado,
+        # el score de ese lado se pone a 0 para no "empatar"
+        # con el lado válido.  El lado contrario gana siempre
+        # que supere score_min.
+        # ══════════════════════════════════════════════════════
+        eff_long  = sl_long  if trend_ok_long  else 0
+        eff_short = sl_short if trend_ok_short else 0
 
-        # ── Elegir mejor dirección ──
+        # RSI extremo bloquea solo si score es bajo (< 6)
+        if rsi >= config.RSI_BUY_MAX  and sl_long  < 6: eff_long  = 0
+        if rsi <= config.RSI_SELL_MIN and sl_short < 6: eff_short = 0
+
+        # ── Elegir dirección con mayor score efectivo ──
         lado = score = None
         motivos = []
 
-        # Evaluar SHORT primero (se sobreescribe si LONG es igual o mejor)
-        if (not config.SOLO_LONG and
-                sl_short >= score_min and trend_ok_short and
-                not rsi_bloquea_short and sl_short > sl_long):
-            lado, score, motivos = "SHORT", sl_short, ml_short
+        if not config.SOLO_LONG and eff_short >= score_min:
+            if eff_long < eff_short:          # SHORT gana claramente
+                lado, score, motivos = "SHORT", sl_short, ml_short
+            elif eff_long == eff_short:       # empate → prefiere SHORT en bear, LONG en bull
+                if htf == "BEAR" or (ema9_bear and not ema9_bull):
+                    lado, score, motivos = "SHORT", sl_short, ml_short
 
-        # LONG gana si score >= min, HTF no es BEAR, RSI no extremo con score bajo
-        if (sl_long >= score_min and trend_ok_long and not rsi_bloquea_long):
-            if lado is None or sl_long >= sl_short:
+        if eff_long >= score_min:
+            if lado is None or eff_long >= eff_short:
                 lado, score, motivos = "LONG", sl_long, ml_long
 
-        # Log diagnóstico — siempre que score sea relevante (>=2)
+        # Log diagnóstico — siempre que algún score sea relevante
         if lado is None:
             if sl_long >= 2 or sl_short >= 2:
-                razon_l, razon_s = [], []
-                if sl_long  < score_min:          razon_l.append(f"score={sl_long}<{score_min}")
-                if not trend_ok_long:             razon_l.append(f"HTF_BEAR")
-                if rsi_bloquea_long:              razon_l.append(f"RSI_OB={rsi:.0f}")
-                if sl_short < score_min:          razon_s.append(f"score={sl_short}<{score_min}")
-                if not trend_ok_short:            razon_s.append(f"HTF_BULL")
-                if rsi_bloquea_short:             razon_s.append(f"RSI_OS={rsi:.0f}")
-                if sl_short <= sl_long and lado is None and sl_short >= score_min:
-                    razon_s.append("L_mejor_score")
+                razones = []
+                if eff_long  == 0 and sl_long  >= score_min: razones.append(f"L_bloq(HTF={htf})")
+                if eff_short == 0 and sl_short >= score_min: razones.append(f"S_bloq(HTF={htf})")
+                if sl_long  < score_min: razones.append(f"L_score={sl_long}<{score_min}")
+                if sl_short < score_min: razones.append(f"S_score={sl_short}<{score_min}")
                 log.info(
                     f"[NO-SE] {par} "
-                    f"L:{sl_long}pts({','.join(razon_l) or 'ok'}) "
-                    f"S:{sl_short}pts({','.join(razon_s) or 'ok'}) "
-                    f"rsi={rsi:.0f} htf={htf} "
+                    f"L:{sl_long}(eff={eff_long}) S:{sl_short}(eff={eff_short}) "
+                    f"htf={htf} rsi={rsi:.0f} "
                     f"fvg={fvg['bull_fvg']}/{fvg['bear_fvg']} "
                     f"ob={ob['bull_ob']}/{ob['bear_ob']} "
-                    f"ema={'B' if bull_trend_5m else ('R' if bear_trend_5m else '-')}"
+                    f"sweep={sweep['sweep_bull']}/{sweep['sweep_bear']} "
+                    f"ema={'↑' if bull_trend_5m else ('↓' if bear_trend_5m else '→')} "
+                    f"| {' '.join(razones)}"
                 )
             return None
 
