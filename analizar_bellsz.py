@@ -39,6 +39,8 @@ log = logging.getLogger("analizar_bellsz")
 _cooldown_ts:  dict = {}
 _kz_stats:     dict = {}
 _macro_btc:    dict = {"htf": "NEUTRAL", "ts": 0.0}
+_niveles_cache: dict = {}   # par → {"data": dict, "ts": float}
+_NIVELES_TTL  = 900         # 15 minutos — H1/H4/D no cambian en 1 ciclo
 
 
 # ══════════════════════════════════════════════════════════════
@@ -185,8 +187,12 @@ def calc_macd(closes: list, fast=12, slow=26, signal=9):
 def get_niveles_liquidez(par: str) -> dict:
     """
     Obtiene BSL (máximo) y SSL (mínimo) de los últimos N periodos
-    en H1, H4 y Diario. Estos son los niveles de liquidez institucional.
+    en H1, H4 y Diario. Cacheado 15 minutos — los niveles HTF no cambian por ciclo.
     """
+    cached = _niveles_cache.get(par)
+    if cached and (time.time() - cached["ts"]) < _NIVELES_TTL:
+        return cached["data"]
+
     resultado = {
         "bsl_h1": 0.0, "ssl_h1": 0.0,
         "bsl_h4": 0.0, "ssl_h4": 0.0,
@@ -217,10 +223,12 @@ def get_niveles_liquidez(par: str) -> dict:
         resultado["ok"] = True
     except Exception as e:
         log.debug(f"[LIQ] {par} error: {e}")
+
+    _niveles_cache[par] = {"data": resultado, "ts": time.time()}
     return resultado
 
 
-def detectar_purga(candles: list, niveles: dict, precio: float) -> dict:
+def detectar_purga(candles: list, niveles: dict, precio: float, margen_override: float = None) -> dict:
     """
     Detecta si el precio barrió un nivel de liquidez y cerró al otro lado.
 
@@ -234,11 +242,11 @@ def detectar_purga(candles: list, niveles: dict, precio: float) -> dict:
     """
     if len(candles) < 3:
         return {"purga_alcista": False, "purga_bajista": False,
-                "purga_nivel": "", "purga_peso": 0}
+                "purga_nivel": "", "purga_nivel_l": "", "purga_nivel_s": "", "purga_peso": 0}
 
     c = candles[-1]
-    # LIQ_MARGEN = 0.001 significa 0.1% → multiplicar directo, sin /100
-    margen = precio * config.LIQ_MARGEN
+    # Usar margen override si se pasa (thread-safe), si no usar config
+    margen = margen_override if margen_override is not None else (precio * config.LIQ_MARGEN)
 
     purga_alcista = False
     purga_bajista = False
@@ -669,9 +677,7 @@ def analizar_par(par: str):
         if not _cooldown_ok(par):
             return None
 
-        if not es_trending(candles, 20):
-            return None
-
+        # volumen mínimo: filtro rápido antes de calcular indicadores
         if not volumen_ok(candles):
             return None
 
@@ -686,27 +692,30 @@ def analizar_par(par: str):
         if atr <= 0 or atr / precio * 100 < 0.03:
             return None
 
-        # ══════════════════════════════════════════════════════
-        # CAPA 1 — LIQUIDEZ (purga de BSL/SSL)
-        # ══════════════════════════════════════════════════════
-        # Inyectar margen adaptativo en config temporal para esta llamada
-        _atr_pct = atr / precio  # p.ej 0.003 = 0.3%
-        _margen_orig = config.LIQ_MARGEN
-        # Usar el mayor entre el margen config y 0.5× ATR%
-        # Así en coins muy volátiles (ATR 1%) el margen se adapta
-        config.LIQ_MARGEN = max(config.LIQ_MARGEN, _atr_pct * 0.5)
-        niveles = get_niveles_liquidez(par)
-        purga   = detectar_purga(candles, niveles, precio)
-        config.LIQ_MARGEN = _margen_orig  # restaurar
-
         # ── ADX: evitar mercados completamente planos ──────────
         adx = calc_adx(hi, lo, cl)
         if adx < 12:
             log.debug(f"[SKIP] {par} ADX={adx:.1f} — demasiado lateral")
             return None
 
+        # ══════════════════════════════════════════════════════
+        # CAPA 1 — LIQUIDEZ (purga de BSL/SSL)
+        # ══════════════════════════════════════════════════════
+        # Margen adaptativo thread-safe: se calcula local, NO modifica config global
+        _atr_pct      = atr / precio
+        _margen_local = max(config.LIQ_MARGEN, _atr_pct * 0.5)
+
+        niveles = get_niveles_liquidez(par)
+        purga   = detectar_purga(candles, niveles, precio, margen_override=_margen_local)
+
         # Sin purga = sin señal (núcleo de Bellsz)
         if not purga["purga_alcista"] and not purga["purga_bajista"]:
+            return None
+
+        # Filtro de tendencia — solo aplicar si NO hay purga fuerte
+        # Una purga D o H4 ya implica movimiento significativo
+        if purga["purga_peso"] < 2 and not es_trending(candles, 20):
+            log.debug(f"[SKIP] {par} mercado lateral y purga débil (peso={purga['purga_peso']})")
             return None
 
         # ══════════════════════════════════════════════════════
@@ -815,19 +824,20 @@ def analizar_par(par: str):
 
         # ══════════════════════════════════════════════════════
         # CONDICIÓN BASE: purga es OBLIGATORIA (núcleo Bellsz)
-        # + al menos 1 confirmación de capa 2 o 3
+        # + al menos 1 confirmación de capa 2 O capa 3
         # ══════════════════════════════════════════════════════
-        base_l = (purga["purga_alcista"] and
-                  (ema_conf["bull"] or ema_conf["cruce_bull"]) and
-                  (rsi_conf["ok_long"] or rsi_conf["momentum_bull"]))
+        ema_ok_l = ema_conf["bull"] or ema_conf["cruce_bull"]
+        ema_ok_s = ema_conf["bear"] or ema_conf["cruce_bear"]
+        rsi_ok_l = rsi_conf["ok_long"]  or rsi_conf["momentum_bull"]
+        rsi_ok_s = rsi_conf["ok_short"] or rsi_conf["momentum_bear"]
 
-        base_s = (purga["purga_bajista"] and
-                  (ema_conf["bear"] or ema_conf["cruce_bear"]) and
-                  (rsi_conf["ok_short"] or rsi_conf["momentum_bear"]))
+        # Purga + (EMA alcista O RSI ok)
+        base_l = purga["purga_alcista"] and (ema_ok_l or rsi_ok_l)
+        base_s = purga["purga_bajista"] and (ema_ok_s or rsi_ok_s)
 
         # HTF flexible: solo BULL/BEAR explícito bloquea la dirección contraria
-        trend_ok_l = ema_conf["bull"] and (htf != "BEAR")
-        trend_ok_s = ema_conf["bear"] and (htf != "BULL")
+        trend_ok_l = (htf != "BEAR")
+        trend_ok_s = (htf != "BULL")
 
         lado = score = None
         motivos: list = []
