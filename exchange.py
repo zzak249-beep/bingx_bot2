@@ -757,3 +757,15 @@ def actualizar_sl(symbol: str, lado: str, qty: float, nuevo_sl: float):
         log.debug(f"[SL-UPDATE] {symbol} nuevo SL @ {nuevo_sl:.8g}")
     else:
         log.warning(f"[SL-UPDATE] {symbol}: {r.get('msg','')[:60]}")
+
+
+# ── Alias para compatibilidad con main_bellsz ────────────────
+def actualizar_sl_bingx(par: str, nuevo_sl: float, lado: str) -> bool:
+    """Alias de actualizar_sl — compatibilidad con main_bellsz.py"""
+    try:
+        actualizar_sl(par, lado, 0, nuevo_sl)
+        return True
+    except Exception as e:
+        log.debug(f"actualizar_sl_bingx {par}: {e}")
+        return False
+

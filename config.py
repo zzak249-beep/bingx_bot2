@@ -173,6 +173,37 @@ MEMORY_DIR = os.getenv("MEMORY_DIR", "")
 BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
 
 
+# ── Campos adicionales para main_bellsz y analizar_bellsz ────
+HTF_H1_TF   = os.getenv("HTF_H1_TF",   "1h")
+HTF_H4_TF   = os.getenv("HTF_H4_TF",   "4h")
+HTF_D_TF    = os.getenv("HTF_D_TF",    "1d")
+HTF_CANDLES = _int("HTF_CANDLES",       60)
+
+TP1_DIST_MULT     = _float("TP1_DIST_MULT",     1.5)
+METACLAW_VETO_MINIMO = _int("METACLAW_VETO_MINIMO", 7)
+VOLUMEN_MIN_24H   = _float("VOLUMEN_MIN_24H",   200_000.0)
+
+# Campos de analizar_bellsz
+PREMIUM_DISCOUNT_LB  = _int("PREMIUM_DISCOUNT_LB",  50)
+KZ_ASIA_START        = _int("KZ_ASIA_START",          0)
+KZ_ASIA_END          = _int("KZ_ASIA_END",          240)
+KZ_LONDON_START      = _int("KZ_LONDON_START",      420)
+KZ_LONDON_END        = _int("KZ_LONDON_END",        600)
+KZ_NY_START          = _int("KZ_NY_START",          780)
+KZ_NY_END            = _int("KZ_NY_END",            960)
+OB_ACTIVO            = _bool("OB_ACTIVO",          True)
+OB_LOOKBACK          = _int("OB_LOOKBACK",           30)
+BOS_ACTIVO           = _bool("BOS_ACTIVO",         True)
+FVG_ACTIVO           = _bool("FVG_ACTIVO",         True)
+SWEEP_ACTIVO         = _bool("SWEEP_ACTIVO",       True)
+SWEEP_LOOKBACK       = _int("SWEEP_LOOKBACK",        20)
+PINBAR_RATIO         = _float("PINBAR_RATIO",      0.50)
+VWAP_ACTIVO          = _bool("VWAP_ACTIVO",        True)
+VWAP_PCT             = _float("VWAP_PCT",          0.50)
+MTF_4H_ACTIVO        = _bool("MTF_4H_ACTIVO",      True)
+ASIA_RANGE_ACTIVO    = _bool("ASIA_RANGE_ACTIVO",  True)
+VELA_CONFIRMACION    = _bool("VELA_CONFIRMACION",  True)
+
 def validar():
     errores = []
     if not MODO_DEMO:
