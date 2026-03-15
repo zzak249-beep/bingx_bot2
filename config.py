@@ -127,6 +127,15 @@ MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
 SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)
 SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
 
+# ── Liquidez / Bellsz ─────────────────────────────────────────
+# Todos los parámetros que usa main_bellsz.py y liquidez.py
+LIQ_MARGEN       = _float("LIQ_MARGEN",       0.15)   # % margen de distancia al nivel BSL/SSL
+LIQ_LOOKBACK     = _int("LIQ_LOOKBACK",        30)    # velas lookback para detección de niveles
+LIQ_RVOL_MIN     = _float("LIQ_RVOL_MIN",      1.2)   # RVOL mínimo para confirmar sweep institucional
+LIQ_ATR_DEPTH    = _float("LIQ_ATR_DEPTH",     0.20)  # profundidad mínima sweep en múltiplos ATR
+LIQ_ANALISIS_HTF = _bool("LIQ_ANALISIS_HTF",   True)  # activar análisis HTF en bellsz
+LIQ_SCORE_MIN    = _int("LIQ_SCORE_MIN",        1)    # score mínimo del módulo liquidez
+
 # ── Scanner ───────────────────────────────────────────────────
 # FIX: VOLUMEN_MIN_24H era 500k → 200k para cubrir más pares con liquidez
 VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 200_000.0)
