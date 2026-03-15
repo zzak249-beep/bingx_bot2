@@ -67,7 +67,7 @@ MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
 # ── Score ─────────────────────────────────────────────────────
 # FIX: SCORE_MIN era 7, generaba muy pocas señales
 # Bajar a 5 permite operar con FVG + 3 confluencias adicionales
-SCORE_MIN    = _int("SCORE_MIN",       3)     # v4.5: era 5 → 3 (score puro, sin base gate)
+SCORE_MIN    = _int("SCORE_MIN",       2)     # v4.5: score puro — sube a 4-5 via Railway si hay muchas señales
 FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
 EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
 EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)

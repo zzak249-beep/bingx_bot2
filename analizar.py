@@ -746,66 +746,53 @@ def analizar_par(par: str):
         # ══════════════════════════════════════════════════════
         # v4.5 — SISTEMA DE SCORE PURO (sin gate de "base")
         # ══════════════════════════════════════════════════════
-        # El score YA incluye FVG, OB+FVG, Sweep, BOS, patrones,
-        # EMAs, RSI, VWAP, pivotes, etc.  No hay un gate binario
-        # adicional de "base" — si el score supera SCORE_MIN con
-        # los filtros de calidad, se genera señal.
-        #
-        # Filtros de CALIDAD que sí se mantienen (no son estructurales):
-        #   1. trend_ok   — no operar contra HTF fuerte
-        #   2. conf_vela  — la vela actual confirma la dirección
-        #   3. rsi_ok     — RSI no extremo (suave: se bypasea con score alto)
+        # v4.5 SCORE PURO — el único gate es score >= SCORE_MIN
+        # HTF solo filtra el lado contrario MUY marcado (BEAR→no LONG, BULL→no SHORT)
+        # RSI extremo solo bloquea si score bajo — con score alto siempre pasa
+        # Sin conf_vela — el patrón de vela ya está en el score (BULL_STRONG, etc.)
         # ══════════════════════════════════════════════════════
-
-        rng_vela = max(candles[-1]["high"] - candles[-1]["low"], 1e-10)
-
-        # Confirmación de vela — bullish/bearish o mecha ≥40%
-        conf_long  = (candles[-1]["close"] >= candles[-1]["open"] or
-                      (candles[-1]["close"] - candles[-1]["low"]) / rng_vela >= 0.40)
-        conf_short = (candles[-1]["close"] <= candles[-1]["open"] or
-                      (candles[-1]["high"] - candles[-1]["close"]) / rng_vela >= 0.40)
-
-        # RSI — filtro suave: se ignora si score muy alto
-        rsi_ok_long  = rsi < config.RSI_BUY_MAX  or sl_long  >= 7
-        rsi_ok_short = rsi > config.RSI_SELL_MIN or sl_short >= 7
 
         score_min = config.SCORE_MIN
 
-        # ── Elegir dirección ──
+        # RSI extremo solo bloquea si score es bajo
+        rsi_bloquea_long  = rsi >= config.RSI_BUY_MAX  and sl_long  < 6
+        rsi_bloquea_short = rsi <= config.RSI_SELL_MIN and sl_short < 6
+
+        # ── Elegir mejor dirección ──
         lado = score = None
         motivos = []
 
-        # SHORT: solo si score SHORT > LONG y trend no es BULL
+        # Evaluar SHORT primero (se sobreescribe si LONG es igual o mejor)
         if (not config.SOLO_LONG and
                 sl_short >= score_min and trend_ok_short and
-                conf_short and rsi_ok_short and sl_short > sl_long):
+                not rsi_bloquea_short and sl_short > sl_long):
             lado, score, motivos = "SHORT", sl_short, ml_short
 
-        # LONG: si score >= min y trend no es BEAR
-        if (sl_long >= score_min and trend_ok_long and
-                conf_long and rsi_ok_long):
+        # LONG gana si score >= min, HTF no es BEAR, RSI no extremo con score bajo
+        if (sl_long >= score_min and trend_ok_long and not rsi_bloquea_long):
             if lado is None or sl_long >= sl_short:
                 lado, score, motivos = "LONG", sl_long, ml_long
 
-        # Log diagnóstico cuando score es relevante pero no pasa
+        # Log diagnóstico — siempre que score sea relevante (>=2)
         if lado is None:
-            if sl_long >= 3 or sl_short >= 3:
+            if sl_long >= 2 or sl_short >= 2:
                 razon_l, razon_s = [], []
-                if sl_long < score_min:   razon_l.append(f"score={sl_long}<{score_min}")
-                if not conf_long:         razon_l.append("noConf")
-                if not trend_ok_long:     razon_l.append(f"HTF={htf}")
-                if not rsi_ok_long:       razon_l.append(f"RSI={rsi:.1f}>{config.RSI_BUY_MAX}")
-                if sl_short < score_min:  razon_s.append(f"score={sl_short}<{score_min}")
-                if not conf_short:        razon_s.append("noConf")
-                if not trend_ok_short:    razon_s.append(f"HTF={htf}")
+                if sl_long  < score_min:          razon_l.append(f"score={sl_long}<{score_min}")
+                if not trend_ok_long:             razon_l.append(f"HTF_BEAR")
+                if rsi_bloquea_long:              razon_l.append(f"RSI_OB={rsi:.0f}")
+                if sl_short < score_min:          razon_s.append(f"score={sl_short}<{score_min}")
+                if not trend_ok_short:            razon_s.append(f"HTF_BULL")
+                if rsi_bloquea_short:             razon_s.append(f"RSI_OS={rsi:.0f}")
+                if sl_short <= sl_long and lado is None and sl_short >= score_min:
+                    razon_s.append("L_mejor_score")
                 log.info(
                     f"[NO-SE] {par} "
-                    f"L:{sl_long}({','.join(razon_l) or 'ok'}) "
-                    f"S:{sl_short}({','.join(razon_s) or 'ok'}) "
-                    f"rsi={rsi:.1f} htf={htf} "
+                    f"L:{sl_long}pts({','.join(razon_l) or 'ok'}) "
+                    f"S:{sl_short}pts({','.join(razon_s) or 'ok'}) "
+                    f"rsi={rsi:.0f} htf={htf} "
                     f"fvg={fvg['bull_fvg']}/{fvg['bear_fvg']} "
                     f"ob={ob['bull_ob']}/{ob['bear_ob']} "
-                    f"sweep={sweep['sweep_bull']}/{sweep['sweep_bear']}"
+                    f"ema={'B' if bull_trend_5m else ('R' if bear_trend_5m else '-')}"
                 )
             return None
 
