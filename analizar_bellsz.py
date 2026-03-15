@@ -116,6 +116,192 @@ def calc_macd(closes: list, fast=12, slow=26, signal=9):
     return ml, sl, ml - (sl or 0)
 
 
+
+# ══════════════════════════════════════════════════════
+# LIQUIDATION REVERSAL [AlgoAlpha] — Python replica
+# Z-Score de volumen comprador/vendedor + Supertrend
+# ══════════════════════════════════════════════════════
+
+def _supertrend(highs, lows, closes, factor=2, atr_period=10):
+    """Supertrend simple. Retorna (trend, direction[]) donde direction>0=bajista, <0=alcista"""
+    if len(closes) < atr_period + 2:
+        return None, None
+    atrs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        atrs.append(tr)
+    # ATR suavizado
+    atr_vals = []
+    atr_val = sum(atrs[:atr_period]) / atr_period
+    atr_vals.append(atr_val)
+    for a in atrs[atr_period:]:
+        atr_val = (atr_val * (atr_period - 1) + a) / atr_period
+        atr_vals.append(atr_val)
+
+    n = len(atr_vals)
+    offset = len(closes) - n  # closes y atr_vals alineados desde offset
+    upper_band = [0.0] * n
+    lower_band = [0.0] * n
+    direction  = [1] * n   # 1=bajista, -1=alcista (igual que Pine)
+    supertrend = [0.0] * n
+
+    for i in range(n):
+        ci = i + offset
+        hl2 = (highs[ci] + lows[ci]) / 2
+        ub = hl2 + factor * atr_vals[i]
+        lb = hl2 - factor * atr_vals[i]
+        if i == 0:
+            upper_band[i] = ub
+            lower_band[i] = lb
+        else:
+            upper_band[i] = min(ub, upper_band[i-1]) if closes[ci-1] < upper_band[i-1] else ub
+            lower_band[i] = max(lb, lower_band[i-1]) if closes[ci-1] > lower_band[i-1] else lb
+        if i == 0:
+            direction[i] = 1
+        elif supertrend[i-1] == upper_band[i-1]:
+            direction[i] = 1 if closes[ci] < upper_band[i] else -1
+        else:
+            direction[i] = -1 if closes[ci] > lower_band[i] else 1
+        supertrend[i] = upper_band[i] if direction[i] == 1 else lower_band[i]
+
+    return supertrend, direction
+
+
+def calc_liquidation_reversal(candles: list, z_length: int = 200, z_thresh: float = 3.0,
+                               timeout_bars: int = 50) -> dict:
+    """
+    Replica AlgoAlpha Liquidation Reversal en Python.
+    Retorna dict con:
+      liq_bull:  bool — señal alcista (short liq + supertrend flip alcista)
+      liq_bear:  bool — señal bajista (long  liq + supertrend flip bajista)
+      short_liq: bool — spike de liquidación de shorts (z-score up-vol > thresh)
+      long_liq:  bool — spike de liquidación de longs  (z-score dn-vol > thresh)
+      z_up:      float — z-score volumen comprador
+      z_dn:      float — z-score volumen vendedor
+    """
+    base = {"liq_bull": False, "liq_bear": False, "short_liq": False,
+            "long_liq": False, "z_up": 0.0, "z_dn": 0.0}
+
+    if len(candles) < z_length + 20:
+        return base
+
+    # ── Separar volumen comprador / vendedor ──────────────
+    # Aproximación: si close > open → volumen alcista, si close < open → bajista
+    # (Pine Script usa requestUpAndDownVolume del TF inferior, aquí aproximamos)
+    up_vols = []
+    dn_vols = []
+    for c in candles:
+        vol = c.get("volume", 0)
+        if vol <= 0:
+            up_vols.append(0.0)
+            dn_vols.append(0.0)
+            continue
+        body = abs(c["close"] - c["open"])
+        rng  = c["high"] - c["low"] if c["high"] > c["low"] else 1e-9
+        ratio = body / rng
+        if c["close"] >= c["open"]:
+            up_vols.append(vol * (0.5 + 0.5 * ratio))
+            dn_vols.append(vol * (0.5 - 0.5 * ratio))
+        else:
+            up_vols.append(vol * (0.5 - 0.5 * ratio))
+            dn_vols.append(vol * (0.5 + 0.5 * ratio))
+
+    # ── Z-Score ───────────────────────────────────────────
+    def zscore_series(vals, length):
+        zs = []
+        for i in range(len(vals)):
+            if i < length:
+                zs.append(0.0)
+                continue
+            window = vals[i-length:i]
+            mean   = sum(window) / length
+            var    = sum((x - mean)**2 for x in window) / length
+            std    = var**0.5
+            zs.append((vals[i] - mean) / std if std > 0 else 0.0)
+        return zs
+
+    z_up_series = zscore_series(up_vols, z_length)
+    z_dn_series = zscore_series(dn_vols, z_length)
+
+    # ── Supertrend ────────────────────────────────────────
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    closes = [c["close"] for c in candles]
+    _, st_dir = _supertrend(highs, lows, closes, factor=2, atr_period=10)
+    if st_dir is None:
+        return base
+
+    # Alinear: st_dir tiene longitud len(candles)-1 aprox, atr_vals empiezan tras atr_period
+    # st_dir[i] corresponde a closes[i + offset] donde offset = len(closes) - len(st_dir)
+    n_dir  = len(st_dir)
+    offset = len(closes) - n_dir
+
+    # ── Detectar short_liq y long_liq ────────────────────
+    short_liq_series = []
+    long_liq_series  = []
+    for i in range(n_dir):
+        ci = i + offset
+        # short liq: dirección < 0 (alcista) y z_up > thresh
+        s_liq = st_dir[i] < 0 and z_up_series[ci] > z_thresh
+        # long  liq: dirección > 0 (bajista) y z_dn > thresh
+        l_liq = st_dir[i] > 0 and z_dn_series[ci] > z_thresh
+        short_liq_series.append(s_liq)
+        long_liq_series.append(l_liq)
+
+    # ── Detectar reversals (Pine logic) ──────────────────
+    last_liq_dir   = 0
+    last_liq_index = 0
+    valid          = 0
+    plot_trnd      = 0
+    liq_bull = liq_bear = False
+
+    for i in range(1, n_dir):
+        prev_dir = st_dir[i-1]
+        curr_dir = st_dir[i]
+
+        # ta.cross(direction, 0)
+        if (prev_dir > 0 and curr_dir < 0) or (prev_dir < 0 and curr_dir > 0):
+            plot_trnd = 0
+
+        # ta.crossunder: dirección cruza de positivo a negativo (flip a alcista)
+        if prev_dir > 0 and curr_dir < 0:
+            if last_liq_dir == 1 and valid == 1:
+                if timeout_bars == 0 or (i - last_liq_index) < timeout_bars:
+                    plot_trnd = -1
+                    if i == n_dir - 1:
+                        liq_bear = True   # señal bajista (bearish ST start en Pine)
+            valid = 0
+
+        # ta.crossover: dirección cruza de negativo a positivo (flip a bajista)
+        if prev_dir < 0 and curr_dir > 0:
+            if last_liq_dir == -1 and valid == 1:
+                if timeout_bars == 0 or (i - last_liq_index) < timeout_bars:
+                    plot_trnd = 1
+                    if i == n_dir - 1:
+                        liq_bull = True   # señal alcista (bullish ST start en Pine)
+            valid = 0
+
+        if short_liq_series[i]:
+            last_liq_dir   = -1
+            last_liq_index = i
+            valid          = 1
+        if long_liq_series[i]:
+            last_liq_dir   = 1
+            last_liq_index = i
+            valid          = 1
+
+    last_i = n_dir - 1
+    ci_last = last_i + offset
+    return {
+        "liq_bull":  liq_bull,
+        "liq_bear":  liq_bear,
+        "short_liq": short_liq_series[last_i],
+        "long_liq":  long_liq_series[last_i],
+        "z_up":      round(z_up_series[ci_last], 2),
+        "z_dn":      round(z_dn_series[ci_last], 2),
+        "plot_trnd": plot_trnd,    # -1=bajista, 1=alcista, 0=neutral
+    }
+
 # ══════════════════════════════════════════════════════
 # CAPA 1 — LIQUIDEZ (núcleo Bellsz)
 # Replica exactamente Pine Script con lookahead_off
@@ -546,6 +732,12 @@ def analizar_par(par: str):
         vwap    = calc_vwap(candles)
         _, _, macd_hist = calc_macd(cl)
 
+        # ── CAPA LIQUIDATION REVERSAL (AlgoAlpha) ──────────
+        liq_length = int(os.getenv("LIQ_REV_LENGTH", "200"))
+        liq_thresh = float(os.getenv("LIQ_REV_THRESH", "3.0"))
+        liq_timeout = int(os.getenv("LIQ_REV_TIMEOUT", "50"))
+        liqrev = calc_liquidation_reversal(candles, liq_length, liq_thresh, liq_timeout)
+
         sobre_vwap = precio > vwap * (1 + config.VWAP_PCT / 100)
         bajo_vwap  = precio < vwap * (1 - config.VWAP_PCT / 100)
         ob_fvg_b   = ob["iob_bull"] and fvg["bull_fvg"] and ob["bull_ob_bottom"] <= fvg.get("fvg_bottom",0) <= ob["bull_ob_top"]
@@ -612,6 +804,16 @@ def analizar_par(par: str):
         if pat.get("patron"):
             add(pat["lado"] == "LONG",  pat["confianza"], pat["patron"], "L")
             add(pat["lado"] == "SHORT", pat["confianza"], pat["patron"], "S")
+        # ── Liquidation Reversal [AlgoAlpha] ────────────────
+        # liq_bull: short liquidation spike + supertrend flip alcista → confirma LONG
+        # liq_bear: long  liquidation spike + supertrend flip bajista → confirma SHORT
+        # short_liq/long_liq actuales: spike en curso → +1 punto de confirmación
+        add(liqrev["liq_bull"],              3, "LIQ_REVERSAL_BULL", "L")
+        add(liqrev["liq_bear"],              3, "LIQ_REVERSAL_BEAR", "S")
+        add(liqrev["short_liq"],             1, "LIQ_SPIKE_SHORT",   "L")
+        add(liqrev["long_liq"],              1, "LIQ_SPIKE_LONG",    "S")
+        add(liqrev["plot_trnd"] == -1,       1, "LIQ_TREND_BEAR",    "S")
+        add(liqrev["plot_trnd"] ==  1,       1, "LIQ_TREND_BULL",    "L")
 
         # ── CONDICIÓN BASE (replica Pine Script) ───────────
         # purga + (EMA alcista/bajista O RSI en rango)
@@ -620,8 +822,15 @@ def analizar_par(par: str):
         rsi_ok_l = rsi_conf["ok_long"]
         rsi_ok_s = rsi_conf["ok_short"]
 
-        base_l = purga["purga_alcista"] and (ema_ok_l or rsi_ok_l)
-        base_s = purga["purga_bajista"] and (ema_ok_s or rsi_ok_s)
+        pp = purga.get("purga_peso", 0)
+        if pp >= 2:
+            # Purga H4/D: EMA OR RSI suficiente (replica Pine Script)
+            base_l = purga["purga_alcista"] and (ema_ok_l or rsi_ok_l)
+            base_s = purga["purga_bajista"] and (ema_ok_s or rsi_ok_s)
+        else:
+            # Purga H1 sola: exigir ambos
+            base_l = purga["purga_alcista"] and ema_ok_l and rsi_ok_l
+            base_s = purga["purga_bajista"] and ema_ok_s and rsi_ok_s
 
         trend_ok_l = (htf != "BEAR")
         trend_ok_s = (htf != "BULL")
@@ -629,23 +838,38 @@ def analizar_par(par: str):
         lado = score = None
         motivos: list = []
 
+        # Score mínimo dinámico: purga H4/D requiere menos confluencias
+        pp = purga.get("purga_peso", 0)
+        score_min_ef = max(3, config.SCORE_MIN - 2) if pp >= 2 else config.SCORE_MIN
+        # Purga H4/D + LiqReversal activo → rebaja score 1 más
+        if pp >= 2 and (liqrev["liq_bull"] or liqrev["liq_bear"]):
+            score_min_ef = max(3, score_min_ef - 1)
+        # Purgas H4/D permiten operar contra tendencia H1 (igual que Pine Script)
+        if pp >= 2:
+            trend_ok_l = True
+            trend_ok_s = True
+
         if not config.SOLO_LONG:
-            if base_s and ss_pts >= config.SCORE_MIN and trend_ok_s:
+            if base_s and ss_pts >= score_min_ef and trend_ok_s:
                 if ss_pts > sl_pts:
                     lado, score, motivos = "SHORT", ss_pts, ms
 
-        if base_l and sl_pts >= config.SCORE_MIN and trend_ok_l:
+        if base_l and sl_pts >= score_min_ef and trend_ok_l:
             if lado is None or sl_pts >= ss_pts:
                 lado, score, motivos = "LONG", sl_pts, ml
 
         if lado is None:
-            if sl_pts >= 3 or ss_pts >= 3:
+            if purga["purga_alcista"] or purga["purga_bajista"] or sl_pts >= 2 or ss_pts >= 2:
                 log.info(
-                    f"[NO-SENAL] {par} L:{sl_pts}({','.join(ml[:4])}) "
-                    f"S:{ss_pts}({','.join(ms[:4])}) "
+                    f"[NO-SENAL] {par} L:{sl_pts}/{score_min_ef}({','.join(ml[:4])}) "
+                    f"S:{ss_pts}/{score_min_ef}({','.join(ms[:4])}) "
                     f"purga_L={purga['purga_alcista']}({pnl}) "
                     f"purga_S={purga['purga_bajista']}({pns}) "
-                    f"ema_bull={ema_conf['bull']} rsi={rsi_conf['valor']:.1f} htf={htf}"
+                    f"base_l={base_l} base_s={base_s} "
+                    f"ema_bull={ema_conf['bull']} ema_bear={ema_conf['bear']} "
+                    f"rsi={rsi_conf['valor']:.1f} htf={htf} "
+                    f"liq_bull={liqrev['liq_bull']} liq_bear={liqrev['liq_bear']} "
+                    f"z_up={liqrev['z_up']} z_dn={liqrev['z_dn']}"
                 )
             return None
 
@@ -695,6 +919,9 @@ def analizar_par(par: str):
             "bsl_d":  round(niveles["bsl_d"],  8), "ssl_d":  round(niveles["ssl_d"],  8),
             "ema_r":  round(ema_conf["er"], 8), "ema_l": round(ema_conf["el"], 8),
             "adx": round(adx, 1), "inducement": False,
+            "liq_bull": liqrev["liq_bull"], "liq_bear": liqrev["liq_bear"],
+            "liq_z_up": liqrev["z_up"], "liq_z_dn": liqrev["z_dn"],
+            "liq_plot_trnd": liqrev["plot_trnd"],
         }
 
     except Exception as e:
