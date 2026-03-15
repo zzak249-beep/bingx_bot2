@@ -606,7 +606,11 @@ def main():
     log.info(f"Balance: ${balance:.2f} USDT")
 
     if _opt_ok:
-        optimizador.iniciar()
+        try:
+            optimizador.iniciar()
+        except Exception as e:
+            log.warning(f"[OPT] optimizador.iniciar falló: {e}")
+            _opt_ok = False
 
     try:
         exchange._cargar_contratos()
@@ -754,6 +758,8 @@ def main():
             log.error(f"ERROR ciclo {ciclo}: {e}\n{traceback.format_exc()}")
             try: _notif(f"🚨 *Error ciclo {ciclo}*\n`{str(e)[:200]}`")
             except Exception: pass
+            time.sleep(10)  # pausa breve antes de reintentar
+            continue
 
         log.info(f"Próximo ciclo en {config.LOOP_SECONDS}s")
         log.info("-" * 60)
@@ -761,4 +767,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            log.info("Bot detenido por el usuario.")
+            break
+        except Exception as e:
+            log.error(f"[CRASH] main() crasheó: {e}\n{traceback.format_exc()}")
+            try:
+                import requests as _rq
+                tok = os.getenv("TELEGRAM_TOKEN","").strip()
+                cid = os.getenv("TELEGRAM_CHAT_ID","").strip()
+                if tok and cid:
+                    _rq.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                             json={"chat_id": cid, "text": f"⚠️ Bot reiniciando tras crash:\n`{str(e)[:200]}`",
+                                   "parse_mode":"Markdown"}, timeout=8)
+            except Exception:
+                pass
+            log.info("Reiniciando en 15 segundos...")
+            time.sleep(15)
