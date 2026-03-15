@@ -1,137 +1,135 @@
 """
-scanner_pares.py — Escáner de pares BingX con filtro de volumen 24h
-SMC Bot v5.0 [MetaClaw Edition]
+scanner_pares.py — Obtiene todos los pares de BingX perpetuos
+Filtra por volumen mínimo para evitar pares sin liquidez.
+Cache de 1 hora para no saturar la API.
 """
-import logging
-import time
 
-import requests
+import requests, logging, time
+try:
+    import memoria as _memoria
+except ImportError:
+    _memoria = None
 
-import config
+log      = logging.getLogger("scanner")
+BASE_URL = "https://open-api.bingx.com"
 
-log = logging.getLogger("scanner")
-
-_cache_pares: list = []
-_cache_ts:    float = 0.0
-_CACHE_TTL:   int   = 3600  # 1 hora
-
-
-def get_pares_cached(vol_min: float = 200_000.0) -> list:
-    global _cache_pares, _cache_ts
-    if _cache_pares and (time.time() - _cache_ts) < _CACHE_TTL:
-        return _cache_pares
-    pares = _fetch_pares_bingx(vol_min)
-    if pares:
-        _cache_pares = pares
-        _cache_ts    = time.time()
-        log.info(f"[SCAN] {len(pares)} pares con vol>${vol_min/1e6:.1f}M")
-    else:
-        log.warning("[SCAN] Fallo fetch BingX — usando lista fija")
-        try:
-            from config_pares import PARES
-            _cache_pares = PARES
-        except Exception:
-            _cache_pares = _PARES_FALLBACK
-    return _cache_pares
+VOLUMEN_MIN_24H = 500_000  # $500K mínimo
 
 
-
-# Prefijos y patrones de pares NO-cripto en BingX (materias primas, índices, forex)
-_PREFIJOS_NO_CRIPTO = (
-    "NCC",      # Commodities: NCCONICKEL2USD, NCCGOLD2USD, NCCOIL2USD...
-    "FOREX",    # Forex pairs
-    "STOCK",    # Acciones tokenizadas
-)
-_SUFIJOS_NO_CRIPTO = (
-    "2USD",     # Patrón de materias primas: NICKEL2USD, GOLD2USD...
-    "2USDT",
-)
-_TOKENS_NO_CRIPTO = {
-    # Índices (no son cripto)
-    "SPX500", "NDX100", "DJI30", "FTSE100", "DAX40", "NKY225",
-    # Forex tokenizado (no son cripto)
-    "EURUSD", "GBPUSD", "JPYUSD", "AUDUSD", "USDCNH",
-    # Nota: GOLD/SILVER/OIL en BingX pueden ser tokens cripto reales
-    # Se bloquean por el prefijo NCC o patrón 2USD, no por nombre
-}
-
-def _es_no_cripto(base: str) -> bool:
-    """Devuelve True si el par base NO es una criptomoneda real."""
-    b = base.upper()
-    # Por prefijo
-    for p in _PREFIJOS_NO_CRIPTO:
-        if b.startswith(p):
-            return True
-    # Por sufijo
-    for s in _SUFIJOS_NO_CRIPTO:
-        if b.endswith(s):
-            return True
-    # Por nombre exacto conocido
-    if b in _TOKENS_NO_CRIPTO:
-        return True
-    # Contiene "2USD" en cualquier posición (patrón BingX para commodities)
-    if "2USD" in b:
-        return True
-    return False
-
-
-def _fetch_pares_bingx(vol_min: float) -> list:
+def get_todos_los_pares(volumen_min: float = VOLUMEN_MIN_24H) -> list:
+    """
+    Devuelve lista de símbolos con suficiente liquidez, ordenados por volumen.
+    """
     try:
-        resp = requests.get(
-            "https://open-api.bingx.com/openApi/swap/v2/quote/ticker",
-            timeout=12,
-        )
-        data = resp.json()
-        tickers = data.get("data", []) or []
-        if not tickers:
-            # Intentar endpoint alternativo
-            resp2 = requests.get(
-                "https://open-api.bingx.com/openApi/swap/v2/quote/contracts",
-                timeout=10,
+        res = requests.get(
+            BASE_URL + "/openApi/swap/v2/quote/contracts",
+            timeout=15,
+        ).json()
+
+        contratos = res.get("data", [])
+        if not contratos:
+            log.error("No se obtuvieron contratos de BingX")
+            return _pares_fallback()
+
+        simbolos = [
+            c["symbol"] for c in contratos
+            if c.get("symbol", "").endswith("-USDT")
+            and c.get("status", 1) == 1
+        ]
+
+        log.info(f"[SCANNER] {len(simbolos)} contratos USDT activos encontrados")
+
+        # Filtrar por volumen
+        try:
+            res2    = requests.get(
+                BASE_URL + "/openApi/swap/v2/quote/ticker",
+                timeout=20,
+            ).json()
+            tickers = res2.get("data", [])
+
+            volumen_por_par = {
+                t.get("symbol", ""): float(
+                    t.get("quoteVolume", t.get("volume", 0)) or 0
+                )
+                for t in tickers
+            }
+
+            pares_filtrados = [
+                s for s in simbolos
+                if volumen_por_par.get(s, 0) >= volumen_min
+            ]
+            pares_filtrados.sort(
+                key=lambda s: volumen_por_par.get(s, 0),
+                reverse=True,
             )
-            tickers = resp2.json().get("data", []) or []
 
-        pares = []
-        prios = set(config.PARES_PRIORITARIOS)
-        bloq  = set(config.PARES_BLOQUEADOS)
-
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if not sym.endswith("-USDT"):
-                continue
-            if sym in bloq:
-                continue
-            # ── Filtro: solo criptomonedas reales ─────────────
-            # BingX incluye materias primas (Nickel, Gold, Oil...)
-            # que empiezan con NCC o contienen "2USD" en el nombre
-            base = sym.replace("-USDT", "")
-            if _es_no_cripto(base):
-                continue
-            # ──────────────────────────────────────────────────
-            # Filtro de volumen
-            vol = float(
-                t.get("quoteVolume",
-                t.get("volume",
-                t.get("turnover", 0))) or 0
+            log.info(
+                f"[SCANNER] {len(pares_filtrados)} pares con volumen ≥ "
+                f"${volumen_min:,.0f} (de {len(simbolos)} totales)"
             )
-            if vol >= vol_min or sym in prios:
-                pares.append((sym, vol))
+            return pares_filtrados
 
-        # Ordenar: prioritarios primero, luego por volumen desc
-        pares.sort(key=lambda x: (0 if x[0] in prios else 1, -x[1]))
-        return [p for p, _ in pares]
+        except Exception as e:
+            log.warning(f"[SCANNER] No se pudo filtrar por volumen: {e} — usando todos")
+            return simbolos
+
     except Exception as e:
-        log.warning(f"[SCAN] _fetch_pares_bingx: {e}")
-        return []
+        log.error(f"[SCANNER] Error obteniendo pares: {e}")
+        return _pares_fallback()
 
 
-# Lista de fallback si la API falla
-_PARES_FALLBACK = [
-    "BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT",
-    "XRP-USDT", "ADA-USDT", "AVAX-USDT", "DOGE-USDT",
-    "DOT-USDT", "LINK-USDT", "UNI-USDT", "ATOM-USDT",
-    "NEAR-USDT", "APT-USDT", "SUI-USDT", "ARB-USDT",
-    "OP-USDT", "PEPE-USDT", "WIF-USDT", "TRX-USDT",
-    "TON-USDT", "INJ-USDT", "IMX-USDT", "STX-USDT",
-    "LTC-USDT", "BCH-USDT", "FIL-USDT", "AAVE-USDT",
-]
+def _pares_fallback() -> list:
+    log.warning("[SCANNER] Usando lista de respaldo (100 pares)")
+    return [
+        "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
+        "DOGE-USDT","ADA-USDT","AVAX-USDT","LINK-USDT","DOT-USDT",
+        "ARB-USDT","OP-USDT","NEAR-USDT","LTC-USDT","ATOM-USDT",
+        "SUI-USDT","APT-USDT","INJ-USDT","TIA-USDT","MATIC-USDT",
+        "TON-USDT","PEPE-USDT","WIF-USDT","BONK-USDT","JUP-USDT",
+        "SEI-USDT","FTM-USDT","RUNE-USDT","AAVE-USDT","UNI-USDT",
+        "CRV-USDT","MKR-USDT","SNX-USDT","COMP-USDT","1INCH-USDT",
+        "LDO-USDT","BLUR-USDT","IMX-USDT","RNDR-USDT","FIL-USDT",
+        "AR-USDT","ICP-USDT","FLOW-USDT","THETA-USDT","VET-USDT",
+        "EOS-USDT","XLM-USDT","ALGO-USDT","HBAR-USDT","EGLD-USDT",
+        "SAND-USDT","MANA-USDT","AXS-USDT","GALA-USDT","ENJ-USDT",
+        "CHZ-USDT","ROSE-USDT","ZIL-USDT","ONE-USDT","KAVA-USDT",
+        "ETC-USDT","BCH-USDT","NEO-USDT","WAVES-USDT","IOTA-USDT",
+        "ZRX-USDT","BAT-USDT","ANKR-USDT","WOO-USDT","MAGIC-USDT",
+        "GMX-USDT","DYDX-USDT","BERA-USDT","ONDO-USDT","POPCAT-USDT",
+        "PNUT-USDT","GOAT-USDT","MOODENG-USDT","ACT-USDT","PI-USDT",
+        "GRASS-USDT","KAITO-USDT","ZEC-USDT","XMR-USDT","DASH-USDT",
+    ]
+
+
+# ── Cache ─────────────────────────────────────────────────────
+
+_cache_pares = []
+_cache_ts    = 0
+_CACHE_TTL   = 3600  # 1 hora
+
+
+def get_pares_cached(volumen_min: float = VOLUMEN_MIN_24H) -> list:
+    global _cache_pares, _cache_ts
+    if time.time() - _cache_ts > _CACHE_TTL or not _cache_pares:
+        _cache_pares = get_todos_los_pares(volumen_min)
+        _cache_ts    = time.time()
+        log.info(f"[SCANNER] Cache actualizada: {len(_cache_pares)} pares")
+        # Filtrar pares eliminados por aprendizaje (memoria)
+    if _memoria:
+        try:
+            _cache_pares = _memoria.filtrar_pares(_cache_pares)
+        except Exception as e:
+            log.warning(f"[SCANNER] filtrar_pares error (ignorado): {e}")
+
+    # Filtrar pares que fallaron en API (exchange)
+    try:
+        import exchange as _ex
+        ns = _ex.get_pares_no_soportados()
+        if ns:
+            antes = len(_cache_pares)
+            _cache_pares = [p for p in _cache_pares if p not in ns]
+            log.debug(f"[SCANNER] {antes - len(_cache_pares)} pares bloqueados por API eliminados")
+    except Exception:
+        pass
+
+    return _cache_pares

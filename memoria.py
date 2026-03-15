@@ -1,257 +1,405 @@
 """
-memoria.py — Persistencia, compounding y aprendizaje del bot
-SMC Bot v5.0 [MetaClaw Edition]
-"""
-import json
-import logging
-import os
-from datetime import datetime, timezone
+memoria.py v4.2 — Aprendizaje + Compounding + Eliminación permanente
 
-import config
+✅ APRENDE: WR por par/KZ/patrón → ajusta score dinámicamente
+✅ REINVIERTE: +$1/trade cada $30 ganados netos (base $10, max $50)
+✅ ELIMINA: WR≤15% en 10+ trades | 6 pérd. consecutivas | 2 errores API
+"""
+
+import json, time, logging, os, shutil
+from datetime import datetime
 
 log = logging.getLogger("memoria")
 
-_DATA_PATH = (
-    os.path.join(config.MEMORY_DIR, "bot_memoria.json")
-    if config.MEMORY_DIR
-    else "bot_memoria.json"
-)
+_DIR = os.getenv("MEMORY_DIR", "").strip()
+if _DIR:
+    os.makedirs(_DIR, exist_ok=True)
 
-# ── FIX: crear el directorio ANTES de intentar leer/escribir ──────────────
-if config.MEMORY_DIR:
-    try:
-        import pathlib
-        pathlib.Path(config.MEMORY_DIR).mkdir(parents=True, exist_ok=True)
-    except Exception as _e:
-        log.warning(f"[MEM] No se pudo crear directorio {config.MEMORY_DIR}: {_e}")
-# ─────────────────────────────────────────────────────────────────────────
+MEMORY_FILE    = os.path.join(_DIR, "memoria.json")    if _DIR else "memoria.json"
+MEMORY_BKUP    = MEMORY_FILE.replace(".json", "_bkup.json")
+MEMORY_TMP     = MEMORY_FILE.replace(".json", "_tmp.json")
+BLACKLIST_FILE = os.path.join(_DIR, "blacklist.json")  if _DIR else "blacklist.json"
 
-_DEFAULT: dict = {
-    "trades":       [],
-    "compounding":  {
-        "ganancias":             0.0,
-        "total_ganado":          0.0,
-        "total_perdido":         0.0,
-        "inversion_acumulada":   0.0,
+_data = {
+    "pares":       {},
+    "killzones":   {},
+    "patrones":    {},
+    "compounding": {
+        "nivel":         10.0,
+        "ganancias":     0.0,
+        "total_ganado":  0.0,
+        "total_perdido": 0.0,
+        "racha_wins":    0,
+        "racha_losses":  0,
     },
-    "pares_stats":  {},   # par → {trades, wins, pnl_total, errores}
-    "errores_api":  {},   # par → count  (legacy, ahora en pares_stats)
+    "trades":      [],
+    "actualizado": "",
 }
 
-_data: dict = {}
+_blacklist: set = set()
 
 
-def _load():
-    global _data
-    try:
-        if os.path.exists(_DATA_PATH):
-            with open(_DATA_PATH, encoding="utf-8") as f:
-                loaded = json.load(f)
-            _data = {**_DEFAULT, **loaded}
-            # Asegurar sub-claves de compounding
-            comp = _data.setdefault("compounding", {})
-            for k, v in _DEFAULT["compounding"].items():
-                comp.setdefault(k, v)
+# ══════════════════════════════════════════════════════════════
+# PERSISTENCIA
+# ══════════════════════════════════════════════════════════════
+
+def _cargar():
+    global _data, _blacklist
+    if os.path.exists(BLACKLIST_FILE):
+        try:
+            _blacklist = set(json.load(open(BLACKLIST_FILE)))
+            log.info(f"[MEM] 🚫 {len(_blacklist)} pares en blacklist permanente")
+        except Exception as e:
+            log.warning(f"[MEM] blacklist error: {e}")
+
+    for path in [MEMORY_FILE, MEMORY_BKUP]:
+        if not os.path.exists(path):
+            continue
+        try:
+            loaded = json.load(open(path))
+            for k in _data:
+                if k in loaded:
+                    _data[k] = loaded[k]
+            c = _data["compounding"]
+            log.info(f"[MEM] {len(_data['pares'])} pares | {len(_data['trades'])} trades | "
+                     f"${c['nivel']:.2f}/trade | Pool: ${c['ganancias']:.2f}")
             return
-    except Exception as e:
-        log.warning(f"[MEM] Error cargando {_DATA_PATH}: {e}")
-    # Reset limpio
-    _data = {
-        "trades":      [],
-        "compounding": dict(_DEFAULT["compounding"]),
-        "pares_stats": {},
-        "errores_api": {},
-    }
+        except Exception as e:
+            log.warning(f"[MEM] Error cargando {path}: {e}")
+    log.info("[MEM] Memoria nueva")
 
 
-def _save():
+def _guardar():
     try:
-        with open(_DATA_PATH, "w", encoding="utf-8") as f:
-            json.dump(_data, f, indent=2, ensure_ascii=False)
+        _data["actualizado"] = datetime.now().isoformat()
+        with open(MEMORY_TMP, "w") as f:
+            json.dump(_data, f, indent=2)
+        if os.path.exists(MEMORY_FILE):
+            shutil.copy2(MEMORY_FILE, MEMORY_BKUP)
+        os.replace(MEMORY_TMP, MEMORY_FILE)
     except Exception as e:
         log.warning(f"[MEM] Error guardando: {e}")
 
 
-_load()
+def _guardar_blacklist():
+    try:
+        with open(BLACKLIST_FILE, "w") as f:
+            json.dump(list(_blacklist), f, indent=2)
+    except Exception as e:
+        log.warning(f"[MEM] Error blacklist: {e}")
 
 
-# ═══════════════════════════════════════════════════════
-# COMPOUNDING
-# ═══════════════════════════════════════════════════════
+def _par(p: str) -> dict:
+    if p not in _data["pares"]:
+        _data["pares"][p] = {
+            "wins": 0, "losses": 0, "pnl": 0.0,
+            "blocked_until": 0.0, "consec_losses": 0,
+            "consec_wins": 0, "errores_api": 0,
+        }
+    return _data["pares"][p]
+
+
+def _kz(kz: str) -> dict:
+    if kz not in _data["killzones"]:
+        _data["killzones"][kz] = {"wins": 0, "losses": 0, "pnl": 0.0}
+    return _data["killzones"][kz]
+
+
+def _patron(motivos: list) -> dict:
+    key = "+".join(sorted(motivos or []))
+    if key not in _data["patrones"]:
+        _data["patrones"][key] = {"wins": 0, "losses": 0, "pnl": 0.0}
+    return _data["patrones"][key]
+
+
+_cargar()
+
+
+# ══════════════════════════════════════════════════════════════
+# BLACKLIST PERMANENTE
+# ══════════════════════════════════════════════════════════════
+
+def esta_eliminado(par: str) -> bool:
+    return par in _blacklist
+
+
+def eliminar_par(par: str, razon: str) -> bool:
+    if par in _blacklist:
+        return False
+    _blacklist.add(par)
+    _guardar_blacklist()
+    if par in _data["pares"]:
+        _data["pares"][par]["eliminado_razon"] = razon
+    log.warning(f"[ELIMINADO] 🚫 {par} — {razon}")
+    return True
+
+
+def filtrar_pares(pares: list) -> list:
+    """Filtra lista de pares quitando los de blacklist. Usar en scanner."""
+    antes    = len(pares)
+    filtrado = [p for p in pares if p not in _blacklist]
+    if antes - len(filtrado) > 0:
+        log.debug(f"[MEM] Filtrados {antes - len(filtrado)} pares de blacklist")
+    return filtrado
+
+
+# ══════════════════════════════════════════════════════════════
+# COMPOUNDING — reinversión automática
+# ══════════════════════════════════════════════════════════════
 
 def get_trade_amount() -> float:
     """
-    Calcula el tamaño del próximo trade con compounding real:
-    - Sube: cada COMPOUND_STEP_USDT ganados → +COMPOUND_ADD_USDT
-    - Baja: racha perdedora reduce el tamaño (máx -30% del base)
-    - Nunca supera TRADE_USDT_MAX ni baja de TRADE_USDT_BASE * 0.5
+    $10 base + $1 por cada $30 ganados netos.
+    Racha ≥3 pérdidas → tamaño reducido al 75%.
+    Máximo $50.
     """
-    base      = float(config.TRADE_USDT_BASE)
-    max_amt   = float(config.TRADE_USDT_MAX)
-    step      = float(config.COMPOUND_STEP_USDT)
-    add       = float(config.COMPOUND_ADD_USDT)
-    ganancias = float(_data["compounding"].get("ganancias", 0.0))
-    perdidas  = float(_data["compounding"].get("total_perdido", 0.0))
+    c     = _data["compounding"]
+    base  = 10.0
+    extra = (c["ganancias"] // 30) * 1.0
+    nivel = min(base + extra, 50.0)
+    if c["racha_losses"] >= 3:
+        nivel = max(base, round(nivel * 0.75, 2))
+    nivel = round(nivel, 2)
+    c["nivel"] = nivel
+    return nivel
 
-    # Subir según ganancias acumuladas
-    if step > 0 and ganancias > 0:
-        niveles  = int(ganancias // step)
-        cantidad = base + niveles * add
+
+def _update_compounding(pnl: float):
+    c = _data["compounding"]
+    if pnl >= 0:
+        c["total_ganado"] += pnl
+        c["racha_wins"]   += 1
+        c["racha_losses"]  = 0
+        c["ganancias"]     = round(c["ganancias"] + pnl, 4)
+        nuevo = min(10.0 + (c["ganancias"] // 30), 50.0)
+        if nuevo > c["nivel"]:
+            log.info(f"[COMPOUND] 📈 ${c['nivel']:.2f} → ${nuevo:.2f}/trade "
+                     f"(pool: ${c['ganancias']:.2f})")
+        c["nivel"] = nuevo
     else:
-        cantidad = base
-
-    # Bajar si hay racha perdedora reciente (últimos 5 trades)
-    trades_recientes = _data.get("trades", [])[-5:]
-    if len(trades_recientes) >= 3:
-        perdidas_recientes = sum(1 for t in trades_recientes if not t.get("ganado"))
-        if perdidas_recientes >= 4:          # 4+ perdidos de los últimos 5
-            cantidad = max(cantidad * 0.7, base * 0.5)
-        elif perdidas_recientes >= 3:        # 3 perdidos de los últimos 5
-            cantidad = max(cantidad * 0.85, base * 0.5)
-
-    return min(max(cantidad, base * 0.5), max_amt)
+        c["total_perdido"] += abs(pnl)
+        c["racha_losses"]  += 1
+        c["racha_wins"]     = 0
+        c["ganancias"]      = max(0.0, round(c["ganancias"] + pnl, 4))
+        if c["racha_losses"] >= 3:
+            log.warning(f"[COMPOUND] ⚠️ {c['racha_losses']} pérdidas seguidas — "
+                        f"reduciendo a ${get_trade_amount():.2f}")
 
 
-def registrar_ganancia_compounding(pnl: float):
-    comp = _data["compounding"]
-    if pnl > 0:
-        comp["ganancias"]    = comp.get("ganancias", 0.0) + pnl
-        comp["total_ganado"] = comp.get("total_ganado", 0.0) + pnl
-    else:
-        comp["total_perdido"] = comp.get("total_perdido", 0.0) + abs(pnl)
-        # Las pérdidas NO reducen el pool de compounding (reinversión solo de ganancias)
-    _save()
-
-
-def registrar_inversion(usdt: float):
-    _data["compounding"]["inversion_acumulada"] = (
-        _data["compounding"].get("inversion_acumulada", 0.0) + usdt
-    )
-    _save()
-
-
-# ═══════════════════════════════════════════════════════
-# TRADES
-# ═══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# REGISTRAR RESULTADO
+# ══════════════════════════════════════════════════════════════
 
 def registrar_resultado(par: str, pnl: float, lado: str,
                         kz: str = "", motivos: list = None):
-    ganado = pnl > 0
-    trade  = {
-        "par":     par,
-        "pnl":     round(pnl, 6),
-        "lado":    lado,
-        "kz":      kz,
+    d   = _par(par)
+    kd  = _kz(kz) if kz else None
+    pd  = _patron(motivos)
+
+    d["pnl"] = round(d["pnl"] + pnl, 4)
+
+    if pnl >= 0:
+        d["wins"]          += 1
+        d["consec_wins"]   += 1
+        d["consec_losses"]  = 0
+        d["errores_api"]    = max(0, d["errores_api"] - 1)
+        if kd: kd["wins"] += 1; kd["pnl"] = round(kd["pnl"] + pnl, 4)
+        pd["wins"] += 1;        pd["pnl"] = round(pd["pnl"] + pnl, 4)
+    else:
+        d["losses"]        += 1
+        d["consec_losses"] += 1
+        d["consec_wins"]    = 0
+        if kd: kd["losses"] += 1; kd["pnl"] = round(kd["pnl"] + pnl, 4)
+        pd["losses"] += 1;         pd["pnl"] = round(pd["pnl"] + pnl, 4)
+
+        total = d["wins"] + d["losses"]
+
+        # ── Bloqueos temporales ──
+        if d["consec_losses"] >= 3:
+            d["blocked_until"] = time.time() + 7200
+            log.warning(f"[MEM] {par} bloqueado 2h ({d['consec_losses']} pérd. consecutivas)")
+
+        if total >= 6 and d["losses"] / total >= 0.75:
+            d["blocked_until"] = time.time() + 14400
+            log.warning(f"[MEM] {par} bloqueado 4h (WR={d['wins']/total*100:.0f}%)")
+
+        # ── Eliminación permanente ──
+        if total >= 10 and d["wins"] / total <= 0.15:
+            eliminar_par(par, f"WR={d['wins']/total*100:.0f}% en {total} trades")
+
+        if d["consec_losses"] >= 6:
+            eliminar_par(par, f"{d['consec_losses']} pérdidas consecutivas")
+
+        if total >= 8 and d["pnl"] <= -3.0:
+            eliminar_par(par, f"PnL={d['pnl']:.2f}$ en {total} trades")
+
+    _update_compounding(pnl)
+
+    _data["trades"].append({
+        "par": par, "lado": lado,
+        "pnl": round(pnl, 4), "kz": kz,
         "motivos": motivos or [],
-        "ts":      datetime.now(timezone.utc).isoformat(),
-        "ganado":  ganado,
-    }
-    _data["trades"].append(trade)
-    # Mantener máx 500 trades en disco
-    if len(_data["trades"]) > 500:
-        _data["trades"] = _data["trades"][-500:]
-
-    stats = _data["pares_stats"].setdefault(par, {
-        "trades": 0, "wins": 0, "pnl_total": 0.0, "errores": 0,
+        "size": get_trade_amount(),
+        "ts":   datetime.now().isoformat(),
     })
-    stats["trades"]    = stats.get("trades", 0) + 1
-    stats["wins"]      = stats.get("wins", 0) + (1 if ganado else 0)
-    stats["pnl_total"] = stats.get("pnl_total", 0.0) + pnl
+    if len(_data["trades"]) > 2000:
+        _data["trades"] = _data["trades"][-2000:]
 
-    registrar_ganancia_compounding(pnl)
-    _save()
-    log.info(f"[MEM] {par} {lado} PnL={pnl:+.4f} {'✅' if ganado else '❌'}")
+    _guardar()
+    c = _data["compounding"]
+    log.info(f"[MEM] {par} W:{d['wins']} L:{d['losses']} "
+             f"PnL:{d['pnl']:+.2f} | Pool:${c['ganancias']:.2f} | "
+             f"Próx:${get_trade_amount():.2f}")
 
+
+# ══════════════════════════════════════════════════════════════
+# ERROR API → 2 fallos = eliminación permanente
+# ══════════════════════════════════════════════════════════════
 
 def registrar_error_api(par: str):
-    stats = _data["pares_stats"].setdefault(par, {
-        "trades": 0, "wins": 0, "pnl_total": 0.0, "errores": 0,
-    })
-    stats["errores"] = stats.get("errores", 0) + 1
-    _save()
+    d = _par(par)
+    d["errores_api"] += 1
+    if d["errores_api"] >= 2:
+        eliminar_par(par, f"{d['errores_api']} errores API — par no soportado")
+    else:
+        d["blocked_until"] = time.time() + 3600
+        log.warning(f"[MEM] {par} bloqueado 1h (1er error API)")
+    _guardar()
 
 
-# ═══════════════════════════════════════════════════════
-# BLOQUEOS
-# ═══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# BLOQUEO
+# ══════════════════════════════════════════════════════════════
 
 def esta_bloqueado(par: str) -> bool:
-    """Par bloqueado si muchos errores API o tasa de éxito muy baja."""
-    if par in config.PARES_BLOQUEADOS:
+    if esta_eliminado(par):
         return True
-    stats = _data["pares_stats"].get(par, {})
-    if stats.get("errores", 0) >= 5:
+    d = _par(par)
+    if time.time() < d.get("blocked_until", 0):
         return True
-    trades = stats.get("trades", 0)
-    wins   = stats.get("wins", 0)
-    pnl    = stats.get("pnl_total", 0.0)
-    # Bloquear si ≥5 trades con WR < 20% y PnL negativo
-    if trades >= 5 and (wins / trades) < 0.20 and pnl < -10.0:
-        return True
+    d["blocked_until"] = 0.0
     return False
 
 
-def get_pares_bloqueados() -> list:
-    return [p for p in _data["pares_stats"] if esta_bloqueado(p)]
-
-
-# ═══════════════════════════════════════════════════════
-# TOP PARES Y SCORE
-# ═══════════════════════════════════════════════════════
-
-def get_top_pares(n: int = 10) -> list:
-    """Retorna los N mejores pares por PnL acumulado."""
-    stats = _data["pares_stats"]
-    ranked = sorted(
-        [
-            (p, s) for p, s in stats.items()
-            if s.get("trades", 0) >= 3 and not esta_bloqueado(p)
-        ],
-        key=lambda x: x[1].get("pnl_total", 0.0),
-        reverse=True,
-    )
-    return [p for p, _ in ranked[:n]]
-
+# ══════════════════════════════════════════════════════════════
+# AJUSTE DE SCORE (aprendizaje)
+# ══════════════════════════════════════════════════════════════
 
 def ajustar_score(par: str, score: int, kz: str = "", motivos: list = None) -> int:
-    """Ajusta score ±2 según historial real del par (WR + PnL)."""
-    stats = _data["pares_stats"].get(par, {})
-    trades = stats.get("trades", 0)
-    wins   = stats.get("wins", 0)
-    pnl    = stats.get("pnl_total", 0.0)
-    if trades < 3:
-        return score
-    wr = wins / trades
     ajuste = 0
-    # WR alto y PnL positivo = par ganador → boost
-    if wr >= 0.65 and pnl > 0:
-        ajuste = +2
-    elif wr >= 0.55 and pnl > 0:
-        ajuste = +1
-    # WR bajo o PnL negativo = par perdedor → penalizar
-    elif wr <= 0.30 or (trades >= 5 and pnl < -5.0):
-        ajuste = -2
-    elif wr <= 0.40:
-        ajuste = -1
-    return max(score + ajuste, 0)
+    d      = _par(par)
+    total  = d["wins"] + d["losses"]
+
+    if total >= 5:
+        wr = d["wins"] / total
+        if   wr >= 0.70: ajuste += 2
+        elif wr >= 0.60: ajuste += 1
+        elif wr <= 0.25: ajuste -= 2
+        elif wr <= 0.35: ajuste -= 1
+
+    if kz:
+        kd  = _kz(kz)
+        kzt = kd["wins"] + kd["losses"]
+        if kzt >= 5:
+            kwr = kd["wins"] / kzt
+            if   kwr >= 0.65: ajuste += 1
+            elif kwr <= 0.35: ajuste -= 1
+
+    if motivos:
+        pd  = _patron(motivos)
+        pt  = pd["wins"] + pd["losses"]
+        if pt >= 5:
+            pwr = pd["wins"] / pt
+            if   pwr >= 0.65: ajuste += 1
+            elif pwr <= 0.35: ajuste -= 1
+
+    final = score + ajuste
+    if ajuste != 0:
+        log.debug(f"[MEM] {par} score {score}→{final} ({ajuste:+d})")
+    return final
 
 
-# ═══════════════════════════════════════════════════════
-# RESUMEN
-# ═══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def get_pares_bloqueados() -> list:
+    return [p for p, d in _data["pares"].items()
+            if time.time() < d.get("blocked_until", 0) and p not in _blacklist]
+
+
+def get_top_pares(n: int = 10) -> list:
+    """Devuelve los n mejores pares por PnL neto (activos, no eliminados)."""
+    activos = [
+        (p, d) for p, d in _data["pares"].items()
+        if p not in _blacklist and d["wins"] + d["losses"] >= 2
+    ]
+    top = sorted(activos, key=lambda x: x[1]["pnl"], reverse=True)[:n]
+    return [p for p, _ in top]
+
+
+def registrar_ganancia_compounding(pnl: float):
+    """Actualiza el pool de compounding sin registrar un trade completo.
+    Usar para partial TP parciales donde el trade sigue abierto."""
+    _update_compounding(pnl)
+    _guardar()
+
+
+def registrar_inversion(amount: float):
+    """Registra una inversión realizada (trazabilidad). No bloquea ni aprende."""
+    log.debug(f"[MEM] Inversión registrada: ${amount:.2f}")
+
+
+def desbloquear(par: str):
+    d = _par(par)
+    d["blocked_until"]  = 0.0
+    d["consec_losses"]  = 0
+    _guardar()
+    log.info(f"[MEM] {par} desbloqueado manualmente")
+
+
+# ══════════════════════════════════════════════════════════════
+# RESUMEN TELEGRAM
+# ══════════════════════════════════════════════════════════════
 
 def resumen() -> str:
-    comp   = _data["compounding"]
-    trades = _data["trades"]
-    total  = len(trades)
-    wins   = sum(1 for t in trades if t.get("ganado"))
-    wr     = f"{wins/total*100:.1f}%" if total > 0 else "N/A"
-    bloq   = len(get_pares_bloqueados())
-    pool   = comp.get("ganancias", 0.0)
-    tot_g  = comp.get("total_ganado", 0.0)
+    pares  = _data["pares"]
+    c      = _data["compounding"]
+    tw     = sum(d["wins"]   for d in pares.values())
+    tl     = sum(d["losses"] for d in pares.values())
+    tt     = tw + tl
+    wr     = f"{tw/tt*100:.1f}%" if tt else "N/A"
+    neto   = round(c["total_ganado"] - c["total_perdido"], 4)
+
+    activos = [(p, d) for p, d in pares.items()
+               if p not in _blacklist and d["wins"] + d["losses"] >= 2]
+    mejores = sorted(activos, key=lambda x: x[1]["pnl"], reverse=True)[:3]
+    peores  = sorted(activos, key=lambda x: x[1]["pnl"])[:3]
+
+    top = " | ".join(f"{p}:{d['pnl']:+.2f}" for p, d in mejores)
+    bot = " | ".join(f"{p}:{d['pnl']:+.2f}" for p, d in peores if d["pnl"] < 0)
+
+    best_kz = max(_data["killzones"].items(),
+                  key=lambda x: x[1]["pnl"], default=("N/A", {}))
+
+    bloq = get_pares_bloqueados()
+
     return (
-        f"📚 *Memoria* — {total} trades | WR: {wr}\n"
-        f"💹 PnL total: `${tot_g:+.2f}` | Pool: `${pool:.2f}`\n"
-        f"📊 Próx trade: `${get_trade_amount():.2f} USDT`\n"
-        f"🚫 Pares bloqueados: `{bloq}`"
+        f"🧠 *SMC Bot — Memoria v4.2*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Trades: `{tt}` (✅{tw} / ❌{tl}) WR: `{wr}`\n"
+        f"💵 PnL neto: `${neto:+.4f}` USDT\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Trade actual: `${c['nivel']:.2f}` × 10x\n"
+        f"📈 Pool ganancias: `${c['ganancias']:.2f}` USDT\n"
+        f"🎯 Siguiente subida al operar: `${min(c['nivel']+1, 50):.2f}` en +$30\n"
+        f"🔄 Racha: `+{c['racha_wins']}W` / `-{c['racha_losses']}L`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 Mejores: `{top or 'N/A'}`\n"
+        f"💀 Peores:  `{bot or 'N/A'}`\n"
+        f"🕐 Mejor KZ: `{best_kz[0]}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏸️ Bloqueados: `{len(bloq)}`\n"
+        f"🚫 Eliminados: `{len(_blacklist)}`\n"
+        f"📋 Pares analizados: `{len(pares)}`\n"
     )

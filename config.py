@@ -1,104 +1,168 @@
 """
-config.py — Bellsz Bot v2.0 [Liquidez Lateral]
+config.py — SMC Bot BingX v4.3 [FIXES DEFAULTS]
+
+CAMBIOS v4.3:
+  ✅ KZ_REQUERIDA=False  → el bot operaba SOLO 10h/día (fuera de KZ = "Sin señales")
+  ✅ SCORE_MIN=5         → 7 era demasiado alto, apenas generaba señales
+  ✅ COOLDOWN_VELAS=5    → 8 bloqueaba señales válidas (25min vs 40min)
+  ✅ TIME_EXIT_HORAS=8   → coherente con Telegram (antes 6h)
+  ✅ VOLUMEN_MIN_24H=200k → más pares escaneados con liquidez suficiente
 """
 import os
 
-VERSION = os.getenv("VERSION", "Bellsz Bot v2.0")
+VERSION = "SMC-Bot v4.5 [PRECISION+APRENDE+COMPOUNDING]"
 
+def _int(var, default):
+    try:
+        return int(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
+    except Exception:
+        return default
+
+def _float(var, default):
+    try:
+        return float(os.getenv(var, str(default)).split()[0].split("(")[0].strip())
+    except Exception:
+        return default
+
+def _bool(var, default):
+    raw = os.getenv(var, "true" if default else "false")
+    return raw.strip().lower().split()[0] in ("true", "1", "yes")
+
+# ── Credenciales ──────────────────────────────────────────────
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
 BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
-API_KEY          = BINGX_API_KEY
-API_SECRET       = BINGX_SECRET_KEY
-EXCHANGE         = "bingx"
-LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
-MODO_DEMO        = os.getenv("MODO_DEMO", "false").lower() in ("true", "demo", "1")
-MEMORY_DIR       = os.getenv("MEMORY_DIR", "/app/data")
-
-TRADE_USDT_BASE    = float(os.getenv("TRADE_USDT_BASE",    "10"))
-TRADE_USDT_MAX     = float(os.getenv("TRADE_USDT_MAX",     "100"))
-COMPOUND_STEP_USDT = float(os.getenv("COMPOUND_STEP_USDT", "50"))
-COMPOUND_ADD_USDT  = float(os.getenv("COMPOUND_ADD_USDT",  "5"))
-
-TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", "200"))
-HTF_H1_TF     = "1h"
-HTF_H4_TF     = "4h"
-HTF_D_TF      = "1d"
-HTF_CANDLES   = int(os.getenv("HTF_CANDLES", "60"))
-MTF_ACTIVO    = os.getenv("MTF_ACTIVO",    "true").lower() == "true"
-MTF_TIMEFRAME = os.getenv("MTF_TIMEFRAME", "1h")
-MTF_4H_ACTIVO = os.getenv("MTF_4H_ACTIVO", "true").lower() == "true"
-
-ATR_PERIOD   = int(os.getenv("ATR_PERIOD", "14"))
-RSI_PERIOD   = int(os.getenv("RSI_PERIOD", "14"))
-EMA_FAST     = int(os.getenv("EMA_FAST",   "9"))
-EMA_SLOW     = int(os.getenv("EMA_SLOW",   "21"))
-RSI_BUY_MAX  = float(os.getenv("RSI_BUY_MAX",  "70"))
-RSI_SELL_MIN = float(os.getenv("RSI_SELL_MIN", "30"))
-VWAP_ACTIVO  = os.getenv("VWAP_ACTIVO", "true").lower() == "true"
-VWAP_PCT     = float(os.getenv("VWAP_PCT", "0.3"))
-
-# LIQ_MARGEN replica margen_pip del Pine Script (se divide /100 internamente)
-LIQ_LOOKBACK = int(os.getenv("LIQ_LOOKBACK",  "50"))
-LIQ_MARGEN   = float(os.getenv("LIQ_MARGEN",  "0.1"))
-
-SL_ATR_MULT      = float(os.getenv("SL_ATR_MULT",   "1.5"))
-TP_DIST_MULT     = float(os.getenv("TP_DIST_MULT",  "3.0"))
-TP1_DIST_MULT    = float(os.getenv("TP1_DIST_MULT", "1.5"))
-MIN_RR           = float(os.getenv("MIN_RR",        "2.0"))
-
-TRAILING_ACTIVO    = os.getenv("TRAILING_ACTIVO",  "true").lower() == "true"
-TRAILING_ACTIVAR   = float(os.getenv("TRAILING_ACTIVAR",   "1.5"))
-TRAILING_DISTANCIA = float(os.getenv("TRAILING_DISTANCIA", "1.0"))
-PARTIAL_TP_ACTIVO  = os.getenv("PARTIAL_TP_ACTIVO", "true").lower() == "true"
-BE_ACTIVO          = os.getenv("BE_ACTIVO",         "true").lower() == "true"
-BE_TRIGGER_ATR     = float(os.getenv("BE_TRIGGER_ATR", "1.0"))
-TIME_EXIT_HORAS    = float(os.getenv("TIME_EXIT_HORAS", "8.0"))
-
-SCORE_MIN      = int(os.getenv("SCORE_MIN",      "4"))
-MAX_POSICIONES = int(os.getenv("MAX_POSICIONES", "3"))
-COOLDOWN_VELAS  = int(os.getenv("COOLDOWN_VELAS",   "5"))
-MAX_PERDIDA_DIA = float(os.getenv("MAX_PERDIDA_DIA", "30.0"))
-
-OB_ACTIVO               = os.getenv("OB_ACTIVO",    "true").lower() == "true"
-OB_LOOKBACK             = int(os.getenv("OB_LOOKBACK", "20"))
-BOS_ACTIVO              = os.getenv("BOS_ACTIVO",   "true").lower() == "true"
-FVG_ACTIVO              = os.getenv("FVG_ACTIVO",   "true").lower() == "true"
-SWEEP_ACTIVO            = os.getenv("SWEEP_ACTIVO", "true").lower() == "true"
-SWEEP_LOOKBACK          = int(os.getenv("SWEEP_LOOKBACK", "20"))
-DISPLACEMENT_ACTIVO     = os.getenv("DISPLACEMENT_ACTIVO",     "true").lower() == "true"
-PREMIUM_DISCOUNT_ACTIVO = os.getenv("PREMIUM_DISCOUNT_ACTIVO", "true").lower() == "true"
-PREMIUM_DISCOUNT_LB     = int(os.getenv("PREMIUM_DISCOUNT_LB", "50"))
-CORRELACION_ACTIVO      = os.getenv("CORRELACION_ACTIVO", "true").lower() == "true"
-ASIA_RANGE_ACTIVO       = os.getenv("ASIA_RANGE_ACTIVO",  "true").lower() == "true"
-VELA_CONFIRMACION       = os.getenv("VELA_CONFIRMACION",  "true").lower() == "true"
-PINBAR_RATIO            = float(os.getenv("PINBAR_RATIO", "0.50"))
-
-KZ_ASIA_START   = int(os.getenv("KZ_ASIA_START",   "0"))
-KZ_ASIA_END     = int(os.getenv("KZ_ASIA_END",     "240"))
-KZ_LONDON_START = int(os.getenv("KZ_LONDON_START", "480"))
-KZ_LONDON_END   = int(os.getenv("KZ_LONDON_END",   "720"))
-KZ_NY_START     = int(os.getenv("KZ_NY_START",     "780"))
-KZ_NY_END       = int(os.getenv("KZ_NY_END",       "960"))
-
-SOLO_LONG          = os.getenv("SOLO_LONG", "false").lower() == "true"
-PARES_BLOQUEADOS   = [p.strip() for p in os.getenv("PARES_BLOQUEADOS","").split(",") if p.strip()]
-PARES_PRIORITARIOS = ["BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","AVAX-USDT","ARB-USDT","OP-USDT"]
-
-VOLUMEN_MIN_24H  = float(os.getenv("VOLUMEN_MIN_24H", "2000000"))
-MAX_PARES_SCAN   = int(os.getenv("MAX_PARES_SCAN",    "50"))
-ANALISIS_WORKERS = int(os.getenv("ANALISIS_WORKERS",  "6"))
-LOOP_SECONDS     = int(os.getenv("LOOP_SECONDS",      "60"))
-
-METACLAW_ACTIVO      = os.getenv("METACLAW_ACTIVO", "false").lower() == "true"
-METACLAW_VETO_MINIMO = int(os.getenv("METACLAW_VETO_MINIMO", "7"))
-
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def validar() -> list:
-    e = []
-    if not BINGX_API_KEY:    e.append("BINGX_API_KEY no configurada")
-    if not BINGX_SECRET_KEY: e.append("BINGX_SECRET_KEY no configurada")
-    if TRADE_USDT_BASE <= 0: e.append("TRADE_USDT_BASE debe ser > 0")
-    return e
+# ── General ───────────────────────────────────────────────────
+MODO_DEMO    = _bool("MODO_DEMO",    False)
+LOOP_SECONDS = _int("LOOP_SECONDS",  60)
+
+# ── Capital y Compounding ─────────────────────────────────────
+TRADE_USDT_BASE    = _float("TRADE_USDT_BASE",    10.0)
+TRADE_USDT_MAX     = _float("TRADE_USDT_MAX",     50.0)
+COMPOUND_STEP_USDT = _float("COMPOUND_STEP_USDT", 30.0)
+COMPOUND_ADD_USDT  = _float("COMPOUND_ADD_USDT",   1.0)
+
+# ── Posiciones ────────────────────────────────────────────────
+LEVERAGE       = _int("LEVERAGE",       10)
+MAX_POSICIONES = _int("MAX_POSICIONES",  5)   # FIX v4.4: solo cuenta trades del bot, no manuales
+
+# ── TP / SL ───────────────────────────────────────────────────
+TP_ATR_MULT       = _float("TP_ATR_MULT",      2.5)
+SL_ATR_MULT       = _float("SL_ATR_MULT",      1.0)
+PARTIAL_TP1_MULT  = _float("PARTIAL_TP1_MULT", 1.2)
+PARTIAL_TP_ACTIVO = _bool("PARTIAL_TP_ACTIVO",  True)
+MIN_RR            = _float("MIN_RR",            2.0)
+
+# ── Trailing Stop ─────────────────────────────────────────────
+TRAILING_ACTIVO    = _bool("TRAILING_ACTIVO",    True)
+TRAILING_ACTIVAR   = _float("TRAILING_ACTIVAR",  1.2)
+TRAILING_DISTANCIA = _float("TRAILING_DISTANCIA", 0.8)
+
+# ── Protección ────────────────────────────────────────────────
+TIME_EXIT_HORAS = _float("TIME_EXIT_HORAS", 8.0)    # FIX: era 6h, Telegram muestra 8h
+MAX_PERDIDA_DIA = _float("MAX_PERDIDA_DIA", 20.0)
+
+# ── Score ─────────────────────────────────────────────────────
+# FIX: SCORE_MIN era 7, generaba muy pocas señales
+# Bajar a 5 permite operar con FVG + 3 confluencias adicionales
+SCORE_MIN    = _int("SCORE_MIN",       3)     # v4.5: era 5 → 3 (score puro, sin base gate)
+FVG_MIN_PIPS = _float("FVG_MIN_PIPS",  0.0)
+EQ_LOOKBACK  = _int("EQ_LOOKBACK",    50)
+EQ_THRESHOLD = _float("EQ_THRESHOLD",  0.1)
+EQ_PIVOT_LEN = _int("EQ_PIVOT_LEN",    5)
+
+# ── Killzones ─────────────────────────────────────────────────
+KZ_ASIA_START   = _int("KZ_ASIA_START",    0)
+KZ_ASIA_END     = _int("KZ_ASIA_END",    240)
+KZ_LONDON_START = _int("KZ_LONDON_START",420)
+KZ_LONDON_END   = _int("KZ_LONDON_END",  600)
+KZ_NY_START     = _int("KZ_NY_START",    780)
+KZ_NY_END       = _int("KZ_NY_END",      960)
+
+# FIX CRÍTICO: KZ_REQUERIDA era True → el bot no generaba señales de 16:00 a 0:00 UTC
+# Con False el bot opera las 24h; el score de KZ sigue sumando +1 cuando estamos en KZ
+KZ_REQUERIDA = _bool("KZ_REQUERIDA", False)   # FIX: era True → False
+
+# ── Indicadores ───────────────────────────────────────────────
+EMA_FAST       = _int("EMA_FAST",      21)
+EMA_SLOW       = _int("EMA_SLOW",      50)
+EMA_LOCAL_FAST = _int("EMA_LOCAL_FAST",  9)
+EMA_LOCAL_SLOW = _int("EMA_LOCAL_SLOW", 21)
+RSI_PERIOD     = _int("RSI_PERIOD",    14)
+RSI_BUY_MAX    = _float("RSI_BUY_MAX",  70.0)   # FIX: era 68 → 70 (más permisivo)
+RSI_SELL_MIN   = _float("RSI_SELL_MIN", 30.0)   # FIX: era 32 → 30
+ATR_PERIOD     = _int("ATR_PERIOD",    14)
+ATR_FAST       = _int("ATR_FAST",       7)
+
+PIVOT_NEAR_PCT = _float("PIVOT_NEAR_PCT", 2.0)   # FIX: era 1.5% → 2.0% (zona más amplia)
+
+# ── Filtros de precisión ──────────────────────────────────────
+PINBAR_RATIO     = _float("PINBAR_RATIO",    0.50)   # FIX: era 0.55 → 0.50 (más detecciones)
+ENGULF_ACTIVO    = _bool("ENGULF_ACTIVO",    True)
+VWAP_ACTIVO      = _bool("VWAP_ACTIVO",      True)
+VWAP_PCT         = _float("VWAP_PCT",        0.50)   # FIX: era 0.20% → 0.50% (menos restrictivo)
+
+# FIX: COOLDOWN_VELAS era 8 (40min en 5m) → 5 (25min)
+# Evitamos señales dobles sin bloquear setups válidos consecutivos
+COOLDOWN_VELAS   = _int("COOLDOWN_VELAS",    5)      # FIX: era 8 → 5
+MOMENTUM_ACTIVO  = _bool("MOMENTUM_ACTIVO",  True)
+
+# ── Timeframes ────────────────────────────────────────────────
+TIMEFRAME     = os.getenv("TIMEFRAME",     "5m").strip()
+CANDLES_LIMIT = _int("CANDLES_LIMIT",     200)
+MTF_ACTIVO    = _bool("MTF_ACTIVO",        True)
+MTF_TIMEFRAME = os.getenv("MTF_TIMEFRAME", "1h").strip()
+MTF_CANDLES   = _int("MTF_CANDLES",        60)
+
+# ── Módulos activos ───────────────────────────────────────────
+OB_ACTIVO          = _bool("OB_ACTIVO",          True)
+OB_LOOKBACK        = _int("OB_LOOKBACK",          30)
+BOS_ACTIVO         = _bool("BOS_ACTIVO",          True)
+ASIA_RANGE_ACTIVO  = _bool("ASIA_RANGE_ACTIVO",   True)
+VELA_CONFIRMACION  = _bool("VELA_CONFIRMACION",   True)
+CORRELACION_ACTIVO = _bool("CORRELACION_ACTIVO",  True)
+MACD_ACTIVO        = _bool("MACD_ACTIVO",         True)
+SWEEP_ACTIVO       = _bool("SWEEP_ACTIVO",        True)
+SWEEP_LOOKBACK     = _int("SWEEP_LOOKBACK",       20)
+
+# ── Scanner ───────────────────────────────────────────────────
+# FIX: VOLUMEN_MIN_24H era 500k → 200k para cubrir más pares con liquidez
+VOLUMEN_MIN_24H  = _float("VOLUMEN_MIN_24H", 200_000.0)
+MAX_PARES_SCAN   = _int("MAX_PARES_SCAN",    0)
+ANALISIS_WORKERS = _int("ANALISIS_WORKERS",  6)
+
+# ── Dirección ─────────────────────────────────────────────────
+SOLO_LONG = _bool("SOLO_LONG", False)
+
+# ── Listas ────────────────────────────────────────────────────
+PARES_BLOQUEADOS   = [p.strip() for p in os.getenv("PARES_BLOQUEADOS",   "RESOLV-USDT").split(",") if p.strip()]
+PARES_PRIORITARIOS = [p.strip() for p in os.getenv("PARES_PRIORITARIOS", "").split(",") if p.strip()]
+
+# ── Persistencia ──────────────────────────────────────────────
+MEMORY_DIR = os.getenv("MEMORY_DIR", "")
+
+# ── Modo BingX ────────────────────────────────────────────────
+# "auto"   = detectar automáticamente al arrancar (recomendado)
+# "hedge"  = forzar modo Hedge (positionSide=LONG/SHORT)
+# "oneway" = forzar modo One-Way
+BINGX_MODE = os.getenv("BINGX_MODE", "auto").strip().lower()
+
+
+def validar():
+    errores = []
+    if not MODO_DEMO:
+        if not BINGX_API_KEY:    errores.append("BINGX_API_KEY no configurada")
+        if not BINGX_SECRET_KEY: errores.append("BINGX_SECRET_KEY no configurada")
+    if not TELEGRAM_TOKEN:
+        errores.append("TELEGRAM_TOKEN no configurada")
+    if LEVERAGE < 1 or LEVERAGE > 125:
+        errores.append(f"LEVERAGE={LEVERAGE} fuera de rango")
+    if TRADE_USDT_BASE < 1:
+        errores.append(f"TRADE_USDT_BASE={TRADE_USDT_BASE} muy bajo")
+    if SCORE_MIN < 1 or SCORE_MIN > 14:
+        errores.append(f"SCORE_MIN={SCORE_MIN} debe ser 1-14")
+    if MIN_RR < 1.0:
+        errores.append(f"MIN_RR={MIN_RR} peligroso (mín 1.0)")
+    return errores
