@@ -1,10 +1,7 @@
 """
-analizar_iofs.py — ULTRA SIMPLE 24/7
-Solo necesita: Supertrend alineado + EMA9 cruzó EMA21
-Sin filtros de volumen, sin RSI, sin nada más.
-Genera señales constantemente en cualquier mercado tendencial.
+analizar_iofs.py — DEBUG + SEÑALES GARANTIZADAS
 """
-import logging, os, time, concurrent.futures
+import logging, time, concurrent.futures
 from datetime import datetime, timezone
 import exchange, config_iofs as cfg
 
@@ -24,17 +21,7 @@ def _atr(hi, lo, cl, n=14):
          for i in range(1, len(hi))]
     return sum(t[-n:]) / n
 
-def _rsi(p, n=14):
-    if len(p) < n+1: return 50.0
-    d = [p[i]-p[i-1] for i in range(1, len(p))]
-    ag = sum(max(x,0) for x in d[:n])/n
-    al = sum(abs(min(x,0)) for x in d[:n])/n
-    for x in d[n:]:
-        ag = (ag*(n-1)+max(x,0))/n
-        al = (al*(n-1)+abs(min(x,0)))/n
-    return 100.0 if al == 0 else round(100-100/(1+ag/al), 2)
-
-def _supertrend(hi, lo, cl, f=3.0, p=10):
+def _supertrend(hi, lo, cl, f=2.0, p=7):
     if len(cl) < p+2: return False, False, False, False, 0.0
     at = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
           for i in range(1, len(cl))]
@@ -52,8 +39,8 @@ def _supertrend(hi, lo, cl, f=3.0, p=10):
         else: dr[i]=-1 if cl[ci]>lb[i] else 1
         st[i]=ub[i] if dr[i]==1 else lb[i]
     bull=dr[-1]<0; bear=dr[-1]>0
-    fb  =(dr[-1]<0 and dr[-2]>0) if len(dr)>=2 else False
-    fbr =(dr[-1]>0 and dr[-2]<0) if len(dr)>=2 else False
+    fb=(dr[-1]<0 and dr[-2]>0) if len(dr)>=2 else False
+    fbr=(dr[-1]>0 and dr[-2]<0) if len(dr)>=2 else False
     return bull, bear, fb, fbr, st[-1]
 
 def en_killzone():
@@ -72,10 +59,14 @@ def registrar_senal_ts(par):
 
 def analizar_par(par: str):
     try:
-        if not _cooldown_ok(par): return None
+        if not _cooldown_ok(par):
+            log.debug(f"[SKIP-CD] {par} en cooldown")
+            return None
 
         candles = exchange.get_candles(par, cfg.TIMEFRAME, cfg.CANDLES_LIMIT)
-        if len(candles) < 40: return None
+        if len(candles) < 30:
+            log.debug(f"[SKIP-C] {par} solo {len(candles)} velas")
+            return None
 
         cl  = [c["close"]  for c in candles]
         hi  = [c["high"]   for c in candles]
@@ -91,27 +82,31 @@ def analizar_par(par: str):
         e21 = _ema(cl, 21)
         if not e9 or not e21: return None
 
-        rsi = _rsi(cl[-20:])
-        bull, bear, fb, fbr, st = _supertrend(hi, lo, cl)
-        kz  = en_killzone()
+        bull, bear, fb, fbr, st = _supertrend(hi, lo, cl, f=2.0, p=7)
+        kz = en_killzone()
 
-        avg_vol = sum(vol[-20:-1]) / 19 if len(vol) >= 20 else vol[-1]
-        rvol    = vol[-1] / avg_vol if avg_vol > 0 else 1.0
+        avg_vol = sum(vol[-20:-1])/19 if len(vol)>=20 else vol[-1]
+        rvol    = vol[-1]/avg_vol if avg_vol>0 else 1.0
+
+        # LOG DE DIAGNÓSTICO — visible en Railway
+        log.info(f"[DIAG] {par:15s} ST:{'B' if bull else 'b'}/{'R' if bear else 'r'} "
+                 f"e9{'>'if e9>e21 else '<'}e21 "
+                 f"RV={rvol:.1f} velas={len(candles)}")
 
         lado = None
-
-        # ── LONG: ST alcista + EMA9 sobre EMA21 ──────
         if bull and e9 > e21:
             lado = "LONG"
-
-        # ── SHORT: ST bajista + EMA9 bajo EMA21 ──────
         elif bear and e9 < e21:
             lado = "SHORT"
 
-        if not lado: return None
-        if lado == "SHORT" and cfg.SOLO_LONG: return None
+        if not lado:
+            log.debug(f"[NO-SIG] {par} bull={bull} bear={bear} e9>e21={e9>e21}")
+            return None
 
-        # ── SL ────────────────────────────────────────
+        if lado == "SHORT" and cfg.SOLO_LONG:
+            return None
+
+        # SL/TP
         rec = candles[-8:-1]
         buf = atr * 0.3
         if lado == "LONG":
@@ -129,30 +124,26 @@ def analizar_par(par: str):
         rr  = abs(tp - precio) / dist
         if rr < 1.5: return None
 
-        # ── Score ─────────────────────────────────────
         score = 4
         if fb or fbr:   score += 3
         if rvol >= 1.5: score += 1
-        if rvol >= 2.5: score += 1
         if kz["in_kz"]: score += 1
 
         tipo = "ST_FLIP" if (fb or fbr) else "ST_EMA"
-        motivos = [tipo, f"RV{rvol:.1f}", f"RSI{rsi:.0f}"]
-        if fb or fbr: motivos.append("FLIP")
+        motivos = [tipo, f"RV{rvol:.1f}"]
         if kz["in_kz"]: motivos.append(f"KZ_{kz['nombre']}")
 
         registrar_senal_ts(par)
         log.info(f"[SEÑAL] {lado:5s} {par:15s} {tipo} "
-                 f"RV={rvol:.1f} RSI={rsi:.0f} "
-                 f"{'FLIP ' if fb or fbr else ''}"
-                 f"sc={score} SL={sl:.6f} TP={tp:.6f} RR={rr:.2f}")
+                 f"RV={rvol:.1f} sc={score} "
+                 f"SL={sl:.6f} TP={tp:.6f} RR={rr:.2f}")
 
         return {
             "par":par,"lado":lado,"precio":precio,
             "sl":round(sl,8),"tp":round(tp,8),
             "tp1":round(tp1,8),"tp2":round(tp,8),
             "atr":round(atr,8),"dist_sl":round(dist,8),
-            "score":score,"rsi":round(rsi,1),"rr":round(rr,2),
+            "score":score,"rsi":50.0,"rr":round(rr,2),
             "motivos":motivos,"kz":kz["nombre"],
             "tipo":tipo,"capa":1,"conf":60.0,"power_bal":60.0,
             "rvol":rvol,"atr_pct":0.0,
