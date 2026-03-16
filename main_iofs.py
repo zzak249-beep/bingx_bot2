@@ -468,23 +468,43 @@ def main():
 
     cargar_posiciones()
 
-    # Construir lista de pares
+    # ── Construir lista COMPLETA de pares ───────────────────────────────
+    # Sin límite de volumen, sin cap de MAX_PARES_SCAN.
+    # Se escanean TODOS los pares USDT de BingX ordenados por volumen.
+    # Los pares que devuelvan 0 velas se bloquean automáticamente
+    # en exchange.get_candles() y se excluyen en ciclos futuros.
+    bloq_cfg   = set(cfg.PARES_BLOQUEADOS)
+    futuros_ok = exchange._CONTRATOS_FUTURES  # puede estar vacío al arranque
+
     try:
-        pares_raw = scanner_pares.get_pares_cached(cfg.VOLUMEN_MIN_24H)
-    except Exception:
+        # get_todos_los_pares() devuelve TODOS sin filtro de volumen
+        pares_raw = scanner_pares.get_todos_los_pares()
+        log.info(f"[SCAN] {len(pares_raw)} pares totales obtenidos de BingX")
+    except Exception as e:
+        log.warning(f"[SCAN] error obteniendo pares: {e} — usando fallback")
         pares_raw = PARES_FIJOS
 
-    bloq_cfg   = set(cfg.PARES_BLOQUEADOS)
-    futuros_ok = exchange._CONTRATOS_FUTURES
-    pares_todos = [p for p in pares_raw
-                   if p not in bloq_cfg and (not futuros_ok or p in futuros_ok)]
+    # Filtrar solo pares bloqueados por config y pares no soportados
+    # Si futuros_ok está vacío (fallo al arranque), NO filtrar por contratos
+    pares_todos = [
+        p for p in pares_raw
+        if p not in bloq_cfg
+        and p not in set(exchange._blocked_pairs)
+        and (not futuros_ok or p in futuros_ok)
+    ]
+
+    # Orden: prioritarios > top memoria > resto — SIN cap
     prioritarios = [p for p in cfg.PARES_PRIORITARIOS if p in set(pares_todos)]
-    top_mem      = [p for p in memoria.get_top_pares(10) if p in set(pares_todos)]
+    top_mem      = [p for p in memoria.get_top_pares(20) if p in set(pares_todos)
+                    and p not in set(prioritarios)]
     resto        = [p for p in pares_todos
                     if p not in set(prioritarios) and p not in set(top_mem)]
-    pares        = (prioritarios + top_mem + resto)[:cfg.MAX_PARES_SCAN]
+    pares        = prioritarios + top_mem + resto   # SIN [:MAX_PARES_SCAN]
 
-    log.info(f"Pares: {len(pares)} ({len(prioritarios)} prioritarios)")
+    log.info(
+        f"Pares cargados: {len(pares)} total "
+        f"({len(prioritarios)} prioritarios, {len(top_mem)} top-mem, {len(resto)} resto)"
+    )
 
     _notif(
         f"🤖 *{cfg.VERSION}* arrancado\n"
@@ -519,17 +539,29 @@ def main():
                 f"Trade:${memoria.get_trade_amount():.2f}"
             )
 
-            # Actualizar lista de pares cada hora
-            if time.time() - last_scan_pares > 3600:
+            # Actualizar lista de pares cada 30 minutos
+            if time.time() - last_scan_pares > 1800:
                 try:
-                    nuevos  = scanner_pares.get_pares_cached(cfg.VOLUMEN_MIN_24H)
-                    nuevos  = [p for p in nuevos
-                               if p not in bloq_cfg and (not futuros_ok or p in futuros_ok)]
-                    top_m   = [p for p in memoria.get_top_pares(10) if p in set(nuevos)]
-                    resto_n = [p for p in nuevos
-                               if p not in set(top_m) and p not in set(memoria.get_pares_bloqueados())]
-                    pares   = (prioritarios + top_m + resto_n)[:cfg.MAX_PARES_SCAN]
-                    log.info(f"Pares actualizados: {len(pares)}")
+                    bloq_mem = set(memoria.get_pares_bloqueados())
+                    bloq_exch = exchange._blocked_pairs
+                    nuevos   = scanner_pares.get_todos_los_pares()
+                    nuevos   = [
+                        p for p in nuevos
+                        if p not in bloq_cfg
+                        and p not in bloq_mem
+                        and p not in bloq_exch
+                        and (not futuros_ok or p in futuros_ok)
+                    ]
+                    top_m    = [p for p in memoria.get_top_pares(20) if p in set(nuevos)
+                                and p not in set(prioritarios)]
+                    resto_n  = [p for p in nuevos
+                                if p not in set(prioritarios) and p not in set(top_m)]
+                    pares    = prioritarios + top_m + resto_n  # SIN cap
+                    stats    = scanner_pares.get_stats()
+                    log.info(
+                        f"Pares actualizados: {len(pares)} "
+                        f"(bloq_velas={stats['bloqueados']})"
+                    )
                     last_scan_pares = time.time()
                 except Exception as e:
                     log.warning(f"[SCAN] {e}")
@@ -553,7 +585,7 @@ def main():
                 pares_scan = [p for p in pares
                               if p not in estado.posiciones and p not in bloq_ahora]
 
-                log.info(f"Escaneando {len(pares_scan)} pares | Pos:{_pos_bot_count()}/{cfg.MAX_POSICIONES}")
+                log.info(f"Escaneando {len(pares_scan)} pares (de {len(pares)} totales) | Pos:{_pos_bot_count()}/{cfg.MAX_POSICIONES}")
                 senales = analizar.analizar_todos(pares_scan, workers=cfg.ANALISIS_WORKERS)
 
                 if senales:
