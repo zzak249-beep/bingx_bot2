@@ -1,10 +1,9 @@
 """
-config_smc.py — SMC Sniper Bot v2.0 [1M Fusion Strategy]
-Liquidez HTF + Order Flow + Supertrend + EMA/RSI
+config_smc.py — SMC Sniper Bot [Liquidez + QML + Stop Clusters]
 """
 import os
 
-VERSION = os.getenv("VERSION", "SMC Sniper Bot v2.0 [1M Fusion]")
+VERSION = os.getenv("VERSION", "SMC Sniper Bot v1.0")
 
 # ─── API BingX ───────────────────────────────────────────────
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY",    "")
@@ -23,42 +22,25 @@ MAX_PERDIDA_DIA    = float(os.getenv("MAX_PERDIDA_DIA",    "30.0"))
 MAX_POSICIONES     = int(os.getenv("MAX_POSICIONES",       "3"))
 
 # ─── Timeframes ──────────────────────────────────────────────
-TIMEFRAME     = os.getenv("TIMEFRAME",     "1m")   # 1M para entradas
-TF_PURGA      = os.getenv("TF_PURGA",      "15m")  # TF donde se detecta purga
-TF_H1         = "1h"
-TF_H4         = "4h"
+TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
 CANDLES_LIMIT = int(os.getenv("CANDLES_LIMIT", "200"))
-CANDLES_HTF   = int(os.getenv("CANDLES_HTF",   "60"))  # candles para H1/H4
+HTF_H1        = "1h"
+HTF_H4        = "4h"
 
-# ─── Estrategia: Liquidez + Purga ────────────────────────────
-LIQ_LOOKBACK    = int(os.getenv("LIQ_LOOKBACK",    "50"))   # velas HTF para buscar max/min
-LIQ_MARGEN_PCT  = float(os.getenv("LIQ_MARGEN_PCT","0.002")) # % tolerancia zona
-LIQ_PURGA_MEM   = int(os.getenv("LIQ_PURGA_MEM",   "12"))   # velas 1M que dura memoria purga
-LIQ_TOQUES_MIN  = int(os.getenv("LIQ_TOQUES_MIN",  "2"))    # toques mínimos en zona antes de señal
-LIQ_TOQUES_WIN  = int(os.getenv("LIQ_TOQUES_WIN",  "30"))   # ventana para contar toques (velas 1M)
-LIQ_USAR_H1     = os.getenv("LIQ_USAR_H1",  "true").lower()  == "true"
-LIQ_USAR_H4     = os.getenv("LIQ_USAR_H4",  "true").lower()  == "true"
-LIQ_USAR_D      = os.getenv("LIQ_USAR_D",   "false").lower() == "true"
+# ─── Estrategia ──────────────────────────────────────────────
+# Liquidity Magnet Zones [identityKa] — pivots
+PIVOT_LEN     = int(os.getenv("PIVOT_LEN",   "15"))   # sensibilidad pivot
 
-# ─── Estrategia: Order Flow ───────────────────────────────────
-OF_FLOW_LEN     = int(os.getenv("OF_FLOW_LEN",    "21"))   # batch length acumulación
-OF_FLOW_RATIO   = float(os.getenv("OF_FLOW_RATIO", "1.8")) # ratio acumulación/distribución
-OF_ICE_MUL      = float(os.getenv("OF_ICE_MUL",   "2.0")) # multiplicador iceberg
-OF_ICE_MIN_VOL  = float(os.getenv("OF_ICE_MIN_VOL","200")) # vol mínimo absoluto iceberg
-OF_SPOOF_PULL   = float(os.getenv("OF_SPOOF_PULL", "0.4")) # caída % vol para spoof
+# QML FTB [Malibu] — Quasimodo structure
+QML_ZIGZAG    = int(os.getenv("QML_ZIGZAG",  "13"))   # zigzag sensitivity
+QML_MIN_ATR   = float(os.getenv("QML_MIN_ATR","1.5")) # estructura mínima en ATR
 
-# ─── Estrategia: Confirmaciones ──────────────────────────────
-EMA_RAPIDA      = int(os.getenv("EMA_RAPIDA",    "9"))
-EMA_LENTA       = int(os.getenv("EMA_LENTA",     "21"))
-EMA_MODO        = os.getenv("EMA_MODO", "ALINEACION")  # CRUCE | ALINEACION | CUALQUIERA
-RSI_LEN         = int(os.getenv("RSI_LEN",       "14"))
-RSI_OB          = float(os.getenv("RSI_OB",      "70"))
-RSI_OS          = float(os.getenv("RSI_OS",      "30"))
-ST_FACTOR       = float(os.getenv("ST_FACTOR",   "3.0"))
-ST_PERIOD       = int(os.getenv("ST_PERIOD",     "10"))
-VOL_LOOKBACK    = int(os.getenv("VOL_LOOKBACK",  "20"))
-VOL_MULT        = float(os.getenv("VOL_MULT",    "1.2"))  # RVOL mínimo (1.0 = bypass)
-SCORE_MINIMO    = int(os.getenv("SCORE_MINIMO",  "55"))   # score 0-100 para señal
+# Stop Loss Clustering [Kioseff] — stop clusters
+CLUSTER_BARS  = int(os.getenv("CLUSTER_BARS", "20"))  # lookback stops
+
+# Volumen
+VOL_LOOKBACK  = int(os.getenv("VOL_LOOKBACK", "20"))
+VOL_MULT      = float(os.getenv("VOL_MULT",   "1.3")) # RVOL mínimo
 
 # ─── SL / TP ─────────────────────────────────────────────────
 SL_ATR_MULT   = float(os.getenv("SL_ATR_MULT",   "1.5"))
@@ -72,18 +54,18 @@ TRAILING_ACTIVAR   = float(os.getenv("TRAILING_ACTIVAR",   "1.5"))
 TRAILING_DISTANCIA = float(os.getenv("TRAILING_DISTANCIA", "1.0"))
 PARTIAL_TP_ACTIVO  = os.getenv("PARTIAL_TP_ACTIVO", "true").lower() == "true"
 BE_ACTIVO          = os.getenv("BE_ACTIVO",         "true").lower() == "true"
-TIME_EXIT_HORAS    = float(os.getenv("TIME_EXIT_HORAS", "4.0"))  # 4h en 1M
-COOLDOWN_VELAS     = int(os.getenv("COOLDOWN_VELAS",    "5"))    # cooldown entre señales
+TIME_EXIT_HORAS    = float(os.getenv("TIME_EXIT_HORAS", "8.0"))
+COOLDOWN_VELAS     = int(os.getenv("COOLDOWN_VELAS",    "5"))
 
 # ─── Pares ───────────────────────────────────────────────────
 SOLO_LONG          = os.getenv("SOLO_LONG", "false").lower() == "true"
 PARES_BLOQUEADOS   = [p.strip() for p in os.getenv("PARES_BLOQUEADOS","").split(",") if p.strip()]
 PARES_PRIORITARIOS = ["BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
                       "AVAX-USDT","ARB-USDT","OP-USDT","DOGE-USDT","LINK-USDT"]
-MAX_PARES_SCAN     = int(os.getenv("MAX_PARES_SCAN",    "20"))
-VOLUMEN_MIN_24H    = float(os.getenv("VOLUMEN_MIN_24H", "5000000"))
-ANALISIS_WORKERS   = int(os.getenv("ANALISIS_WORKERS",  "4"))
-LOOP_SECONDS       = int(os.getenv("LOOP_SECONDS",      "60"))  # 60s en 1M
+MAX_PARES_SCAN     = int(os.getenv("MAX_PARES_SCAN",   "30"))
+VOLUMEN_MIN_24H    = float(os.getenv("VOLUMEN_MIN_24H","10000000"))
+ANALISIS_WORKERS   = int(os.getenv("ANALISIS_WORKERS", "4"))
+LOOP_SECONDS       = int(os.getenv("LOOP_SECONDS",     "90"))
 
 # ─── Telegram ────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
@@ -101,6 +83,16 @@ def validar() -> list:
     if not BINGX_API_KEY:    e.append("BINGX_API_KEY no configurada")
     if not BINGX_SECRET_KEY: e.append("BINGX_SECRET_KEY no configurada")
     if TRADE_USDT_BASE <= 0: e.append("TRADE_USDT_BASE debe ser > 0")
-    if TIMEFRAME not in ("1m","3m","5m","15m"):
-        e.append(f"TIMEFRAME={TIMEFRAME} — para 1M usar '1m'")
     return e
+
+# ─── Delta Strike 量能猎杀 [KodaTao] ─────────────────
+DS_VOL_SHORT   = int(os.getenv("DS_VOL_SHORT",   "20"))
+DS_VOL_MID     = int(os.getenv("DS_VOL_MID",     "60"))
+DS_VOL_LONG    = int(os.getenv("DS_VOL_LONG",   "180"))
+DS_RATIO_SHORT = float(os.getenv("DS_RATIO_SHORT","1.5"))
+DS_RATIO_MID   = float(os.getenv("DS_RATIO_MID",  "3.0"))
+DS_RATIO_LONG  = float(os.getenv("DS_RATIO_LONG", "5.0"))
+DS_RSI_OB      = float(os.getenv("DS_RSI_OB",    "60"))
+DS_RSI_OS      = float(os.getenv("DS_RSI_OS",    "40"))
+DS_IMB_RATIO   = float(os.getenv("DS_IMB_RATIO",  "2.0"))
+DS_N_CONFIRM   = int(os.getenv("DS_N_CONFIRM",    "5"))

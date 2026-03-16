@@ -1,7 +1,6 @@
 """
-memoria_smc.py — Sistema de memoria y compounding para SMC Bot v2.0
+memoria_smc.py — Sistema de memoria y compounding para SMC Bot
 Standalone: no depende de ningún otro módulo del bot.
-Añadido: get_compounding_info() público para evitar acceso directo a _data
 """
 import json
 import os
@@ -15,11 +14,11 @@ log = logging.getLogger("memoria")
 _FNAME = os.path.join(cfg.MEMORY_DIR, "memoria_smc.json")
 
 _DEFAULT = {
-    "compounding":     {"ganancias": 0.0, "nivel": 0},
-    "trades":          [],
-    "pares_stats":     {},
-    "errores_api":     {},
-    "pares_bloq":      [],
+    "compounding":   {"ganancias": 0.0, "nivel": 0},
+    "trades":        [],
+    "pares_stats":   {},
+    "errores_api":   {},
+    "pares_bloq":    [],
     "inversion_total": 0.0,
 }
 
@@ -32,6 +31,7 @@ def _load():
         if os.path.exists(_FNAME):
             with open(_FNAME, encoding="utf-8") as f:
                 _data = json.load(f)
+            # asegurar claves
             for k, v in _DEFAULT.items():
                 if k not in _data:
                     _data[k] = v
@@ -59,18 +59,15 @@ _load()
 # ══════════════════════════════════════════════════════
 
 def get_trade_amount() -> float:
+    """Retorna el tamaño de trade actual con compounding."""
     comp  = _data["compounding"]
     nivel = comp.get("nivel", 0)
     base  = cfg.TRADE_USDT_BASE + nivel * cfg.COMPOUND_ADD_USDT
     return min(round(base, 2), cfg.TRADE_USDT_MAX)
 
 
-def get_compounding_info() -> dict:
-    """Acceso público al estado del compounding (evita _data directo)."""
-    return dict(_data.get("compounding", {"ganancias": 0.0, "nivel": 0}))
-
-
 def registrar_ganancia_compounding(pnl: float):
+    """Acumula ganancias y sube el nivel si corresponde."""
     if pnl <= 0:
         return
     comp = _data["compounding"]
@@ -95,6 +92,7 @@ def registrar_inversion(usdt: float):
 
 def registrar_resultado(par: str, pnl: float, lado: str,
                          kz: str = "", motivos: list = None):
+    """Registra el resultado de un trade cerrado."""
     ganado = pnl > 0
     trade  = {
         "ts":      datetime.now(timezone.utc).isoformat(),
@@ -109,6 +107,7 @@ def registrar_resultado(par: str, pnl: float, lado: str,
     if len(_data["trades"]) > 500:
         _data["trades"] = _data["trades"][-500:]
 
+    # Stats por par
     ps = _data["pares_stats"].setdefault(par, {"trades": 0, "wins": 0, "pnl": 0.0})
     ps["trades"] += 1
     ps["wins"]   += int(ganado)
@@ -117,22 +116,25 @@ def registrar_resultado(par: str, pnl: float, lado: str,
     if ganado:
         registrar_ganancia_compounding(pnl)
     else:
+        # Bloquear par si pierde 3 veces seguidas
         ultimos = [t for t in _data["trades"][-6:] if t["par"] == par]
         if len(ultimos) >= 3 and all(not t["ganado"] for t in ultimos[-3:]):
             if par not in _data["pares_bloq"]:
                 _data["pares_bloq"].append(par)
                 log.warning(f"[MEM] {par} bloqueado por 3 pérdidas seguidas")
+
     _save()
 
 
 def ajustar_score(par: str, score: int, kz: str = "", motivos: list = None) -> int:
+    """Ajusta el score según historial del par."""
     ps = _data["pares_stats"].get(par, {})
     t  = ps.get("trades", 0)
     if t < 3:
         return score
     wr = ps.get("wins", 0) / t
-    if wr >= 0.65: return score + 1
-    if wr <= 0.30: return score - 1
+    if wr >= 0.65:  return score + 1
+    if wr <= 0.30:  return score - 1
     return score
 
 
@@ -145,7 +147,8 @@ def get_pares_bloqueados() -> list:
 
 
 def get_top_pares(n: int = 10) -> list:
-    ps     = _data.get("pares_stats", {})
+    """Retorna los N pares con mejor PnL histórico."""
+    ps = _data.get("pares_stats", {})
     ranked = sorted(ps.items(), key=lambda x: x[1].get("pnl", 0), reverse=True)
     return [p for p, _ in ranked[:n]]
 
@@ -167,9 +170,9 @@ def resumen() -> str:
     wins = sum(1 for t in trades if t["ganado"])
     pnl  = sum(t["pnl"] for t in trades)
     wr   = wins / total * 100
-    comp = get_compounding_info()
+    comp = _data["compounding"]
     return (
-        f"📊 *Memoria SMC Bot v2.0*\n"
+        f"📊 *Memoria SMC Bot*\n"
         f"Trades: `{total}` | WR: `{wr:.1f}%`\n"
         f"PnL total: `${pnl:+.2f}`\n"
         f"Pool compounding: `${comp['ganancias']:.2f}`\n"
