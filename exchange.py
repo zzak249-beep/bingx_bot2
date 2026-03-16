@@ -128,22 +128,56 @@ def sync_server_time():
 # ═══════════════════════════════════════════════════════
 
 def _cargar_contratos():
+    """
+    Carga contratos con 3 reintentos. Si todos fallan, usa fallback hardcoded
+    para que el bot nunca escanee pares inexistentes en BingX.
+    """
     global _QTY_PRECISION, _MIN_QTY
-    try:
-        data  = _get("/openApi/swap/v2/quote/contracts")
-        items = data.get("data", []) or []
-        for item in items:
-            sym  = item.get("symbol", "")
-            if not sym:
-                continue
-            _CONTRATOS_FUTURES.add(sym)
-            prec = int(item.get("quantityPrecision", 4) or 4)
-            mq   = float(item.get("minQty", 0) or 0)
-            _QTY_PRECISION[sym] = prec
-            _MIN_QTY[sym]       = mq
-        log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} futuros cargados")
-    except Exception as e:
-        log.warning(f"[CONTRATOS] {e}")
+
+    _FALLBACK_CONTRATOS = {
+        "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT",
+        "AVAX-USDT","ARB-USDT","OP-USDT","DOGE-USDT","LINK-USDT",
+        "NEAR-USDT","APT-USDT","SUI-USDT","INJ-USDT","TIA-USDT",
+        "MATIC-USDT","DOT-USDT","ATOM-USDT","LTC-USDT","BCH-USDT",
+        "FIL-USDT","SAND-USDT","MANA-USDT","AXS-USDT","FTM-USDT",
+        "ALGO-USDT","VET-USDT","ICP-USDT","ETC-USDT","EGLD-USDT",
+        "RUNE-USDT","MINA-USDT","FLOW-USDT","ROSE-USDT","KSM-USDT",
+        "CRV-USDT","SNX-USDT","ENJ-USDT","CHZ-USDT","BAT-USDT",
+        "ZIL-USDT","STORJ-USDT","LRC-USDT","SKL-USDT","1INCH-USDT",
+        "ANKR-USDT","CELR-USDT","COTI-USDT","BAND-USDT","WLD-USDT",
+        "PEPE-USDT","FLOKI-USDT","BONK-USDT","WIF-USDT","SHIB-USDT",
+        "BLUR-USDT","GMX-USDT","PENDLE-USDT","JTO-USDT","PYTH-USDT",
+        "JUP-USDT","RNDR-USDT","SEI-USDT","ORDI-USDT","STX-USDT",
+        "MEME-USDT","CYBER-USDT","ACE-USDT","PIXEL-USDT","ALT-USDT",
+        "BLUR-USDT","GMX-USDT","GRT-USDT","COMP-USDT","AAVE-USDT",
+        "UNI-USDT","MKR-USDT","SNX-USDT","YFI-USDT","SUSHI-USDT",
+    }
+
+    for intento in range(3):
+        try:
+            data  = _get("/openApi/swap/v2/quote/contracts")
+            items = data.get("data", []) or []
+            if not items:
+                raise ValueError("lista vacía")
+            for item in items:
+                sym  = item.get("symbol", "")
+                if not sym:
+                    continue
+                _CONTRATOS_FUTURES.add(sym)
+                prec = int(item.get("quantityPrecision", 4) or 4)
+                mq   = float(item.get("minQty", 0) or 0)
+                _QTY_PRECISION[sym] = prec
+                _MIN_QTY[sym]       = mq
+            log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} futuros cargados (intento {intento+1})")
+            return
+        except Exception as e:
+            log.warning(f"[CONTRATOS] intento {intento+1}/3 falló: {e}")
+            if intento < 2:
+                time.sleep(3 * (intento + 1))
+
+    log.error("[CONTRATOS] API falló 3 veces — usando lista hardcoded de fallback")
+    _CONTRATOS_FUTURES.update(_FALLBACK_CONTRATOS)
+    log.info(f"[CONTRATOS] {len(_CONTRATOS_FUTURES)} pares fallback cargados")
 
 
 def par_es_soportado(par: str) -> bool:
@@ -177,7 +211,11 @@ def get_precio(par: str) -> float:
 # VELAS
 # ═══════════════════════════════════════════════════════
 
-def get_candles(par: str, tf: str = "5m", limit: int = 200) -> list:
+def get_candles(par: str, tf: str = "1m", limit: int = 250) -> list:
+    """
+    Obtiene velas OHLCV. Si devuelve vacío 2 veces seguidas, bloquea el par
+    automáticamente para no desperdiciar ciclos en pares inexistentes.
+    """
     for intento in range(2):
         try:
             data   = _get("/openApi/swap/v3/quote/klines",
@@ -199,8 +237,18 @@ def get_candles(par: str, tf: str = "5m", limit: int = 200) -> list:
             if candles:
                 return candles
             if intento == 0:
-                log.debug(f"[CANDLES] {par} {tf} vacío, reintentando...")
+                code_api = data.get("code", "?")
+                log.debug(f"[CANDLES] {par} {tf} vacío (code={code_api}), reintentando...")
                 time.sleep(0.5)
+            else:
+                # 2 intentos vacíos → par no existe en BingX → bloquearlo
+                log.warning(f"[CANDLES] {par} sin datos — bloqueando par")
+                bloquear_par(par)
+                try:
+                    import scanner_smc as _sc
+                    _sc.bloquear_par_sin_velas(par)
+                except Exception:
+                    pass
         except Exception as e:
             log.error(f"get_candles {par} {tf}: {e}")
             if intento == 0:
