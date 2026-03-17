@@ -2,19 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instalar dependencias del sistema
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copiar requirements
+# Copiar archivos de requisitos
 COPY requirements.txt .
 
-# Instalar dependencias de Python
+# Instalar dependencias
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código
+# Copiar código del bot
 COPY . .
 
-# Ejecutar bot
+# Comando para ejecutar el bot
 CMD ["python", "main.py"]
