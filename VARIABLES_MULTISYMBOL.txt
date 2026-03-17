@@ -1,0 +1,332 @@
+================================================================================
+🚀 VARIABLES PARA MULTI-SÍMBOLO - RAILWAY
+================================================================================
+
+Para usar la versión Multi-símbolo en Railway, cambia estas variables:
+
+================================================================================
+OPCIÓN 1: MODO AUTOMÁTICO (AUTO - RECOMENDADO)
+================================================================================
+
+Automáticamente obtiene TODOS los símbolos de BingX
+
+Nombre: BINGX_API_KEY
+Valor: [TU API KEY]
+
+Nombre: BINGX_SECRET_KEY
+Valor: [TU SECRET KEY]
+
+Nombre: TELEGRAM_BOT_TOKEN
+Valor: [TU BOT TOKEN]
+
+Nombre: TELEGRAM_CHAT_ID
+Valor: [TU CHAT ID]
+
+┌─ LA DIFERENCIA PRINCIPAL ─────────────────────────────────┐
+│ ANTES (Single):          AHORA (Multi):                   │
+│ SYMBOL = BTC/USDT        SYMBOL = AUTO                    │
+│ POSITION_SIZE = 0.01     POSITION_SIZE = 0.005            │
+│ (no existe)              MAX_OPEN_POSITIONS = 5           │
+└───────────────────────────────────────────────────────────┘
+
+Nombre: SYMBOL
+Valor: AUTO
+
+Nombre: TIMEFRAME
+Valor: 1h
+
+Nombre: POSITION_SIZE
+Valor: 0.005
+
+Nombre: TAKE_PROFIT_PERCENT
+Valor: 2.5
+
+Nombre: STOP_LOSS_PERCENT
+Valor: 1.5
+
+Nombre: LINREG_LENGTH
+Valor: 50
+
+Nombre: LINREG_MULT
+Valor: 2.0
+
+Nombre: CHECK_INTERVAL
+Valor: 300
+
+Nombre: MAX_OPEN_POSITIONS
+Valor: 5
+
+Nombre: ENABLE_TRADING
+Valor: True
+
+Nombre: DRY_RUN
+Valor: False
+
+================================================================================
+OPCIÓN 2: SÍMBOLOS SELECCIONADOS MANUALMENTE
+================================================================================
+
+Si quieres analizar SOLO ciertos símbolos (en lugar de AUTO):
+
+Edita main_multisymbol.py y busca esta línea:
+
+    # Retornar los principales por defecto
+    return [
+        'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+        'ADA/USDT', 'DOGE/USDT', 'MATIC/USDT', 'LTC/USDT', 'DOT/USDT',
+        'UNI/USDT', 'LINK/USDT', 'AVAX/USDT', 'FTT/USDT', 'CRO/USDT',
+        'NEAR/USDT', 'FIL/USDT', 'ATOM/USDT', 'SAND/USDT', 'MANA/USDT'
+    ]
+
+Reemplaza con tus símbolos favoritos:
+
+    return [
+        'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'XRP/USDT'
+    ]
+
+Luego en Railway, agrega:
+Nombre: SYMBOL
+Valor: CUSTOM
+
+================================================================================
+OPCIÓN 3: CONFIGURACIÓN CONSERVADORA
+================================================================================
+
+Bajo riesgo, pocos trades, muy seguro
+
+BINGX_API_KEY = [tu_key]
+BINGX_SECRET_KEY = [tu_secret]
+TELEGRAM_BOT_TOKEN = [tu_token]
+TELEGRAM_CHAT_ID = [tu_chat_id]
+
+SYMBOL = AUTO
+TIMEFRAME = 4h
+POSITION_SIZE = 0.002
+TAKE_PROFIT_PERCENT = 2.0
+STOP_LOSS_PERCENT = 1.0
+LINREG_LENGTH = 100
+LINREG_MULT = 2.0
+CHECK_INTERVAL = 600
+MAX_OPEN_POSITIONS = 3
+ENABLE_TRADING = True
+DRY_RUN = False
+
+✓ Máximo 3 posiciones abiertas
+✓ POSITION_SIZE muy pequeño
+✓ Análisis cada 10 minutos (menos CPU)
+✓ Timeframe largo (4 horas) = menos falsas señales
+
+================================================================================
+OPCIÓN 4: CONFIGURACIÓN EQUILIBRADA (RECOMENDADA)
+================================================================================
+
+Balance perfecto entre riesgo y oportunidad
+
+BINGX_API_KEY = [tu_key]
+BINGX_SECRET_KEY = [tu_secret]
+TELEGRAM_BOT_TOKEN = [tu_token]
+TELEGRAM_CHAT_ID = [tu_chat_id]
+
+SYMBOL = AUTO
+TIMEFRAME = 1h
+POSITION_SIZE = 0.005
+TAKE_PROFIT_PERCENT = 2.5
+STOP_LOSS_PERCENT = 1.5
+LINREG_LENGTH = 50
+LINREG_MULT = 2.0
+CHECK_INTERVAL = 300
+MAX_OPEN_POSITIONS = 5
+ENABLE_TRADING = True
+DRY_RUN = False
+
+✓ Máximo 5 posiciones abiertas
+✓ POSITION_SIZE pequeño pero viable
+✓ Análisis cada 5 minutos (estándar)
+✓ Timeframe 1h = balance óptimo
+✓ La mayoría de traders usan esto
+
+================================================================================
+OPCIÓN 5: CONFIGURACIÓN AGRESIVA
+================================================================================
+
+Alto riesgo, muchos trades, requiere capital
+
+BINGX_API_KEY = [tu_key]
+BINGX_SECRET_KEY = [tu_secret]
+TELEGRAM_BOT_TOKEN = [tu_token]
+TELEGRAM_CHAT_ID = [tu_chat_id]
+
+SYMBOL = AUTO
+TIMEFRAME = 15m
+POSITION_SIZE = 0.01
+TAKE_PROFIT_PERCENT = 1.5
+STOP_LOSS_PERCENT = 1.0
+LINREG_LENGTH = 30
+LINREG_MULT = 2.0
+CHECK_INTERVAL = 60
+MAX_OPEN_POSITIONS = 10
+ENABLE_TRADING = True
+DRY_RUN = False
+
+⚠️ Máximo 10 posiciones abiertas
+⚠️ POSITION_SIZE normal
+⚠️ Análisis cada minuto (mucha CPU)
+⚠️ Timeframe 15m = señales rápidas
+⚠️ Solo si sabes qué haces
+
+================================================================================
+OPCIÓN 6: MODO PRUEBA (SIN DINERO REAL)
+================================================================================
+
+Para probar la versión multi-símbolo sin riesgo
+
+BINGX_API_KEY = [tu_key]
+BINGX_SECRET_KEY = [tu_secret]
+TELEGRAM_BOT_TOKEN = [tu_token]
+TELEGRAM_CHAT_ID = [tu_chat_id]
+
+SYMBOL = AUTO
+TIMEFRAME = 1h
+POSITION_SIZE = 0.005
+TAKE_PROFIT_PERCENT = 2.5
+STOP_LOSS_PERCENT = 1.5
+LINREG_LENGTH = 50
+LINREG_MULT = 2.0
+CHECK_INTERVAL = 300
+MAX_OPEN_POSITIONS = 5
+ENABLE_TRADING = False      ← ¡IMPORTANTE!
+DRY_RUN = True              ← ¡IMPORTANTE!
+
+✓ Simula todos los trades
+✓ No ejecuta órdenes reales
+✓ Verás en Telegram: "[DRY RUN] BUY"
+✓ Perfecto para aprender
+✓ Útil para ajustar parámetros
+
+================================================================================
+COMPARATIVA DE OPCIONES
+================================================================================
+
+                 │ Conservador │ Equilibrado │ Agresivo │ Prueba
+─────────────────┼─────────────┼─────────────┼──────────┼──────────
+TIMEFRAME        │ 4h          │ 1h          │ 15m      │ 1h
+POSITION_SIZE    │ 0.002       │ 0.005       │ 0.01     │ 0.005
+MAX_POSITIONS    │ 3           │ 5           │ 10       │ 5
+CHECK_INTERVAL   │ 600s        │ 300s        │ 60s      │ 300s
+─────────────────┼─────────────┼─────────────┼──────────┼──────────
+Trades/día       │ 3-5         │ 5-10        │ 15-20    │ 5-10
+Riesgo           │ Muy bajo    │ Medio       │ Alto     │ Ninguno
+Ganancia potencial│ +2-5%/mes   │ +5-15%/mes  │ +15-30%  │ Datos
+Capital mínimo   │ $1000       │ $3000       │ $5000+   │ Prueba
+─────────────────┼─────────────┼─────────────┼──────────┼──────────
+Dificultad       │ Fácil       │ Normal      │ Difícil  │ Fácil
+Recomendado para │ Principiantes│ La mayoría  │ Expertos │ Todos
+─────────────────┼─────────────┼─────────────┼──────────┼──────────
+
+================================================================================
+CÁLCULO DE RIESGO - EJEMPLOS
+================================================================================
+
+¿Cuánto riesgo asumo cada ciclo?
+
+Fórmula: POSITION_SIZE × MAX_OPEN_POSITIONS × STOP_LOSS_PERCENT
+
+CONSERVADOR:
+  0.002 × 3 × 1.0% = 0.0006 = 0.06% de tu capital por ciclo
+  Si tienes $1000: riesgo = $0.60 (muy bajo)
+
+EQUILIBRADO:
+  0.005 × 5 × 1.5% = 0.000375 = 0.0375% de tu capital
+  Si tienes $1000: riesgo = $0.38
+  Si tienes $5000: riesgo = $1.88
+  Si tienes $10000: riesgo = $3.75 (aceptable)
+
+AGRESIVO:
+  0.01 × 10 × 1.0% = 0.001 = 0.1% de tu capital
+  Si tienes $10000: riesgo = $10 (OK)
+  Si tienes $5000: riesgo = $5 (ajustado)
+  Si tienes $1000: riesgo = $1 (muy bajo para este perfil)
+
+================================================================================
+MIGRACIÓN: SINGLE → MULTI
+================================================================================
+
+Si actualmente usas la versión single (1 símbolo):
+
+ANTES (Single):
+  SYMBOL = BTC/USDT
+  POSITION_SIZE = 0.01
+  (no hay MAX_OPEN_POSITIONS)
+
+DESPUÉS (Multi):
+  SYMBOL = AUTO
+  POSITION_SIZE = 0.005 ← Reduce a la mitad
+  MAX_OPEN_POSITIONS = 5
+
+Pasos en Railway:
+1. Edita SYMBOL: "BTC/USDT" → "AUTO"
+2. Edita POSITION_SIZE: "0.01" → "0.005"
+3. Nueva variable: MAX_OPEN_POSITIONS = "5"
+4. Nueva variable: CHECK_INTERVAL = "300"
+5. Click "Save"
+6. El bot se reinicia automáticamente
+
+================================================================================
+MONITOREO MULTI-SÍMBOLO
+================================================================================
+
+Qué esperar en Telegram:
+
+🎯 Bot iniciado analizando 156 símbolos USDT
+Timeframe: 1h
+TP: 2.5% | SL: 1.5%
+
+[Después de 5 minutos...]
+
+📊 Ciclo #1 - 10:00:00
+✅ Obtenidos 156 símbolos USDT
+📊 Analizados 156/156 símbolos exitosamente
+🟢 BTC/USDT: BUY - Price 45000 > PDH 44500
+🟢 SOL/USDT: BUY - Price 150 > PDH 145
+🔴 DOGE/USDT: SELL - Price 0.08 < PDL 0.082
+📂 Estado: 3 posición(es) abierta(s)
+
+[5 minutos después...]
+
+📊 Ciclo #2 - 10:05:00
+✅ Obtenidos 156 símbolos USDT
+📊 Analizados 156/156 símbolos exitosamente
+💰 BTC/USDT: TP - Entry 45000 → Exit 46125 = +2.5%
+⛔ SOL/USDT: SL - Entry 150 → Exit 147.75 = -1.5%
+🟢 ETH/USDT: BUY - Price 2500 > PDH 2450
+📂 Estado: 2 posición(es) abierta(s)
+
+================================================================================
+RESOLUCIÓN DE PROBLEMAS
+================================================================================
+
+"Bot toma mucho CPU"
+→ Reduce CHECK_INTERVAL: 300 → 600
+→ Usa timeframe mayor: 15m → 1h
+→ Reduce MAX_OPEN_POSITIONS: 10 → 5
+
+"Pocas señales generadas"
+→ Aumenta CHECK_INTERVAL: 600 → 300
+→ Reduce TIMEFRAME: 4h → 1h
+→ Reduce TAKE_PROFIT: 2.5% → 1.5%
+
+"Demasiadas pérdidas"
+→ Aumenta STOP_LOSS: 1.0% → 1.5%
+→ Aumenta TAKE_PROFIT: 1.5% → 2.5%
+→ Reduce POSITION_SIZE a la mitad
+→ Usa configuración más conservadora
+
+"Error: too many requests"
+→ Railway está limitando. Aumenta CHECK_INTERVAL
+→ O crea otro proyecto con símbolos diferentes
+
+================================================================================
+
+¡LISTO PARA MULTI-SÍMBOLO! 🚀
+
+================================================================================

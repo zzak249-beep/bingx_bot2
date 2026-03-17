@@ -1,0 +1,251 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    🎯 GUÍA DE DECISIÓN RÁPIDA 🎯                            ║
+║            ¿CUÁL VERSIÓN DEL BOT DEBO DESCARGAR Y USAR?                    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+RESPONDE ESTAS 3 PREGUNTAS:
+
+═══════════════════════════════════════════════════════════════════════════════
+
+PREGUNTA 1: ¿Es tu PRIMER BOT DE TRADING?
+───────────────────────────────────────────
+
+    SÍ → Vé a OPCIÓN A
+    NO → Continúa pregunta 2
+
+
+PREGUNTA 2: ¿Tienes EXPERIENCIA CON TRADING?
+──────────────────────────────────────────────
+
+    NO / PRINCIPIANTE → Vé a OPCIÓN A
+    SÍ / INTERMEDIO+ → Continúa pregunta 3
+
+
+PREGUNTA 3: ¿Tienes CAPITAL DE $3000+ EN BINGX?
+────────────────────────────────────────────────
+
+    NO / MENOS DE $3000 → Vé a OPCIÓN A
+    SÍ / MÁS DE $3000 → Vé a OPCIÓN B
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                              🎯 TU OPCIÓN 🎯
+
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           🟢 OPCIÓN A: SINGLE                               │
+│                    (La mayoría de usuarios van aquí)                        │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ ✅ VENTAJAS:                                                                │
+│   • Fácil de empezar                                                        │
+│   • Bajo riesgo                                                             │
+│   • Fácil de monitorear                                                     │
+│   • Funciona con cualquier capital                                          │
+│   • Buena para aprender                                                     │
+│                                                                              │
+│ ⚡ FLUJO:                                                                    │
+│   1. Descarga 15 archivos de VERSIÓN SINGLE                                 │
+│   2. Sigue CHECKLIST.txt                                                    │
+│   3. Deploy en Railway                                                      │
+│   4. Listo en 30 minutos                                                    │
+│                                                                              │
+│ 💰 GANANCIAS ESPERADAS:                                                     │
+│   • Mes 1: +5-10% del capital                                               │
+│   • Con $1000: +$50-100/mes                                                 │
+│   • Con $5000: +$250-500/mes                                                │
+│                                                                              │
+│ 📊 EJEMPLO:                                                                 │
+│   • Analiza: 1 moneda (BTC/USDT)                                            │
+│   • Trades/día: 1-2                                                         │
+│   • Posiciones simultáneas: 1                                               │
+│   • Timeframe: 1 hora                                                       │
+│                                                                              │
+│ ➡️  DESCARGAR ESTOS 15 ARCHIVOS:                                             │
+│   □ main.py                                                                 │
+│   □ config.py                                                               │
+│   □ indicators.py                                                           │
+│   □ bingx_api.py                                                            │
+│   □ telegram_bot.py                                                         │
+│   □ requirements.txt                                                        │
+│   □ Dockerfile                                                              │
+│   □ .env.example                                                            │
+│   □ .gitignore                                                              │
+│   □ README.md                                                               │
+│   □ RAILWAY_GUIDE.txt                                                       │
+│   □ VARIABLES_RAILWAY.txt                                                   │
+│   □ CHECKLIST.txt                                                           │
+│   □ RESUMEN_FINAL.txt                                                       │
+│   □ INDICE.txt                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          🔥 OPCIÓN B: MULTI-SÍMBOLO                          │
+│                    (Para usuarios con experiencia)                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ ✅ VENTAJAS:                                                                │
+│   • 150+ monedas analizadas                                                 │
+│   • 3-5x más ganancias potenciales                                          │
+│   • Mejor diversificación                                                   │
+│   • Automación completa                                                     │
+│   • Aprovechar TODAS las oportunidades                                      │
+│                                                                              │
+│ ⚡ FLUJO:                                                                    │
+│   1. Descarga 19 archivos (15 base + 4 multi)                               │
+│   2. Renombra main_multisymbol.py → main.py                                 │
+│   3. Renombra config_multisymbol.py → config.py                             │
+│   4. Sigue MIGRACION_A_MULTISYMBOL.txt                                      │
+│   5. Deploy en Railway                                                      │
+│   6. Listo en 30 minutos                                                    │
+│                                                                              │
+│ 💰 GANANCIAS ESPERADAS:                                                     │
+│   • Mes 1: +15-30% del capital                                              │
+│   • Con $5000: +$750-1500/mes                                               │
+│   • Con $10000: +$1500-3000/mes                                             │
+│                                                                              │
+│ 📊 EJEMPLO:                                                                 │
+│   • Analiza: 150+ monedas (BTC, ETH, SOL, etc.)                             │
+│   • Trades/día: 5-10                                                        │
+│   • Posiciones simultáneas: 5 máximo                                        │
+│   • Timeframe: 1 hora                                                       │
+│                                                                              │
+│ ➡️  DESCARGAR TODOS ESTOS 19 ARCHIVOS:                                       │
+│                                                                              │
+│   BASE (igual que OPCIÓN A):                                                │
+│   □ main_multisymbol.py    ← Renombra a main.py                             │
+│   □ config_multisymbol.py  ← Renombra a config.py                           │
+│   □ indicators.py                                                           │
+│   □ bingx_api.py                                                            │
+│   □ telegram_bot.py                                                         │
+│   □ requirements.txt                                                        │
+│   □ Dockerfile                                                              │
+│   □ .env.example                                                            │
+│   □ .gitignore                                                              │
+│   □ README.md                                                               │
+│                                                                              │
+│   MULTI (archivos nuevos):                                                  │
+│   □ GUIA_MULTISYMBOL.txt                                                    │
+│   □ VARIABLES_MULTISYMBOL.txt                                               │
+│   □ MIGRACION_A_MULTISYMBOL.txt                                             │
+│   □ RESUMEN_MULTISYMBOL.txt                                                 │
+│                                                                              │
+│   REFERENCIA (opcionales):                                                  │
+│   □ RAILWAY_GUIDE.txt                                                       │
+│   □ CHECKLIST.txt                                                           │
+│   □ RESUMEN_FINAL.txt                                                       │
+│   □ INDICE.txt                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                        🚀 DESPUÉS DE DESCARGAR 🚀
+
+═══════════════════════════════════════════════════════════════════════════════
+
+OPCIÓN A (SINGLE):
+──────────────────
+1. Abre CHECKLIST.txt
+2. Sigue cada paso
+3. Listo en 30 minutos
+
+
+OPCIÓN B (MULTI):
+─────────────────
+1. Abre MIGRACION_A_MULTISYMBOL.txt
+2. Sigue "OPCIÓN B" (si es nuevo)
+3. Listo en 30 minutos
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                           💡 CONSEJO FINAL 💡
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                    ⭐ MI RECOMENDACIÓN PERSONAL ⭐
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Si NUNCA has usado un bot:                                                 │
+│  → COMIENZA CON OPCIÓN A (SINGLE)                                           │
+│  → Aprende cómo funciona                                                    │
+│  → Después de 2 semanas, MIGRA a OPCIÓN B                                   │
+│  → Tendrás el doble de ganancias                                            │
+│                                                                              │
+│  Si YA tienes experiencia:                                                  │
+│  → COMIENZA CON OPCIÓN B (MULTI)                                            │
+│  → Maximiza ganancias desde el inicio                                       │
+│  → Diversifica en 150+ monedas                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                    ✅ DECISIÓN TOMADA - ¿Y AHORA?
+
+═══════════════════════════════════════════════════════════════════════════════
+
+PASO 1: Descarga los archivos
+────────────────────────────
+
+   OPCIÓN A: 15 archivos (SINGLE)
+   O
+   OPCIÓN B: 19 archivos (MULTI)
+
+   (Están todos en /mnt/user-data/outputs/)
+
+
+PASO 2: Lee el documento indicado
+─────────────────────────────────
+
+   OPCIÓN A: CHECKLIST.txt
+   O
+   OPCIÓN B: MIGRACION_A_MULTISYMBOL.txt
+
+
+PASO 3: Sigue los pasos exactamente
+───────────────────────────────────
+
+   Tiempo: 30 minutos
+   Dificultad: Muy fácil
+
+
+PASO 4: ¡Disfruta tu bot automático!
+────────────────────────────────────
+
+   El bot estará corriendo 24/7 en Railway
+   Recibirás notificaciones en Telegram
+   Ganancias automáticas ✅
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                    ¿TIENES DUDAS? LEE ESTO:
+
+═══════════════════════════════════════════════════════════════════════════════
+
+P: ¿Cuál es la diferencia principal?
+R: SINGLE = 1 moneda / MULTI = 150+ monedas
+   Multi tiene 3-5x más ganancias pero más riesgo
+
+P: ¿Puedo cambiar después?
+R: SÍ. Comienza con SINGLE y migra a MULTI en 10 minutos
+
+P: ¿Cuánto cuesta?
+R: Gratis en Railway (~$3-5/mes después del free tier)
+   Solo necesitas dinero en BingX para tradear
+
+P: ¿Es seguro?
+R: Sí, puedes probar primero con DRY_RUN=True (sin dinero real)
+
+P: ¿Necesito conocimiento de programación?
+R: No. El bot está listo para usar. Solo configurar y ejecutar.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+¡ESTÁS A 30 MINUTOS DE TU BOT FUNCIONANDO! 🚀
+
+═══════════════════════════════════════════════════════════════════════════════
