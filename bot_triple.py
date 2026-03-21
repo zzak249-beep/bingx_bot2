@@ -157,7 +157,7 @@ class TripleBot:
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
 
         log.info("=" * 65)
-        log.info("  BOT TRIPLE CONFIRMACIÓN v1.0")
+        log.info("  BOT TRIPLE CONFIRMACIÓN v1.4")
         log.info("  EMA144 + EMA89 + SMA21 + Stochastic")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -182,7 +182,7 @@ class TripleBot:
         self._get_symbols()
         self._reconciliar_posiciones()
         self._tg(
-            f"<b>📊 Bot Triple Confirmación v1.0</b>\n"
+            f"<b>📊 Bot Triple Confirmación v1.4</b>\n"
             f"EMA144 + EMA89 + SMA21 + Stochastic\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE}\n"
@@ -259,30 +259,40 @@ class TripleBot:
     # ---------------------------------------------------------------- reconciliación
 
     def _reconciliar_posiciones(self):
-        """Al arrancar, detecta posiciones abiertas en BingX y las registra
-        en open_trades para que el bot las gestione (trailing, TP/SL, sync)."""
+        """Al arrancar, detecta posiciones del BOT en BingX (leverage=LEVERAGE, qty≈POSITION_SIZE)
+        y las registra en open_trades. Ignora posiciones manuales/antiguas con leverage diferente."""
         if not AUTO_TRADING:
             return
-        log.info("  🔍 Reconciliando posiciones existentes en BingX...")
+        log.info("  🔍 Reconciliando posiciones propias del bot en BingX...")
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') != 0:
                 log.warning(f"  Reconciliación: error API [{d.get('code')}]: {d.get('msg')}")
                 return
 
-            posiciones = [p for p in (d.get('data') or [])
-                          if abs(float(p.get('positionAmt', 0) or 0)) > 0]
+            todas = [p for p in (d.get('data') or [])
+                     if abs(float(p.get('positionAmt', 0) or 0)) > 0]
 
-            if not posiciones:
+            if not todas:
                 log.info("  ✅ No hay posiciones previas — arrancando limpio")
                 return
 
-            log.info(f"  ⚠️  {len(posiciones)} posición(es) encontrada(s) — registrando...")
+            log.info(f"  BingX reporta {len(todas)} posición(es) abiertas en total")
             recuperadas = 0
 
-            for p in posiciones:
+            for p in todas:
                 sym = p.get('symbol', '')
                 if not sym:
+                    continue
+
+                # ── Filtro: solo posiciones con el leverage del bot ──────────
+                try:
+                    lev_pos = int(float(p.get('leverage', 0) or 0))
+                except:
+                    lev_pos = 0
+
+                if lev_pos != 0 and lev_pos != LEVERAGE:
+                    log.info(f"  ⏭  {sym} ignorado — leverage {lev_pos}x ≠ {LEVERAGE}x (posición manual)")
                     continue
 
                 try:
@@ -301,7 +311,6 @@ class TripleBot:
                 except:
                     entry = 0
 
-                # Si no tenemos precio de entrada, usar ticker actual
                 if entry <= 0:
                     tk = self._ticker(sym)
                     entry = tk['price'] if tk else 0
@@ -312,7 +321,7 @@ class TripleBot:
 
                 qty_c = abs(amt)
 
-                # Calcular TP/SL basados en el precio de entrada real
+                # ── TP/SL basados en precio de entrada real ──────────────────
                 if direction == 'LONG':
                     tp_price = entry * (1 + TP_PCT / 100)
                     sl_price = entry * (1 - SL_PCT / 100)
@@ -320,18 +329,15 @@ class TripleBot:
                     tp_price = entry * (1 - TP_PCT / 100)
                     sl_price = entry * (1 + SL_PCT / 100)
 
-                # Intentar poner TP/SL si no los tiene (posiciones huérfanas)
+                # Solo poner TP/SL si la posición no los tiene ya
                 tp_ok = self._cond_order(sym, direction, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
                 time.sleep(0.3)
                 sl_ok = self._cond_order(sym, direction, qty_c, sl_price, 'STOP_MARKET')
 
-                # Calcular PnL actual
                 tk = self._ticker(sym)
                 cur = tk['price'] if tk else entry
-                if direction == 'LONG':
-                    pnl_pct = (cur - entry) / entry * 100
-                else:
-                    pnl_pct = (entry - cur) / entry * 100
+                pnl_pct = ((cur - entry) / entry * 100) if direction == 'LONG' \
+                          else ((entry - cur) / entry * 100)
 
                 self.open_trades[sym] = {
                     'direction': direction,
@@ -352,28 +358,26 @@ class TripleBot:
                 }
                 recuperadas += 1
 
-                stp = "✅" if tp_ok else "❌ SIN TP"
-                ssl = "✅" if sl_ok else "❌ SIN SL"
+                stp = "✅" if tp_ok else "❌SIN TP"
+                ssl = "✅" if sl_ok else "❌SIN SL"
                 emoji = "📈" if direction == 'LONG' else "📉"
                 log.info(f"  {emoji} {sym} {direction} reconciliado | "
-                         f"entry=${entry:.6f} qty={qty_c} | "
-                         f"PnL actual:{pnl_pct:+.2f}% | TP:{stp} SL:{ssl}")
+                         f"entry=${entry:.6f} qty={qty_c} lev={lev_pos}x | "
+                         f"PnL:{pnl_pct:+.2f}% | TP:{stp} SL:{ssl}")
+
+            ignoradas = len(todas) - recuperadas
+            log.info(f"  ✅ Reconciliación: {recuperadas} registradas, {ignoradas} ignoradas (manuales/leverage diferente)")
 
             if recuperadas > 0:
-                msg_lines = [f"<b>🔄 Reconciliación al arranque</b>",
-                             f"{recuperadas} posición(es) registrada(s):"]
+                lines = [f"<b>🔄 Reconciliación al arranque</b>",
+                         f"{recuperadas} posición(es) registradas, {ignoradas} ignoradas:"]
                 for sym, t in self.open_trades.items():
-                    d_emoji = "📈" if t['direction'] == 'LONG' else "📉"
-                    stp = "✅TP" if t['tp_ok'] else "❌TP MANUAL"
-                    ssl = "✅SL" if t['sl_ok'] else "❌SL MANUAL"
-                    msg_lines.append(
-                        f"{d_emoji} {sym} {t['direction']} @ ${t['entry']:.6f} "
-                        f"qty={t['qty_c']} | {stp} {ssl}"
+                    de = "📈" if t['direction'] == 'LONG' else "📉"
+                    lines.append(
+                        f"{de} {sym} {t['direction']} @ ${t['entry']:.6f} "
+                        f"| {'✅TP' if t['tp_ok'] else '❌TP'} {'✅SL' if t['sl_ok'] else '❌SL'}"
                     )
-                self._tg('\n'.join(msg_lines))
-                log.info(f"  ✅ Reconciliación completa: {recuperadas} posición(es) activa(s)")
-            else:
-                log.info("  ✅ Reconciliación completa — sin posiciones recuperables")
+                self._tg('\n'.join(lines))
 
         except Exception as e:
             log.error(f"  Error en reconciliación: {e}")
