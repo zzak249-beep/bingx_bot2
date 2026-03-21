@@ -1,1 +1,1 @@
-worker: python bot_triple.py
+python bot_triple.py
