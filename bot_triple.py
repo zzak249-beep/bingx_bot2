@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT TRIPLE CONFIRMACIÓN v1.0
+BOT TRIPLE CONFIRMACIÓN v1.1
 ════════════════════════════════════════════════
 ESTRATEGIA: EMA144 + EMA89 + SMA21 + Stochastic
 
@@ -56,7 +56,7 @@ MAX_TRADES       = clean('MAX_OPEN_TRADES',          '3',   'int')
 INTERVAL         = clean('CHECK_INTERVAL',          '120',  'int')
 MIN_VOLUME       = clean('MIN_VOLUME_24H',       '500000',  'float')
 MAX_SYMBOLS      = clean('MAX_SYMBOLS_TO_ANALYZE',   '80',  'int')
-MIN_SCORE        = clean('MIN_SCORE',                '70',  'float')
+MIN_SCORE        = clean('MIN_SCORE',                '50',  'float')
 TRAILING         = clean('TRAILING_STOP_ENABLED',  'true',  'bool')
 USE_LIMIT_ORDERS = clean('USE_LIMIT_ORDERS',       'true',  'bool')
 ENABLE_LONGS     = clean('ENABLE_LONGS',           'true',  'bool')
@@ -157,7 +157,7 @@ class TripleBot:
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
 
         log.info("=" * 65)
-        log.info("  BOT TRIPLE CONFIRMACIÓN v1.0")
+        log.info("  BOT TRIPLE CONFIRMACIÓN v1.1")
         log.info("  EMA144 + EMA89 + SMA21 + Stochastic")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -181,7 +181,7 @@ class TripleBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>📊 Bot Triple Confirmación v1.0</b>\n"
+            f"<b>📊 Bot Triple Confirmación v1.1</b>\n"
             f"EMA144 + EMA89 + SMA21 + Stochastic\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE}\n"
@@ -257,7 +257,7 @@ class TripleBot:
 
     # ---------------------------------------------------------------- datos
 
-    def _klines(self, symbol, interval='15m', limit=200):
+    def _klines(self, symbol, interval='15m', limit=150):
         """Necesitamos 200 velas para calcular EMA144 correctamente."""
         try:
             d = requests.get(f"{BASE_URL}/openApi/swap/v3/quote/klines",
@@ -328,7 +328,7 @@ class TripleBot:
         if not self._hora_ok(): return None
 
         closes, highs, lows, volumes, opens = self._klines(symbol, '15m', 200)
-        if not closes or len(closes) < 150: return None
+        if not closes or len(closes) < 100: return None
 
         ticker = self._ticker(symbol)
         if not ticker or ticker['price'] <= 0: return None
@@ -346,8 +346,12 @@ class TripleBot:
         atr_pct = (atr / price * 100) if price > 0 else 0
 
         # ── Tendencia principal (EMA144 + EMA89) ──────────────────────────────
-        trend_bull = price > ema144 and price > ema89 and ema89 > ema144
-        trend_bear = price < ema144 and price < ema89 and ema89 < ema144
+        # Condición FUERTE: precio y EMAs alineados perfectamente
+        trend_bull_strong = price > ema144 and price > ema89 and ema89 > ema144
+        trend_bear_strong = price < ema144 and price < ema89 and ema89 < ema144
+        # Condición DÉBIL: al menos precio encima/debajo de EMA144
+        trend_bull = price > ema144 or (price > ema89 and ema89 > ema144)
+        trend_bear = price < ema144 or (price < ema89 and ema89 < ema144)
 
         # ── Posición respecto a SMA21 ─────────────────────────────────────────
         # (+) Rebote en SMA21: precio venía cayendo hacia SMA21 y rechaza hacia arriba
@@ -382,7 +386,10 @@ class TripleBot:
         long_score, long_reasons = 0, []
 
         if ENABLE_LONGS and trend_bull:
-            long_score += 30; long_reasons.append("Tendencia_BULL(30)")
+            if trend_bull_strong:
+                long_score += 30; long_reasons.append("Tendencia_BULL++(30)")
+            else:
+                long_score += 15; long_reasons.append("Tendencia_BULL(15)")
 
             # SMA21 como disparador
             if rebote_sma21:
@@ -418,7 +425,10 @@ class TripleBot:
         short_score, short_reasons = 0, []
 
         if ENABLE_SHORTS and trend_bear:
-            short_score += 30; short_reasons.append("Tendencia_BEAR(30)")
+            if trend_bear_strong:
+                short_score += 30; short_reasons.append("Tendencia_BEAR++(30)")
+            else:
+                short_score += 15; short_reasons.append("Tendencia_BEAR(15)")
 
             # SMA21 como disparador
             if ruptura_sma21:
@@ -874,7 +884,7 @@ class TripleBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot Triple Confirmación v1.0 arrancado\n")
+        log.info("\n▶  Bot Triple Confirmación v1.1 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
