@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT TRIPLE CONFIRMACIÓN v1.1
+BOT TRIPLE CONFIRMACIÓN v1.2
 ════════════════════════════════════════════════
 ESTRATEGIA: EMA144 + EMA89 + SMA21 + Stochastic
 
@@ -157,7 +157,7 @@ class TripleBot:
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
 
         log.info("=" * 65)
-        log.info("  BOT TRIPLE CONFIRMACIÓN v1.1")
+        log.info("  BOT TRIPLE CONFIRMACIÓN v1.2")
         log.info("  EMA144 + EMA89 + SMA21 + Stochastic")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -181,7 +181,7 @@ class TripleBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>📊 Bot Triple Confirmación v1.1</b>\n"
+            f"<b>📊 Bot Triple Confirmación v1.2</b>\n"
             f"EMA144 + EMA89 + SMA21 + Stochastic\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE}\n"
@@ -327,8 +327,8 @@ class TripleBot:
         if not self._cooldown_ok(symbol): return None
         if not self._hora_ok(): return None
 
-        closes, highs, lows, volumes, opens = self._klines(symbol, '15m', 200)
-        if not closes or len(closes) < 100: return None
+        closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 150)
+        if not closes or len(closes) < 50: return None
 
         ticker = self._ticker(symbol)
         if not ticker or ticker['price'] <= 0: return None
@@ -336,159 +336,174 @@ class TripleBot:
         price  = ticker['price']
         change = ticker['change']
 
-        # ── Indicadores principales ───────────────────────────────────────────
-        ema144 = calc_ema(closes, 144)
-        ema89  = calc_ema(closes, 89)
+        # ── Indicadores ───────────────────────────────────────────────────────
+        ema144 = calc_ema(closes, min(144, len(closes)))
+        ema89  = calc_ema(closes, min(89, len(closes)))
         sma21  = calc_sma(closes, 21)
         stoch_k, stoch_d = calc_stochastic(highs, lows, closes, 14, 3)
         atr    = calc_atr(highs, lows, closes, 14)
         vs     = vol_spike(volumes)
         atr_pct = (atr / price * 100) if price > 0 else 0
 
-        # ── Tendencia principal (EMA144 + EMA89) ──────────────────────────────
-        # Condición FUERTE: precio y EMAs alineados perfectamente
-        trend_bull_strong = price > ema144 and price > ema89 and ema89 > ema144
-        trend_bear_strong = price < ema144 and price < ema89 and ema89 < ema144
-        # Condición DÉBIL: al menos precio encima/debajo de EMA144
-        trend_bull = price > ema144 or (price > ema89 and ema89 > ema144)
-        trend_bear = price < ema144 or (price < ema89 and ema89 < ema144)
+        # Distancias relativas
+        dist_ema144 = (price - ema144) / ema144 * 100  # + encima, - debajo
+        dist_ema89  = (price - ema89)  / ema89  * 100
+        dist_sma21  = (price - sma21)  / sma21  * 100
 
-        # ── Posición respecto a SMA21 ─────────────────────────────────────────
-        # (+) Rebote en SMA21: precio venía cayendo hacia SMA21 y rechaza hacia arriba
-        prev_closes = closes[-5:-1]
-        cerca_sma21 = abs(price - sma21) / sma21 < 0.008  # dentro del 0.8% de SMA21
-        precio_sobre_sma21 = price > sma21
-        precio_bajo_sma21  = price < sma21
+        # Tendencia EMAs
+        bull = dist_ema144 > 0  # precio encima de EMA144
+        bear = dist_ema144 < 0  # precio debajo de EMA144
 
-        # Detectar rebote: últimas velas tocaron SMA21 y ahora están encima
-        toco_sma21_reciente = any(abs(c - sma21) / sma21 < 0.012 for c in prev_closes)
-        rebote_sma21 = precio_sobre_sma21 and toco_sma21_reciente
+        # SMA21 como disparador
+        cerca_sma21   = abs(dist_sma21) < 1.5   # dentro del 1.5% de SMA21
+        sobre_sma21   = dist_sma21 > 0
+        bajo_sma21    = dist_sma21 < 0
 
-        # Detectar ruptura: precio cruzó SMA21 hacia abajo recientemente
-        ruptura_sma21 = precio_bajo_sma21 and any(c > sma21 for c in prev_closes[:2])
+        # Momentum reciente
+        trend_3  = (closes[-1] - closes[-4])  / closes[-4]  * 100 if len(closes) >= 4  else 0
+        trend_8  = (closes[-1] - closes[-9])  / closes[-9]  * 100 if len(closes) >= 9  else 0
+        trend_20 = (closes[-1] - closes[-21]) / closes[-21] * 100 if len(closes) >= 21 else 0
 
-        # Compresión: oscilando entre SMA21 y EMA144
-        en_compresion = (min(sma21, ema144) * 0.995 <= price <= max(sma21, ema144) * 1.005)
-
-        # ── Stochastic confirmación ───────────────────────────────────────────
-        stoch_oversold   = stoch_k < 25 and stoch_d < 30
-        stoch_overbought = stoch_k > 75 and stoch_d > 70
-        stoch_girando_up = stoch_k > stoch_d  # %K cruzó %D hacia arriba
-        stoch_girando_dn = stoch_k < stoch_d  # %K cruzó %D hacia abajo
-
-        # ── Tendencia corto plazo ─────────────────────────────────────────────
-        trend_5c  = (closes[-1] - closes[-6])  / closes[-6]  * 100 if len(closes) >= 6  else 0
-        trend_10c = (closes[-1] - closes[-11]) / closes[-11] * 100 if len(closes) >= 11 else 0
-
-        # ====================================================================
-        # SEÑAL LONG (+): Rebote en SMA21 con tendencia alcista
-        # ====================================================================
-        long_score, long_reasons = 0, []
-
-        if ENABLE_LONGS and trend_bull:
-            if trend_bull_strong:
-                long_score += 30; long_reasons.append("Tendencia_BULL++(30)")
-            else:
-                long_score += 15; long_reasons.append("Tendencia_BULL(15)")
-
-            # SMA21 como disparador
-            if rebote_sma21:
-                long_score += 35; long_reasons.append("Rebote_SMA21(35)")
-            elif cerca_sma21 and precio_sobre_sma21:
-                long_score += 20; long_reasons.append("Cerca_SMA21+(20)")
-
-            # Stochastic
-            if stoch_oversold and stoch_girando_up:
-                long_score += 25; long_reasons.append(f"Stoch_OS_UP({stoch_k:.0f},{stoch_d:.0f})(25)")
-            elif stoch_oversold:
-                long_score += 15; long_reasons.append(f"Stoch_OS({stoch_k:.0f})(15)")
-            elif stoch_k > 60:
-                long_score -= 10; long_reasons.append(f"Stoch_alto(-10)")
-
-            # Volumen
-            if vs >= 1.8:
-                p = min(15, int(vs*7)); long_score += p; long_reasons.append(f"Vol{vs:.1f}x({p})")
-            elif vs < 1.2:
-                long_score -= 8; long_reasons.append("VolBajo(-8)")
-
-            # Tendencia corta
-            if trend_5c > 0.5:  long_score += 10; long_reasons.append("Impulso+(10)")
-            elif trend_5c < -1.5: long_score -= 10; long_reasons.append("Impulso-(-10)")
-
-            # ATR
-            if atr_pct > 0.5: long_score += 8; long_reasons.append(f"ATR{atr_pct:.1f}%(8)")
-            elif atr_pct < 0.2: long_score -= 8; long_reasons.append("ATRbajo(-8)")
-
-        # ====================================================================
-        # SEÑAL SHORT (-): Ruptura de SMA21 con tendencia bajista
-        # ====================================================================
-        short_score, short_reasons = 0, []
-
-        if ENABLE_SHORTS and trend_bear:
-            if trend_bear_strong:
-                short_score += 30; short_reasons.append("Tendencia_BEAR++(30)")
-            else:
-                short_score += 15; short_reasons.append("Tendencia_BEAR(15)")
-
-            # SMA21 como disparador
-            if ruptura_sma21:
-                short_score += 35; short_reasons.append("Ruptura_SMA21(35)")
-            elif cerca_sma21 and precio_bajo_sma21:
-                short_score += 20; short_reasons.append("Cerca_SMA21-(20)")
-
-            # Stochastic
-            if stoch_overbought and stoch_girando_dn:
-                short_score += 25; short_reasons.append(f"Stoch_OB_DN({stoch_k:.0f},{stoch_d:.0f})(25)")
-            elif stoch_overbought:
-                short_score += 15; short_reasons.append(f"Stoch_OB({stoch_k:.0f})(15)")
-            elif stoch_k < 40:
-                short_score -= 10; short_reasons.append(f"Stoch_bajo(-10)")
-
-            # Volumen
-            if vs >= 1.8:
-                p = min(15, int(vs*7)); short_score += p; short_reasons.append(f"Vol{vs:.1f}x({p})")
-            elif vs < 1.2:
-                short_score -= 8; short_reasons.append("VolBajo(-8)")
-
-            # Tendencia corta
-            if trend_5c < -0.5:  short_score += 10; short_reasons.append("Impulso-(10)")
-            elif trend_5c > 1.5: short_score -= 10; short_reasons.append("Impulso+(-10)")
-
-            # ATR
-            if atr_pct > 0.5: short_score += 8; short_reasons.append(f"ATR{atr_pct:.1f}%(8)")
-            elif atr_pct < 0.2: short_score -= 8; short_reasons.append("ATRbajo(-8)")
-
-        # ── TP dinámico basado en ATR ─────────────────────────────────────────
+        # TP dinámico
         tp_dyn = max(TP_PCT, TP_MIN_RENTABLE, min(TP_PCT * 2.5, atr_pct * 2.5))
 
-        # ── Decidir señal ─────────────────────────────────────────────────────
-        # Log compresión para info
-        if en_compresion and not trend_bull and not trend_bear:
-            log.info(f"  {symbol} COMPRESIÓN ±: precio entre SMA21 y EMA144 — esperando ruptura")
+        # ====================================================================
+        # SEÑAL LONG
+        # ====================================================================
+        ls, lr = 0, []
 
-        if long_score >= MIN_SCORE and long_score > short_score:
-            # Bloquear LONG si BTC está cayendo fuerte
-            if self._btc_change_1h <= -BTC_FILTER_PCT:
-                return None
+        if ENABLE_LONGS:
+            # 1. Estructura alcista (EMA144)
+            if dist_ema144 > 1.0:
+                ls += 25; lr.append(f"SobreEMA144+{dist_ema144:.1f}%(25)")
+            elif dist_ema144 > 0:
+                ls += 15; lr.append(f"SobreEMA144(15)")
+            elif dist_ema144 > -1.0:
+                ls += 5;  lr.append(f"CercaEMA144(5)")
+            else:
+                ls -= 15; lr.append(f"BajoEMA144(-15)")
+
+            # 2. EMA89 confirmación
+            if dist_ema89 > 0:
+                ls += 15; lr.append(f"SobreEMA89(15)")
+            else:
+                ls -= 10; lr.append(f"BajoEMA89(-10)")
+
+            # 3. SMA21 disparador
+            if cerca_sma21 and sobre_sma21:
+                ls += 20; lr.append("CercaSMA21+(20)")
+            elif cerca_sma21 and bajo_sma21:
+                ls += 10; lr.append("TestSMA21(10)")
+            elif sobre_sma21 and dist_sma21 < 3.0:
+                ls += 10; lr.append("SobreSMA21(10)")
+
+            # 4. Stochastic
+            if stoch_k < 20:
+                ls += 25; lr.append(f"StochOS{stoch_k:.0f}(25)")
+            elif stoch_k < 35:
+                ls += 18; lr.append(f"Stoch{stoch_k:.0f}(18)")
+            elif stoch_k < 50:
+                ls += 8;  lr.append(f"Stoch{stoch_k:.0f}(8)")
+            elif stoch_k > 75:
+                ls -= 15; lr.append(f"StochOB(-15)")
+
+            if stoch_k > stoch_d and stoch_k < 60:
+                ls += 10; lr.append("StochGiroUp(10)")
+
+            # 5. Momentum
+            if trend_3 > 0.5:  ls += 10; lr.append(f"Mom3c+{trend_3:.1f}%(10)")
+            elif trend_3 < -1.0: ls -= 8; lr.append(f"Mom3c-(-8)")
+            if trend_8 > 1.0:  ls += 8;  lr.append(f"Mom8c+(8)")
+            if trend_20 > 2.0: ls += 8;  lr.append(f"Mom20c+(8)")
+
+            # 6. Volumen
+            if vs >= 1.8: ls += 12; lr.append(f"Vol{vs:.1f}x(12)")
+            elif vs < 1.1: ls -= 5; lr.append("VolBajo(-5)")
+
+            # 7. Cambio 24h
+            if change > 3.0:  ls += 10; lr.append(f"24h+{change:.1f}%(10)")
+            elif change < -5.0: ls -= 10; lr.append(f"24h{change:.1f}%(-10)")
+
+        # ====================================================================
+        # SEÑAL SHORT
+        # ====================================================================
+        ss, sr = 0, []
+
+        if ENABLE_SHORTS:
+            # 1. Estructura bajista (EMA144)
+            if dist_ema144 < -1.0:
+                ss += 25; sr.append(f"BajoEMA144{dist_ema144:.1f}%(25)")
+            elif dist_ema144 < 0:
+                ss += 15; sr.append(f"BajoEMA144(15)")
+            elif dist_ema144 < 1.0:
+                ss += 5;  sr.append(f"CercaEMA144(5)")
+            else:
+                ss -= 15; sr.append(f"SobreEMA144(-15)")
+
+            # 2. EMA89 confirmación
+            if dist_ema89 < 0:
+                ss += 15; sr.append(f"BajoEMA89(15)")
+            else:
+                ss -= 10; sr.append(f"SobreEMA89(-10)")
+
+            # 3. SMA21 disparador
+            if cerca_sma21 and bajo_sma21:
+                ss += 20; sr.append("CercaSMA21-(20)")
+            elif cerca_sma21 and sobre_sma21:
+                ss += 10; sr.append("TestSMA21(10)")
+            elif bajo_sma21 and dist_sma21 > -3.0:
+                ss += 10; sr.append("BajoSMA21(10)")
+
+            # 4. Stochastic
+            if stoch_k > 80:
+                ss += 25; sr.append(f"StochOB{stoch_k:.0f}(25)")
+            elif stoch_k > 65:
+                ss += 18; sr.append(f"Stoch{stoch_k:.0f}(18)")
+            elif stoch_k > 50:
+                ss += 8;  sr.append(f"Stoch{stoch_k:.0f}(8)")
+            elif stoch_k < 25:
+                ss -= 15; sr.append(f"StochOS(-15)")
+
+            if stoch_k < stoch_d and stoch_k > 40:
+                ss += 10; sr.append("StochGiroDn(10)")
+
+            # 5. Momentum
+            if trend_3 < -0.5:  ss += 10; sr.append(f"Mom3c{trend_3:.1f}%(10)")
+            elif trend_3 > 1.0: ss -= 8;  sr.append(f"Mom3c+(-8)")
+            if trend_8 < -1.0:  ss += 8;  sr.append(f"Mom8c-(8)")
+            if trend_20 < -2.0: ss += 8;  sr.append(f"Mom20c-(8)")
+
+            # 6. Volumen
+            if vs >= 1.8: ss += 12; sr.append(f"Vol{vs:.1f}x(12)")
+            elif vs < 1.1: ss -= 5; sr.append("VolBajo(-5)")
+
+            # 7. Cambio 24h
+            if change < -3.0:  ss += 10; sr.append(f"24h{change:.1f}%(10)")
+            elif change > 5.0: ss -= 10; sr.append(f"24h+{change:.1f}%(-10)")
+
+        # ── Decidir señal ─────────────────────────────────────────────────────
+        if en_compresion := (abs(dist_sma21) < 0.5 and abs(dist_ema144) < 1.0):
+            log.info(f"  {symbol} COMPRESIÓN ±: entre SMA21 y EMA144 — esperando ruptura")
+
+        if ls >= MIN_SCORE and ls > ss:
+            if self._btc_change_1h <= -BTC_FILTER_PCT: return None
             return {
                 'signal':'LONG', 'price':price, 'change':change,
-                'score':long_score, 'reasons':' | '.join(long_reasons),
+                'score':ls, 'reasons':' | '.join(lr),
                 'stoch_k':stoch_k, 'stoch_d':stoch_d, 'vol':vs,
                 'tp_pct':tp_dyn, 'sl_pct':SL_PCT,
-                'ema144':round(ema144,6), 'ema89':round(ema89,6), 'sma21':round(sma21,6),
+                'ema144':round(ema144,6),'ema89':round(ema89,6),'sma21':round(sma21,6),
                 'atr_pct':round(atr_pct,2),
             }
 
-        if short_score >= MIN_SCORE and short_score > long_score:
-            # Bloquear SHORT si BTC está subiendo fuerte
-            if self._btc_change_1h >= BTC_FILTER_PCT:
-                return None
+        if ss >= MIN_SCORE and ss > ls:
+            if self._btc_change_1h >= BTC_FILTER_PCT: return None
             return {
                 'signal':'SHORT', 'price':price, 'change':change,
-                'score':short_score, 'reasons':' | '.join(short_reasons),
+                'score':ss, 'reasons':' | '.join(sr),
                 'stoch_k':stoch_k, 'stoch_d':stoch_d, 'vol':vs,
                 'tp_pct':tp_dyn, 'sl_pct':SL_PCT,
-                'ema144':round(ema144,6), 'ema89':round(ema89,6), 'sma21':round(sma21,6),
+                'ema144':round(ema144,6),'ema89':round(ema89,6),'sma21':round(sma21,6),
                 'atr_pct':round(atr_pct,2),
             }
 
@@ -884,7 +899,7 @@ class TripleBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot Triple Confirmación v1.1 arrancado\n")
+        log.info("\n▶  Bot Triple Confirmación v1.2 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
