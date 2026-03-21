@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT TRIPLE CONFIRMACIÓN v1.2
+BOT TRIPLE CONFIRMACIÓN v1.3
 ════════════════════════════════════════════════
 ESTRATEGIA: EMA144 + EMA89 + SMA21 + Stochastic
 
@@ -56,7 +56,7 @@ MAX_TRADES       = clean('MAX_OPEN_TRADES',          '3',   'int')
 INTERVAL         = clean('CHECK_INTERVAL',          '120',  'int')
 MIN_VOLUME       = clean('MIN_VOLUME_24H',       '500000',  'float')
 MAX_SYMBOLS      = clean('MAX_SYMBOLS_TO_ANALYZE',   '80',  'int')
-MIN_SCORE        = clean('MIN_SCORE',                '50',  'float')
+MIN_SCORE        = clean('MIN_SCORE',                '40',  'float')
 TRAILING         = clean('TRAILING_STOP_ENABLED',  'true',  'bool')
 USE_LIMIT_ORDERS = clean('USE_LIMIT_ORDERS',       'true',  'bool')
 ENABLE_LONGS     = clean('ENABLE_LONGS',           'true',  'bool')
@@ -157,7 +157,7 @@ class TripleBot:
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
 
         log.info("=" * 65)
-        log.info("  BOT TRIPLE CONFIRMACIÓN v1.2")
+        log.info("  BOT TRIPLE CONFIRMACIÓN v1.3")
         log.info("  EMA144 + EMA89 + SMA21 + Stochastic")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -181,7 +181,7 @@ class TripleBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>📊 Bot Triple Confirmación v1.2</b>\n"
+            f"<b>📊 Bot Triple Confirmación v1.3</b>\n"
             f"EMA144 + EMA89 + SMA21 + Stochastic\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
             f"Fee: {fee_lbl} | Score≥{MIN_SCORE}\n"
@@ -507,6 +507,13 @@ class TripleBot:
                 'atr_pct':round(atr_pct,2),
             }
 
+        # Log top scores aunque no lleguen al mínimo (debug)
+        best = max(ls, ss)
+        if best >= 20:
+            dir_best = "LONG" if ls >= ss else "SHORT"
+            log.info(f"  {symbol} {dir_best} score:{best:.0f}/{MIN_SCORE:.0f} "
+                     f"[EMA144:{dist_ema144:+.1f}% EMA89:{dist_ema89:+.1f}% "
+                     f"SMA21:{dist_sma21:+.1f}% Stoch:{stoch_k:.0f}]")
         return None
 
     # ---------------------------------------------------------------- órdenes
@@ -899,7 +906,7 @@ class TripleBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot Triple Confirmación v1.2 arrancado\n")
+        log.info("\n▶  Bot Triple Confirmación v1.3 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
