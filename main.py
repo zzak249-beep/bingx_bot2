@@ -641,7 +641,8 @@ class FloopBot:
         log.info(f"  Cooldown {symbol}: {mins}min ({reason})")
 
     def _hora_ok(self):
-        return datetime.utcnow().hour not in SKIP_HOURS_UTC
+        from datetime import timezone
+        return datetime.now(timezone.utc).hour not in SKIP_HOURS_UTC
 
     # ---------------------------------------------------------------- ANALISIS FLOOP v3
 
