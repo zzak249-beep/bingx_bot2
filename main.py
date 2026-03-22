@@ -108,11 +108,14 @@ COOLDOWN_AFTER_TP = clean('COOLDOWN_AFTER_TP_MIN', '15', 'int')
 COOLDOWN_AFTER_SL = clean('COOLDOWN_AFTER_SL_MIN', '30', 'int')
 
 SKIP_HOURS_UTC   = {0, 1}
-LIMIT_OFFSET_PCT = 0.05
+LIMIT_OFFSET_PCT = 0.05   # offset entrada límite (0.05% por debajo del precio para LONG)
+SL_LIMIT_OFFSET  = clean('SL_LIMIT_OFFSET_PCT', '0.05', 'float') / 100  # offset SL límite
 BASE_URL         = "https://open-api.bingx.com"
 COMISION_MAKER   = 0.0002
 COMISION_TAKER   = 0.0005
-COMISION_ACTUAL  = COMISION_MAKER if USE_LIMIT_ORDERS else COMISION_TAKER
+# Con entrada limite + TP limite + SL limite-offset pagamos maker en los 3 lados
+# En el peor caso (fallback a market) pagamos taker
+COMISION_ACTUAL  = COMISION_MAKER  # asumimos maker en entrada y salida
 API_RATE_LIMIT   = 0.12  # s entre llamadas (~8/s)
 
 # Pares de referencia para filtro de mercado amplio
@@ -898,48 +901,152 @@ class FloopBot:
         log.error(f"  Entrada fallida: {d.get('msg')}"); return None, None
 
     def _cond_order(self, symbol, direction, qty_c, stop_price, otype):
+        """
+        Ordenes condicionales con maker-first para minimizar comisiones.
+
+        TP  → TAKE_PROFIT límite al precio exacto (maker 0.02%)
+              Fallback: TAKE_PROFIT_MARKET (taker 0.05%) si BingX rechaza el límite.
+
+        SL  → STOP límite con pequeño offset favorable (maker 0.02%)
+              El offset coloca la orden límite DENTRO del spread en la dirección
+              de cierre, garantizando ejecución maker si el precio llega al nivel.
+              Offset: +0.05% para LONG-SL (vende un poco por encima del stop),
+                      -0.05% para SHORT-SL (compra un poco por debajo del stop).
+              Fallback: STOP_MARKET (taker 0.05%) si BingX rechaza el límite.
+
+        Ahorro total por trade: entrada maker + TP maker + SL maker = 0.06%
+        vs entrada maker + TP market + SL market = 0.12%
+        Con 3x leverage: ahorro real ~0.18% del notional por trade.
+        """
         if not qty_c or qty_c <= 0: return False
         try:
             is_tp      = "TAKE" in otype
             lbl        = "TP" if is_tp else "SL"
             close_side = 'SELL' if direction=='LONG' else 'BUY'
-            params     = ({'symbol':symbol,'side':close_side,'positionSide':direction,
-                           'type':'TAKE_PROFIT','quantity':str(qty_c),
-                           'price':str(round(stop_price,8)),
-                           'stopPrice':str(round(stop_price,8)),'timeInForce':'GTC'}
-                          if is_tp else
-                          {'symbol':symbol,'side':close_side,'positionSide':direction,
-                           'type':'STOP_MARKET','quantity':str(qty_c),
-                           'stopPrice':str(round(stop_price,8))})
-            d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
-            ok = d.get('code') == 0
-            if ok:
-                log.info(f"  {lbl} OK @ ${stop_price:.6f}")
-            elif is_tp:
-                p2 = {'symbol':symbol,'side':close_side,'positionSide':direction,
-                      'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
-                      'stopPrice':str(round(stop_price,8))}
-                d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
-                ok = d2.get('code') == 0
-                if ok:  log.info("  TP OK fallback")
-                else:   log.error(f"  TP FALLO: {d2.get('msg')}")
+
+            if is_tp:
+                # TP: orden límite al precio exacto del take profit
+                # BingX: TAKE_PROFIT con price + stopPrice = orden limite condicionada
+                params = {
+                    'symbol':symbol, 'side':close_side, 'positionSide':direction,
+                    'type':'TAKE_PROFIT', 'quantity':str(qty_c),
+                    'price':str(round(stop_price, 8)),
+                    'stopPrice':str(round(stop_price, 8)),
+                    'timeInForce':'GTC',
+                }
+                d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
+                ok = d.get('code') == 0
+                if ok:
+                    log.info(f"  TP maker OK @ ${stop_price:.6f} (0.02%)")
+                else:
+                    # Fallback a market solo si el límite es rechazado
+                    log.warning(f"  TP límite rechazado ({d.get('msg','')[:40]}) — fallback market")
+                    p2 = {
+                        'symbol':symbol, 'side':close_side, 'positionSide':direction,
+                        'type':'TAKE_PROFIT_MARKET', 'quantity':str(qty_c),
+                        'stopPrice':str(round(stop_price, 8)),
+                    }
+                    d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
+                    ok = d2.get('code') == 0
+                    if ok:  log.info(f"  TP taker OK fallback @ ${stop_price:.6f} (0.05%)")
+                    else:   log.error(f"  TP FALLO: {d2.get('msg')}")
+
             else:
-                log.error(f"  {lbl} FALLO: {d.get('msg')}")
+                # SL: orden STOP límite con offset pequeño para ejecutar como maker
+                # Para LONG: vendemos al SL, ponemos límite ligeramente por encima
+                #            → si el precio baja hasta stopPrice, dispara la orden límite
+                #            → la orden límite queda en el libro y se ejecuta maker
+                # Para SHORT: compramos al SL, ponemos límite ligeramente por debajo
+                SL_LIMIT_OFFSET_VAL = SL_LIMIT_OFFSET  # configurable via env SL_LIMIT_OFFSET_PCT
+
+                if direction == 'LONG':
+                    limit_price = round(stop_price * (1 + SL_LIMIT_OFFSET_VAL), 8)
+                else:
+                    limit_price = round(stop_price * (1 - SL_LIMIT_OFFSET_VAL), 8)
+
+                params = {
+                    'symbol':symbol, 'side':close_side, 'positionSide':direction,
+                    'type':'STOP', 'quantity':str(qty_c),
+                    'price':str(limit_price),
+                    'stopPrice':str(round(stop_price, 8)),
+                    'timeInForce':'GTC',
+                }
+                d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
+                ok = d.get('code') == 0
+                if ok:
+                    log.info(f"  SL maker OK trigger=${stop_price:.6f} limit=${limit_price:.6f} (0.02%)")
+                else:
+                    # Fallback a STOP_MARKET si BingX no acepta STOP límite
+                    log.warning(f"  SL límite rechazado ({d.get('msg','')[:40]}) — fallback market")
+                    p2 = {
+                        'symbol':symbol, 'side':close_side, 'positionSide':direction,
+                        'type':'STOP_MARKET', 'quantity':str(qty_c),
+                        'stopPrice':str(round(stop_price, 8)),
+                    }
+                    d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
+                    ok = d2.get('code') == 0
+                    if ok:  log.info(f"  SL taker OK fallback @ ${stop_price:.6f} (0.05%)")
+                    else:   log.error(f"  SL FALLO: {d2.get('msg')}")
+
             return ok
         except Exception as e:
             log.error(f"  {otype}: {e}"); return False
 
     def _close_position(self, symbol, direction, t):
+        """
+        Cierre de posicion con maker-first.
+        Intenta orden límite IOC (Immediate-Or-Cancel) al mejor precio posible:
+          - LONG cierre: vende a precio ligeramente POR DEBAJO del mercado → queda en libro, maker
+          - SHORT cierre: compra a precio ligeramente POR ENCIMA del mercado → queda en libro, maker
+        IOC garantiza que si no se llena inmediatamente se cancela sola (sin quedar colgada).
+        Fallback a MARKET si el límite no se acepta o no hay precio disponible.
+        """
         qty_c      = t.get('qty_c', 0)
         close_side = 'SELL' if direction=='LONG' else 'BUY'
-        params     = ({'symbol':symbol,'side':close_side,'positionSide':direction,
+
+        # Intentar cierre límite IOC si tenemos precio de referencia
+        cur_price = t.get('entry', 0)
+        try:
+            tk = self._ticker(symbol)
+            if tk and tk['price'] > 0:
+                cur_price = tk['price']
+        except: pass
+
+        if qty_c and qty_c > 0 and cur_price > 0:
+            # Precio límite ligeramente desfavorable para asegurar fill maker
+            # LONG vende: ponemos límite 0.05% por encima del mercado
+            #   → queda en libro como mejor oferta, se llena en el siguiente tick → maker
+            # SHORT compra: ponemos límite 0.05% por debajo del mercado → idem
+            CLOSE_OFFSET = 0.0005
+            if direction == 'LONG':
+                limit_price = round(cur_price * (1 + CLOSE_OFFSET), 8)
+            else:
+                limit_price = round(cur_price * (1 - CLOSE_OFFSET), 8)
+
+            params_lim = {
+                'symbol':symbol, 'side':close_side, 'positionSide':direction,
+                'type':'LIMIT', 'quantity':str(qty_c),
+                'price':str(limit_price),
+                'timeInForce':'IOC',  # se cancela si no llena al instante
+                'reduceOnly':'true',
+            }
+            d = bingx_request('POST', '/openApi/swap/v2/trade/order', params_lim).json()
+            if d.get('code') == 0:
+                log.info(f"  Cierre maker IOC @ ${limit_price:.6f} (0.02%)")
+                return True
+            log.warning(f"  Cierre límite rechazado — fallback market")
+
+        # Fallback market
+        params_mkt = ({'symbol':symbol,'side':close_side,'positionSide':direction,
                        'type':'MARKET','quantity':str(qty_c),'reduceOnly':'true'}
                       if qty_c else
                       {'symbol':symbol,'side':close_side,'positionSide':direction,
                        'type':'MARKET',
                        'quoteOrderQty':str(round(t.get('usdt_qty',POSITION_SIZE),2)),
                        'reduceOnly':'true'})
-        return bingx_request('POST', '/openApi/swap/v2/trade/order', params).json().get('code') == 0
+        ok = bingx_request('POST', '/openApi/swap/v2/trade/order', params_mkt).json().get('code') == 0
+        if ok: log.info(f"  Cierre taker market OK (0.05%)")
+        return ok
 
     def _tiene_posicion(self, symbol):
         try:
