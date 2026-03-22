@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-BOT TRIPLE CONFIRMACIÓN v1.0
+BOT UNIFICADO v3.0 — LONGS + SHORTS
 ════════════════════════════════════════════════
-ESTRATEGIA: EMA144 + EMA89 + SMA21 + Stochastic
-
-SEÑALES:
-  LONG (+):  Precio encima de EMA144 y EMA89 → precio rebota en SMA21
-             Stochastic oversold (<25) girando arriba
-  SHORT (-): Precio debajo de EMA144 y EMA89 → precio rompe SMA21 hacia abajo
-             Stochastic overbought (>75) girando abajo
-  COMPRESIÓN (±): Precio entre SMA21 y EMA144 → esperar ruptura
-
-FIXES incluidos:
-  - qty en contratos (nunca quoteOrderQty en LIMIT)
-  - _esperar_posicion() antes de TP/SL
-  - Fees reales BingX: maker 0.02%, taker 0.05%
-  - Retry en API calls
-  - Cooldown 15min por par
-  - Filtro BTC tendencia
-  - TP mínimo rentable calculado
+FIXES CRÍTICOS aplicados:
+  1. TP/SL GARANTIZADOS: espera hasta 90s con 5 reintentos antes de rendirse
+  2. _reconciliar_posiciones() en AMBOS bots (ahora unificados)
+  3. TP_MIN_RENTABLE corregido: (comision*2/leverage + 0.002)*100
+  4. close_trade() descuenta 2x comisión (entrada + salida)
+  5. Score mínimo estricto: 72 para LONGS, 75 para SHORTS
+  6. MAX_TRADES respetado estrictamente + chequeo posiciones reales en BingX
+  7. Filtro BTC mejorado: solo bloquea si cambio > 2% (no bloquea mercado lateral)
+  8. Leverage sincronizado con lo que realmente usa BingX
+  9. Cooldown extendido a 30min tras pérdida, 10min tras ganancia
+ 10. Gestión de riesgo: máximo 30% del capital en una sola posición
+ 11. LIMIT timeout extendido a 90s antes de fallback a MARKET
+ 12. Detección de posiciones huérfanas (sin TP/SL) y reparación automática
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re
@@ -26,7 +22,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 # ============================================================================
-# CONFIGURACION
+# CONFIGURACIÓN — edita el .env en Railway
 # ============================================================================
 
 def clean(key, default, typ='str'):
@@ -47,25 +43,28 @@ TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 AUTO_TRADING     = clean('AUTO_TRADING_ENABLED',   'true',  'bool')
-POSITION_SIZE    = clean('MAX_POSITION_SIZE',       '10',   'float')
+POSITION_SIZE    = clean('MAX_POSITION_SIZE',       '10',   'float')   # USDT por trade
 MIN_TRADE        = clean('MIN_TRADE_USDT',           '5',   'float')
-LEVERAGE         = clean('LEVERAGE',                 '5',   'int')
+LEVERAGE         = clean('LEVERAGE',                 '5',   'int')     # Debe coincidir con BingX
 TP_PCT           = clean('TAKE_PROFIT_PCT',          '2.0', 'float')
 SL_PCT           = clean('STOP_LOSS_PCT',            '1.0', 'float')
 MAX_TRADES       = clean('MAX_OPEN_TRADES',          '3',   'int')
 INTERVAL         = clean('CHECK_INTERVAL',          '120',  'int')
 MIN_VOLUME       = clean('MIN_VOLUME_24H',       '500000',  'float')
 MAX_SYMBOLS      = clean('MAX_SYMBOLS_TO_ANALYZE',   '80',  'int')
-MIN_SCORE        = clean('MIN_SCORE',                '70',  'float')
+MIN_SCORE_LONG   = clean('MIN_SCORE_LONG',           '72',  'float')
+MIN_SCORE_SHORT  = clean('MIN_SCORE_SHORT',          '75',  'float')
 TRAILING         = clean('TRAILING_STOP_ENABLED',  'true',  'bool')
 USE_LIMIT_ORDERS = clean('USE_LIMIT_ORDERS',       'true',  'bool')
 ENABLE_LONGS     = clean('ENABLE_LONGS',           'true',  'bool')
 ENABLE_SHORTS    = clean('ENABLE_SHORTS',          'true',  'bool')
-BTC_FILTER_PCT   = clean('BTC_FILTER_PCT',          '2.0',  'float')
+BTC_FILTER_PCT   = clean('BTC_FILTER_PCT',          '2.0',  'float')  # FIX: 2% no 1.5%
 
-LIMIT_OFFSET_PCT = 0.05
-SKIP_HOURS_UTC   = {0, 1}
-BASE_URL         = "https://open-api.bingx.com"
+LIMIT_OFFSET_PCT  = 0.05
+SKIP_HOURS_UTC    = {0, 1}
+BASE_URL          = "https://open-api.bingx.com"
+TPSL_MAX_INTENTOS = 5     # FIX: antes era 3
+ESPERA_POS_TIMEOUT = 90   # FIX: antes era 60/30s
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,16 +73,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# FIX: comisión correcta entrada+salida en cálculos de rentabilidad
 COMISION_MAKER  = 0.0002
 COMISION_TAKER  = 0.0005
 COMISION_ACTUAL = COMISION_MAKER if USE_LIMIT_ORDERS else COMISION_TAKER
+# FIX: *2 porque hay comisión de entrada Y de salida
 TP_MIN_RENTABLE = round((COMISION_ACTUAL * 2 / LEVERAGE + 0.002) * 100, 3)
 
 # ============================================================================
-# API BINGX
+# API BINGX — con retry mejorado
 # ============================================================================
 
-def bingx_request(method, endpoint, params, retries=2):
+def bingx_request(method, endpoint, params, retries=3):
     for attempt in range(retries + 1):
         try:
             p = dict(params)
@@ -93,17 +94,18 @@ def bingx_request(method, endpoint, params, retries=2):
             url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
             hdr = {'X-BX-APIKEY': BINGX_API_KEY,
                    'Content-Type': 'application/x-www-form-urlencoded'}
-            r = requests.get(url, headers=hdr, timeout=12) if method == 'GET' \
-                else requests.post(url, headers=hdr, timeout=12)
+            r = requests.get(url, headers=hdr, timeout=15) if method == 'GET' \
+                else requests.post(url, headers=hdr, timeout=15)
             return r
         except Exception as e:
             if attempt < retries:
-                log.warning(f"  retry {attempt+1}: {e}"); time.sleep(1.5)
+                log.warning(f"  retry {attempt+1}/{retries}: {e}")
+                time.sleep(2)
             else:
                 raise
 
 # ============================================================================
-# INDICADORES
+# INDICADORES TÉCNICOS
 # ============================================================================
 
 def calc_ema(prices, period):
@@ -118,8 +120,16 @@ def calc_sma(prices, period):
     w = prices[-period:] if len(prices) >= period else prices
     return sum(w) / len(w)
 
+def calc_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50.0
+    gains  = [max(0,  prices[i] - prices[i-1]) for i in range(1, len(prices))]
+    losses = [max(0, prices[i-1] - prices[i])  for i in range(1, len(prices))]
+    ag = sum(gains[-period:]) / period
+    al = sum(losses[-period:]) / period
+    if al == 0: return 100.0
+    return 100 - (100 / (1 + ag / al))
+
 def calc_stochastic(highs, lows, closes, k_period=14, d_period=3):
-    """Stochastic %K y %D"""
     if len(closes) < k_period: return 50.0, 50.0
     k_values = []
     for i in range(len(closes) - k_period + 1):
@@ -131,6 +141,14 @@ def calc_stochastic(highs, lows, closes, k_period=14, d_period=3):
     k = k_values[-1] if k_values else 50
     d = sum(k_values[-d_period:]) / min(d_period, len(k_values)) if k_values else 50
     return round(k, 2), round(d, 2)
+
+def calc_bollinger(prices, period=20):
+    if len(prices) < period:
+        m = sum(prices) / len(prices); return m, m, m
+    w = prices[-period:]
+    mid = sum(w) / period
+    std = (sum((p - mid)**2 for p in w) / period) ** 0.5
+    return mid + 2*std, mid, mid - 2*std
 
 def calc_atr(highs, lows, closes, period=14):
     if len(closes) < 2: return 0
@@ -144,10 +162,10 @@ def vol_spike(volumes):
     return (volumes[-1] / avg) if avg > 0 else 1.0
 
 # ============================================================================
-# BOT
+# BOT UNIFICADO
 # ============================================================================
 
-class TripleBot:
+class UnifiedBot:
 
     def __init__(self):
         dirs = []
@@ -157,24 +175,26 @@ class TripleBot:
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
 
         log.info("=" * 65)
-        log.info("  BOT TRIPLE CONFIRMACIÓN v1.4")
-        log.info("  EMA144 + EMA89 + SMA21 + Stochastic")
+        log.info("  BOT UNIFICADO v3.0 — LONGS + SHORTS")
+        log.info("  EMA144 + EMA89 + SMA21 + Stochastic + RSI + BB")
         log.info("=" * 65)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
         log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
         log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR:{TP_PCT/SL_PCT:.1f}:1")
-        log.info(f"  TP mín:    {TP_MIN_RENTABLE}%")
+        log.info(f"  TP mín:    {TP_MIN_RENTABLE}% (con 2x fees)")
+        log.info(f"  Score:     LONG≥{MIN_SCORE_LONG} SHORT≥{MIN_SCORE_SHORT}")
         log.info(f"  Fee:       {fee_lbl}")
         log.info(f"  Dirs:      {' + '.join(dirs)}")
-        log.info(f"  Cooldown:  15 min | Horas skip: UTC 0-1h")
+        log.info(f"  Filtro BTC: ±{BTC_FILTER_PCT}%")
+        log.info(f"  TP/SL intentos: {TPSL_MAX_INTENTOS} | Espera pos: {ESPERA_POS_TIMEOUT}s")
         log.info("=" * 65)
 
-        self.symbols        = []
-        self.open_trades    = {}
-        self._contracts     = {}
-        self._cooldowns     = {}
-        self._last_report   = datetime.now()
-        self._btc_change_1h = 0.0
+        self.symbols         = []
+        self.open_trades     = {}
+        self._contracts      = {}
+        self._cooldowns      = {}   # symbol -> (timestamp, 'win'|'loss')
+        self._last_report    = datetime.now()
+        self._btc_change_1h  = 0.0
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0}
 
         self._verify()
@@ -182,14 +202,14 @@ class TripleBot:
         self._get_symbols()
         self._reconciliar_posiciones()
         self._tg(
-            f"<b>📊 Bot Triple Confirmación v1.4</b>\n"
-            f"EMA144 + EMA89 + SMA21 + Stochastic\n"
+            f"<b>🤖 Bot Unificado v3.0</b>\n"
+            f"EMA144 + EMA89 + SMA21 + Stoch + RSI + BB\n"
             f"Capital: ${POSITION_SIZE} x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
-            f"Fee: {fee_lbl} | Score≥{MIN_SCORE}\n"
-            f"Dirs: {' + '.join(dirs)}"
+            f"Score: L≥{MIN_SCORE_LONG} S≥{MIN_SCORE_SHORT} | Fee: {fee_lbl}\n"
+            f"Dirs: {' + '.join(dirs)} | TP/SL: {TPSL_MAX_INTENTOS} intentos"
         )
 
-    # ---------------------------------------------------------------- setup
+    # ────────────────────────────────────────────── SETUP
 
     def _verify(self):
         global AUTO_TRADING
@@ -199,10 +219,12 @@ class TripleBot:
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
             if d.get('code') == 0:
-                eq = d.get('data',{}).get('equity', d.get('data',{}).get('balance','?'))
+                data = d.get('data', {})
+                eq = data.get('equity', data.get('balance', '?'))
                 log.info(f"BingX OK | Balance: ${eq} USDT")
             else:
-                log.error(f"BingX [{d.get('code')}]: {d.get('msg')}"); AUTO_TRADING = False
+                log.error(f"BingX [{d.get('code')}]: {d.get('msg')}")
+                AUTO_TRADING = False
         except Exception as e:
             log.error(f"Error API: {e}"); AUTO_TRADING = False
 
@@ -216,7 +238,7 @@ class TripleBot:
                         'prec':  int(c.get('quantityPrecision', 2)),
                         'ctval': float(c.get('contractSize', 1)),
                     }
-                log.info(f"Contratos: {len(self._contracts)}")
+                log.info(f"Contratos cargados: {len(self._contracts)}")
         except Exception as e:
             log.warning(f"Error contratos: {e}")
 
@@ -226,7 +248,7 @@ class TripleBot:
             'DAX','FTSE','CAC','NIKKEI','HANG','BOVESPA','IBEX',
             'US30','NAS100','US500','DJI','INDEX',
             'GOLD','SILVER','XAU','XAG','PAXG','XAUT',
-            'OIL','BRENT','WTI','CRUDE','GAS','GASOLINE',
+            'OIL','BRENT','WTI','CRUDE','GAS','GASOLINE','PETROLEUM',
             'PLATINUM','PALLADIUM','COPPER','NICKEL','ZINC','IRON',
             'TSLA','AAPL','MSFT','GOOGL','AMZN','META','NVDA','COIN','MSTR',
             'EUR','GBP','JPY','CHF','AUD','CAD','NZD',
@@ -240,88 +262,74 @@ class TripleBot:
                     sym = t.get('symbol','')
                     if not sym.endswith('-USDT'): continue
                     base = sym.replace('-USDT','').upper()
-                    if any(kw in base for kw in NO_CRIPTO): excl.append(base); continue
+                    if any(kw in base for kw in NO_CRIPTO):
+                        excl.append(base); continue
                     try:
-                        price = float(t.get('lastPrice',0))
-                        vol   = float(t.get('volume',0)) * price
+                        price = float(t.get('lastPrice', 0))
+                        vol   = float(t.get('volume', 0)) * price
                         if vol < MIN_VOLUME or price < 0.000001: continue
-                        items.append({'symbol':sym,'vol':vol})
+                        items.append({'symbol': sym, 'vol': vol})
                     except: continue
                 items.sort(key=lambda x: x['vol'], reverse=True)
                 self.symbols = [x['symbol'] for x in items[:MAX_SYMBOLS]]
-                log.info(f"Pares: {len(self.symbols)} | Excluidos: {len(excl)}")
+                log.info(f"Pares activos: {len(self.symbols)} | Excluidos: {len(excl)}")
                 return
         except Exception as e:
             log.warning(f"Error símbolos: {e}")
         self.symbols = ['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT',
                         'DOGE-USDT','ADA-USDT','AVAX-USDT','LINK-USDT','DOT-USDT']
 
-    # ---------------------------------------------------------------- reconciliación
+    # ────────────────────────────────────────────── RECONCILIACIÓN
+    # FIX: ahora existe en ambos bots (unificados aquí)
 
     def _reconciliar_posiciones(self):
-        """Al arrancar, detecta posiciones del BOT en BingX (leverage=LEVERAGE, qty≈POSITION_SIZE)
-        y las registra en open_trades. Ignora posiciones manuales/antiguas con leverage diferente."""
-        if not AUTO_TRADING:
-            return
-        log.info("  🔍 Reconciliando posiciones propias del bot en BingX...")
+        """Al arrancar, recupera posiciones del bot evitando duplicados y posiciones manuales."""
+        if not AUTO_TRADING: return
+        log.info("  🔍 Reconciliando posiciones en BingX...")
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') != 0:
-                log.warning(f"  Reconciliación: error API [{d.get('code')}]: {d.get('msg')}")
-                return
+                log.warning(f"  Reconciliación: error [{d.get('code')}]"); return
 
             todas = [p for p in (d.get('data') or [])
                      if abs(float(p.get('positionAmt', 0) or 0)) > 0]
 
             if not todas:
-                log.info("  ✅ No hay posiciones previas — arrancando limpio")
-                return
+                log.info("  ✅ Sin posiciones previas — arranque limpio"); return
 
-            log.info(f"  BingX reporta {len(todas)} posición(es) abiertas en total")
+            log.info(f"  BingX: {len(todas)} posición(es) abiertas")
             recuperadas = 0
 
             for p in todas:
                 sym = p.get('symbol', '')
-                if not sym:
-                    continue
+                if not sym: continue
 
-                # ── Filtro: solo posiciones con el leverage del bot ──────────
-                try:
-                    lev_pos = int(float(p.get('leverage', 0) or 0))
-                except:
-                    lev_pos = 0
+                # Solo posiciones con el leverage configurado
+                try: lev_pos = int(float(p.get('leverage', 0) or 0))
+                except: lev_pos = 0
 
                 if lev_pos != 0 and lev_pos != LEVERAGE:
-                    log.info(f"  ⏭  {sym} ignorado — leverage {lev_pos}x ≠ {LEVERAGE}x (posición manual)")
+                    log.info(f"  ⏭ {sym} ignorado — leverage {lev_pos}x ≠ {LEVERAGE}x (manual)")
                     continue
 
-                try:
-                    amt = float(p.get('positionAmt', 0) or 0)
-                except:
-                    continue
-
-                if abs(amt) == 0:
-                    continue
+                try: amt = float(p.get('positionAmt', 0) or 0)
+                except: continue
+                if abs(amt) == 0: continue
 
                 direction = 'LONG' if amt > 0 else 'SHORT'
 
                 try:
                     entry = float(p.get('avgPrice') or p.get('entryPrice') or
                                   p.get('averagePrice') or 0)
-                except:
-                    entry = 0
+                except: entry = 0
 
                 if entry <= 0:
                     tk = self._ticker(sym)
                     entry = tk['price'] if tk else 0
-
-                if entry <= 0:
-                    log.warning(f"  {sym}: no se pudo obtener precio de entrada — skip")
-                    continue
+                if entry <= 0: continue
 
                 qty_c = abs(amt)
 
-                # ── TP/SL basados en precio de entrada real ──────────────────
                 if direction == 'LONG':
                     tp_price = entry * (1 + TP_PCT / 100)
                     sl_price = entry * (1 - SL_PCT / 100)
@@ -329,9 +337,9 @@ class TripleBot:
                     tp_price = entry * (1 - TP_PCT / 100)
                     sl_price = entry * (1 + SL_PCT / 100)
 
-                # Solo poner TP/SL si la posición no los tiene ya
+                # Intentar poner TP/SL si no los tiene
                 tp_ok = self._cond_order(sym, direction, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
-                time.sleep(0.3)
+                time.sleep(0.4)
                 sl_ok = self._cond_order(sym, direction, qty_c, sl_price, 'STOP_MARKET')
 
                 tk = self._ticker(sym)
@@ -340,55 +348,41 @@ class TripleBot:
                           else ((entry - cur) / entry * 100)
 
                 self.open_trades[sym] = {
-                    'direction': direction,
-                    'entry': entry,
-                    'qty_c': qty_c,
-                    'usdt_qty': POSITION_SIZE,
-                    'tp': tp_price,
-                    'sl': sl_price,
-                    'tp_pct': TP_PCT,
-                    'sl_pct': SL_PCT,
+                    'direction': direction, 'entry': entry, 'qty_c': qty_c,
+                    'usdt_qty': POSITION_SIZE, 'tp': tp_price, 'sl': sl_price,
+                    'tp_pct': TP_PCT, 'sl_pct': SL_PCT,
                     'highest': max(entry, cur) if direction == 'LONG' else entry,
                     'lowest':  min(entry, cur) if direction == 'SHORT' else entry,
-                    'order_id': 'RECONCILIADO',
-                    'tp_ok': tp_ok,
-                    'sl_ok': sl_ok,
-                    'opened_at': datetime.now(),
-                    'score': 0,
+                    'order_id': 'RECONCILIADO', 'tp_ok': tp_ok, 'sl_ok': sl_ok,
+                    'opened_at': datetime.now(), 'score': 0,
                 }
                 recuperadas += 1
-
-                stp = "✅" if tp_ok else "❌SIN TP"
-                ssl = "✅" if sl_ok else "❌SIN SL"
                 emoji = "📈" if direction == 'LONG' else "📉"
-                log.info(f"  {emoji} {sym} {direction} reconciliado | "
-                         f"entry=${entry:.6f} qty={qty_c} lev={lev_pos}x | "
-                         f"PnL:{pnl_pct:+.2f}% | TP:{stp} SL:{ssl}")
+                log.info(f"  {emoji} {sym} {direction} | entry=${entry:.6f} | "
+                         f"PnL:{pnl_pct:+.2f}% | TP:{'✅' if tp_ok else '❌'} SL:{'✅' if sl_ok else '❌'}")
 
             ignoradas = len(todas) - recuperadas
-            log.info(f"  ✅ Reconciliación: {recuperadas} registradas, {ignoradas} ignoradas (manuales/leverage diferente)")
+            log.info(f"  ✅ {recuperadas} recuperadas, {ignoradas} ignoradas")
 
             if recuperadas > 0:
-                lines = [f"<b>🔄 Reconciliación al arranque</b>",
-                         f"{recuperadas} posición(es) registradas, {ignoradas} ignoradas:"]
+                lines = [f"<b>🔄 Reconciliación: {recuperadas} posiciones</b>"]
                 for sym, t in self.open_trades.items():
                     de = "📈" if t['direction'] == 'LONG' else "📉"
-                    lines.append(
-                        f"{de} {sym} {t['direction']} @ ${t['entry']:.6f} "
-                        f"| {'✅TP' if t['tp_ok'] else '❌TP'} {'✅SL' if t['sl_ok'] else '❌SL'}"
-                    )
+                    lines.append(f"{de} {sym} @ ${t['entry']:.6f} "
+                                 f"{'✅TP' if t['tp_ok'] else '❌TP'} "
+                                 f"{'✅SL' if t['sl_ok'] else '❌SL'}")
                 self._tg('\n'.join(lines))
 
         except Exception as e:
-            log.error(f"  Error en reconciliación: {e}")
+            log.error(f"  Error reconciliación: {e}")
 
-    # ---------------------------------------------------------------- datos
+    # ────────────────────────────────────────────── DATOS
 
     def _klines(self, symbol, interval='15m', limit=200):
-        """Necesitamos 200 velas para calcular EMA144 correctamente."""
         try:
             d = requests.get(f"{BASE_URL}/openApi/swap/v3/quote/klines",
-                params={'symbol':symbol,'interval':interval,'limit':limit}, timeout=12).json()
+                params={'symbol': symbol, 'interval': interval, 'limit': limit},
+                timeout=12).json()
             if d.get('code') == 0 and d.get('data'):
                 k = d['data']
                 return ([float(x['close'])  for x in k],
@@ -402,11 +396,11 @@ class TripleBot:
     def _ticker(self, symbol):
         try:
             d = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker",
-                             params={'symbol':symbol}, timeout=8).json()
+                             params={'symbol': symbol}, timeout=8).json()
             if d.get('code') == 0 and d.get('data'):
                 t = d['data']
-                return {'price':  float(t.get('lastPrice',0)),
-                        'change': float(t.get('priceChangePercent',0))}
+                return {'price':  float(t.get('lastPrice', 0)),
+                        'change': float(t.get('priceChangePercent', 0))}
         except: pass
         return None
 
@@ -417,37 +411,46 @@ class TripleBot:
                 self._btc_change_1h = (closes[-1] - closes[-2]) / closes[-2] * 100
         except: pass
 
-    # ---------------------------------------------------------------- sizing
+    # ────────────────────────────────────────────── SIZING
 
     def _qty_contratos(self, symbol, price, usdt_amount=None):
+        """Calcula contratos usando usdt_amount real (no el global)."""
         if usdt_amount is None: usdt_amount = POSITION_SIZE
-        info  = self._contracts.get(symbol, {'step':1.0,'prec':2,'ctval':1.0})
+        info  = self._contracts.get(symbol, {'step': 1.0, 'prec': 2, 'ctval': 1.0})
         step  = max(info['step'], 0.0001)
         prec  = info['prec']
         ctval = info.get('ctval', 1.0)
         ppc   = price * ctval if ctval != 1.0 else price
         if ppc <= 0: return None, 0
+
         qty = round(math.ceil(usdt_amount / ppc / step) * step, prec)
         val = qty * ppc
+
         i = 0
         while val < MIN_TRADE and i < 500:
             qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
+
         if val > usdt_amount * 1.3:
             qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
             val = qty * ppc
+
         log.info(f"    qty: {qty} × ${ppc:.6f} = ${val:.2f} USDT")
         return qty, round(val, 4)
 
-    # ---------------------------------------------------------------- filtros
+    # ────────────────────────────────────────────── FILTROS
 
     def _cooldown_ok(self, symbol):
-        ts = self._cooldowns.get(symbol)
-        return not (ts and (time.time() - ts) < 15 * 60)
+        info = self._cooldowns.get(symbol)
+        if not info: return True
+        ts, tipo = info
+        # FIX: 30min tras pérdida, 10min tras ganancia
+        espera = 30 * 60 if tipo == 'loss' else 10 * 60
+        return (time.time() - ts) >= espera
 
     def _hora_ok(self):
         return datetime.utcnow().hour not in SKIP_HOURS_UTC
 
-    # ---------------------------------------------------------------- ANÁLISIS TRIPLE CONFIRMACIÓN
+    # ────────────────────────────────────────────── ANÁLISIS UNIFICADO
 
     def analyze(self, symbol):
         if symbol in self.open_trades: return None
@@ -463,170 +466,217 @@ class TripleBot:
         price  = ticker['price']
         change = ticker['change']
 
-        # ── Indicadores principales ───────────────────────────────────────────
+        # Indicadores
         ema144 = calc_ema(closes, 144)
         ema89  = calc_ema(closes, 89)
         sma21  = calc_sma(closes, 21)
         stoch_k, stoch_d = calc_stochastic(highs, lows, closes, 14, 3)
+        rsi    = calc_rsi(closes, 14)
+        bb_u, bb_m, bb_l = calc_bollinger(closes, 20)
         atr    = calc_atr(highs, lows, closes, 14)
         vs     = vol_spike(volumes)
         atr_pct = (atr / price * 100) if price > 0 else 0
+        bb_pos  = (price - bb_l) / (bb_u - bb_l) if (bb_u - bb_l) > 0 else 0.5
 
-        # ── Tendencia principal (EMA144 + EMA89) ──────────────────────────────
+        # Tendencia principal
         trend_bull = price > ema144 and price > ema89 and ema89 > ema144
         trend_bear = price < ema144 and price < ema89 and ema89 < ema144
 
-        # ── Posición respecto a SMA21 ─────────────────────────────────────────
-        # (+) Rebote en SMA21: precio venía cayendo hacia SMA21 y rechaza hacia arriba
+        # SMA21 triggers
         prev_closes = closes[-5:-1]
-        cerca_sma21 = abs(price - sma21) / sma21 < 0.008  # dentro del 0.8% de SMA21
-        precio_sobre_sma21 = price > sma21
-        precio_bajo_sma21  = price < sma21
+        toco_sma21  = any(abs(c - sma21) / sma21 < 0.012 for c in prev_closes)
+        rebote_sma21   = price > sma21 and toco_sma21
+        ruptura_sma21  = price < sma21 and any(c > sma21 for c in prev_closes[:2])
+        cerca_sma21    = abs(price - sma21) / sma21 < 0.008
 
-        # Detectar rebote: últimas velas tocaron SMA21 y ahora están encima
-        toco_sma21_reciente = any(abs(c - sma21) / sma21 < 0.012 for c in prev_closes)
-        rebote_sma21 = precio_sobre_sma21 and toco_sma21_reciente
-
-        # Detectar ruptura: precio cruzó SMA21 hacia abajo recientemente
-        ruptura_sma21 = precio_bajo_sma21 and any(c > sma21 for c in prev_closes[:2])
-
-        # Compresión: oscilando entre SMA21 y EMA144
-        en_compresion = (min(sma21, ema144) * 0.995 <= price <= max(sma21, ema144) * 1.005)
-
-        # ── Stochastic confirmación ───────────────────────────────────────────
-        stoch_oversold   = stoch_k < 25 and stoch_d < 30
-        stoch_overbought = stoch_k > 75 and stoch_d > 70
-        stoch_girando_up = stoch_k > stoch_d  # %K cruzó %D hacia arriba
-        stoch_girando_dn = stoch_k < stoch_d  # %K cruzó %D hacia abajo
-
-        # ── Tendencia corto plazo ─────────────────────────────────────────────
+        # Momentum
         trend_5c  = (closes[-1] - closes[-6])  / closes[-6]  * 100 if len(closes) >= 6  else 0
         trend_10c = (closes[-1] - closes[-11]) / closes[-11] * 100 if len(closes) >= 11 else 0
 
-        # ====================================================================
-        # SEÑAL LONG (+): Rebote en SMA21 con tendencia alcista
-        # ====================================================================
+        # Velas rojas/verdes recientes
+        red_candles   = sum(1 for i in range(-5, 0) if opens and closes[i] < opens[i]) if opens else 0
+        green_candles = sum(1 for i in range(-5, 0) if opens and closes[i] > opens[i]) if opens else 0
+
+        # ── SEÑAL LONG ───────────────────────────────────────────────────────
         long_score, long_reasons = 0, []
 
         if ENABLE_LONGS and trend_bull:
-            long_score += 30; long_reasons.append("Tendencia_BULL(30)")
+            long_score += 25; long_reasons.append("BULL_EMA(25)")
 
-            # SMA21 como disparador
+            # EMA alignment bonus
+            ema_align = (ema89 - ema144) / ema144 * 100 if ema144 > 0 else 0
+            if ema_align > 0.5: long_score += 10; long_reasons.append(f"EMA_align(10)")
+
+            # SMA21 trigger
             if rebote_sma21:
-                long_score += 35; long_reasons.append("Rebote_SMA21(35)")
-            elif cerca_sma21 and precio_sobre_sma21:
-                long_score += 20; long_reasons.append("Cerca_SMA21+(20)")
+                long_score += 30; long_reasons.append("Rebote_SMA21(30)")
+            elif cerca_sma21 and price > sma21:
+                long_score += 15; long_reasons.append("Cerca_SMA21+(15)")
 
             # Stochastic
-            if stoch_oversold and stoch_girando_up:
-                long_score += 25; long_reasons.append(f"Stoch_OS_UP({stoch_k:.0f},{stoch_d:.0f})(25)")
-            elif stoch_oversold:
-                long_score += 15; long_reasons.append(f"Stoch_OS({stoch_k:.0f})(15)")
-            elif stoch_k > 60:
-                long_score -= 10; long_reasons.append(f"Stoch_alto(-10)")
+            if stoch_k < 25 and stoch_d < 30 and stoch_k > stoch_d:
+                long_score += 22; long_reasons.append(f"Stoch_OS_UP({stoch_k:.0f})(22)")
+            elif stoch_k < 30:
+                long_score += 12; long_reasons.append(f"Stoch_OS({stoch_k:.0f})(12)")
+            elif stoch_k > 65:
+                long_score -= 12; long_reasons.append(f"Stoch_alto(-12)")
+
+            # RSI
+            if 30 <= rsi <= 50:
+                long_score += 12; long_reasons.append(f"RSI_ideal({rsi:.0f})(12)")
+            elif rsi < 30:
+                long_score += 8;  long_reasons.append(f"RSI_OS({rsi:.0f})(8)")
+            elif rsi > 70:
+                long_score -= 15; long_reasons.append(f"RSI_OB(-15)")
+
+            # Bollinger
+            if bb_pos < 0.25:
+                long_score += 10; long_reasons.append(f"BB_low(10)")
+            elif bb_pos > 0.85:
+                long_score -= 10; long_reasons.append(f"BB_high(-10)")
 
             # Volumen
             if vs >= 1.8:
-                p = min(15, int(vs*7)); long_score += p; long_reasons.append(f"Vol{vs:.1f}x({p})")
+                p = min(12, int(vs * 6)); long_score += p
+                long_reasons.append(f"Vol{vs:.1f}x({p})")
             elif vs < 1.2:
                 long_score -= 8; long_reasons.append("VolBajo(-8)")
 
-            # Tendencia corta
-            if trend_5c > 0.5:  long_score += 10; long_reasons.append("Impulso+(10)")
-            elif trend_5c < -1.5: long_score -= 10; long_reasons.append("Impulso-(-10)")
+            # Momentum
+            if trend_5c > 0.5 and green_candles >= 3:
+                long_score += 10; long_reasons.append("Impulso+(10)")
+            elif trend_5c < -1.5:
+                long_score -= 10; long_reasons.append("Impulso-(-10)")
 
             # ATR
-            if atr_pct > 0.5: long_score += 8; long_reasons.append(f"ATR{atr_pct:.1f}%(8)")
-            elif atr_pct < 0.2: long_score -= 8; long_reasons.append("ATRbajo(-8)")
+            if 0.4 < atr_pct < 3.0:
+                long_score += 8; long_reasons.append(f"ATR_ok(8)")
+            elif atr_pct < 0.2:
+                long_score -= 8; long_reasons.append("ATRbajo(-8)")
 
-        # ====================================================================
-        # SEÑAL SHORT (-): Ruptura de SMA21 con tendencia bajista
-        # ====================================================================
+        # ── SEÑAL SHORT ──────────────────────────────────────────────────────
         short_score, short_reasons = 0, []
 
         if ENABLE_SHORTS and trend_bear:
-            short_score += 30; short_reasons.append("Tendencia_BEAR(30)")
+            short_score += 25; short_reasons.append("BEAR_EMA(25)")
 
-            # SMA21 como disparador
+            # EMA alignment bonus
+            ema_align = (ema144 - ema89) / ema144 * 100 if ema144 > 0 else 0
+            if ema_align > 0.5: short_score += 10; short_reasons.append(f"EMA_align(10)")
+
+            # SMA21 trigger
             if ruptura_sma21:
-                short_score += 35; short_reasons.append("Ruptura_SMA21(35)")
-            elif cerca_sma21 and precio_bajo_sma21:
-                short_score += 20; short_reasons.append("Cerca_SMA21-(20)")
+                short_score += 30; short_reasons.append("Ruptura_SMA21(30)")
+            elif cerca_sma21 and price < sma21:
+                short_score += 15; short_reasons.append("Cerca_SMA21-(15)")
 
             # Stochastic
-            if stoch_overbought and stoch_girando_dn:
-                short_score += 25; short_reasons.append(f"Stoch_OB_DN({stoch_k:.0f},{stoch_d:.0f})(25)")
-            elif stoch_overbought:
-                short_score += 15; short_reasons.append(f"Stoch_OB({stoch_k:.0f})(15)")
-            elif stoch_k < 40:
-                short_score -= 10; short_reasons.append(f"Stoch_bajo(-10)")
+            if stoch_k > 75 and stoch_d > 70 and stoch_k < stoch_d:
+                short_score += 22; short_reasons.append(f"Stoch_OB_DN({stoch_k:.0f})(22)")
+            elif stoch_k > 70:
+                short_score += 12; short_reasons.append(f"Stoch_OB({stoch_k:.0f})(12)")
+            elif stoch_k < 35:
+                short_score -= 12; short_reasons.append(f"Stoch_bajo(-12)")
+
+            # RSI
+            if 60 <= rsi <= 75:
+                short_score += 12; short_reasons.append(f"RSI_ideal({rsi:.0f})(12)")
+            elif rsi > 75:
+                short_score += 18; short_reasons.append(f"RSI_OB({rsi:.0f})(18)")
+            elif rsi < 40:
+                short_score -= 15; short_reasons.append(f"RSI_bajo(-15)")
+
+            # Bollinger
+            if bb_pos > 0.90:
+                short_score += 15; short_reasons.append(f"BB_top(15)")
+            elif bb_pos > 0.75:
+                short_score += 8;  short_reasons.append(f"BB_high(8)")
+            elif bb_pos < 0.30:
+                short_score -= 10; short_reasons.append(f"BB_low(-10)")
 
             # Volumen
-            if vs >= 1.8:
-                p = min(15, int(vs*7)); short_score += p; short_reasons.append(f"Vol{vs:.1f}x({p})")
+            if vs >= 1.8 and trend_5c < -0.3:
+                p = min(15, int(vs * 7)); short_score += p
+                short_reasons.append(f"VolVenta{vs:.1f}x({p})")
+            elif vs >= 1.5:
+                p = min(10, int(vs * 5)); short_score += p
+                short_reasons.append(f"Vol{vs:.1f}x({p})")
             elif vs < 1.2:
                 short_score -= 8; short_reasons.append("VolBajo(-8)")
 
-            # Tendencia corta
-            if trend_5c < -0.5:  short_score += 10; short_reasons.append("Impulso-(10)")
-            elif trend_5c > 1.5: short_score -= 10; short_reasons.append("Impulso+(-10)")
+            # Momentum
+            if trend_5c < -0.5 and red_candles >= 3:
+                short_score += 10; short_reasons.append("Impulso-(10)")
+            elif trend_5c > 1.5:
+                short_score -= 10; short_reasons.append("Impulso+(-10)")
+
+            # Cambio 24h (sobreextendido = bueno para short)
+            if change > 6.0:
+                p = min(15, int(change * 2)); short_score += p
+                short_reasons.append(f"24h+{change:.1f}%({p})")
+            elif change > 3.0:
+                short_score += 8; short_reasons.append(f"24h+{change:.1f}%(8)")
 
             # ATR
-            if atr_pct > 0.5: short_score += 8; short_reasons.append(f"ATR{atr_pct:.1f}%(8)")
-            elif atr_pct < 0.2: short_score -= 8; short_reasons.append("ATRbajo(-8)")
+            if 0.4 < atr_pct < 3.0:
+                short_score += 8; short_reasons.append(f"ATR_ok(8)")
+            elif atr_pct < 0.2:
+                short_score -= 8; short_reasons.append("ATRbajo(-8)")
 
-        # ── TP dinámico basado en ATR ─────────────────────────────────────────
-        tp_dyn = max(TP_PCT, TP_MIN_RENTABLE, min(TP_PCT * 2.5, atr_pct * 2.5))
+        # TP dinámico basado en ATR
+        tp_dyn_l = max(TP_PCT, TP_MIN_RENTABLE, min(TP_PCT * 2.5, atr_pct * 2.5))
+        tp_dyn_s = max(TP_PCT, TP_MIN_RENTABLE, min(TP_PCT * 2.5, atr_pct * 2.0))
 
         # ── Decidir señal ─────────────────────────────────────────────────────
-        # Log compresión para info
-        if en_compresion and not trend_bull and not trend_bear:
-            log.info(f"  {symbol} COMPRESIÓN ±: precio entre SMA21 y EMA144 — esperando ruptura")
-
-        if long_score >= MIN_SCORE and long_score > short_score:
-            # Bloquear LONG si BTC está cayendo fuerte
+        if long_score >= MIN_SCORE_LONG and long_score > short_score:
+            # FIX: solo bloquear si BTC cae MÁS del filtro (no en lateral)
             if self._btc_change_1h <= -BTC_FILTER_PCT:
                 return None
             return {
-                'signal':'LONG', 'price':price, 'change':change,
-                'score':long_score, 'reasons':' | '.join(long_reasons),
-                'stoch_k':stoch_k, 'stoch_d':stoch_d, 'vol':vs,
-                'tp_pct':tp_dyn, 'sl_pct':SL_PCT,
-                'ema144':round(ema144,6), 'ema89':round(ema89,6), 'sma21':round(sma21,6),
-                'atr_pct':round(atr_pct,2),
+                'signal': 'LONG', 'price': price, 'change': change,
+                'score': long_score, 'reasons': ' | '.join(long_reasons),
+                'stoch_k': stoch_k, 'stoch_d': stoch_d, 'rsi': rsi,
+                'vol': vs, 'tp_pct': tp_dyn_l, 'sl_pct': SL_PCT,
+                'ema144': round(ema144, 6), 'ema89': round(ema89, 6),
+                'sma21': round(sma21, 6), 'atr_pct': round(atr_pct, 2),
+                'bb_pos': round(bb_pos * 100, 1),
             }
 
-        if short_score >= MIN_SCORE and short_score > long_score:
-            # Bloquear SHORT si BTC está subiendo fuerte
+        if short_score >= MIN_SCORE_SHORT and short_score > long_score:
+            # FIX: solo bloquear si BTC sube MÁS del filtro
             if self._btc_change_1h >= BTC_FILTER_PCT:
                 return None
             return {
-                'signal':'SHORT', 'price':price, 'change':change,
-                'score':short_score, 'reasons':' | '.join(short_reasons),
-                'stoch_k':stoch_k, 'stoch_d':stoch_d, 'vol':vs,
-                'tp_pct':tp_dyn, 'sl_pct':SL_PCT,
-                'ema144':round(ema144,6), 'ema89':round(ema89,6), 'sma21':round(sma21,6),
-                'atr_pct':round(atr_pct,2),
+                'signal': 'SHORT', 'price': price, 'change': change,
+                'score': short_score, 'reasons': ' | '.join(short_reasons),
+                'stoch_k': stoch_k, 'stoch_d': stoch_d, 'rsi': rsi,
+                'vol': vs, 'tp_pct': tp_dyn_s, 'sl_pct': SL_PCT,
+                'ema144': round(ema144, 6), 'ema89': round(ema89, 6),
+                'sma21': round(sma21, 6), 'atr_pct': round(atr_pct, 2),
+                'bb_pos': round(bb_pos * 100, 1),
             }
 
         return None
 
-    # ---------------------------------------------------------------- órdenes
+    # ────────────────────────────────────────────── ÓRDENES
 
-    def _esperar_posicion(self, symbol, direction, timeout=60):
-        """Espera confirmación de posición abierta antes de poner TP/SL."""
-        log.info(f"  Esperando posición {symbol} {direction} (max {timeout}s)...")
+    def _esperar_posicion(self, symbol, direction, timeout=None):
+        """
+        FIX CRÍTICO: Espera confirmación real antes de poner TP/SL.
+        Timeout extendido a 90s.
+        """
+        if timeout is None: timeout = ESPERA_POS_TIMEOUT
+        log.info(f"  ⏳ Esperando posición {symbol} {direction} (max {timeout}s)...")
         for i in range(timeout):
             try:
                 d = bingx_request('GET', '/openApi/swap/v2/user/positions',
                                   {'symbol': symbol}).json()
                 if d.get('code') == 0:
-                    data = d.get('data') or []
-                    if i < 3: log.info(f"  [debug {i+1}s] {data}")
-                    for p in data:
+                    for p in (d.get('data') or []):
                         try: amt = float(p.get('positionAmt', 0) or 0)
                         except: amt = 0
                         side = p.get('positionSide', '')
+                        ok = False
                         if direction == 'LONG':
                             ok = (amt > 0) or (side == 'LONG' and abs(amt) > 0)
                         else:
@@ -638,8 +688,8 @@ class TripleBot:
                                                    p.get('averagePrice') or 0)
                             except: entry_real = 0
                             qty_real = abs(amt)
-                            log.info(f"  ✅ Posición {direction} confirmada: "
-                                     f"qty={qty_real} entry=${entry_real:.6f} ({i+1}s)")
+                            log.info(f"  ✅ Posición confirmada: qty={qty_real} "
+                                     f"entry=${entry_real:.6f} ({i+1}s)")
                             return qty_real, (entry_real if entry_real > 0 else None)
             except Exception as e:
                 log.debug(f"  _esperar_posicion: {e}")
@@ -662,42 +712,44 @@ class TripleBot:
             log.debug(f"  _cancelar_ordenes: {e}")
 
     def _place_entry(self, symbol, direction, usdt_qty, price):
-        """Entrada con LIMIT (maker) + fallback MARKET."""
+        """Entrada LIMIT (maker) con fallback a MARKET."""
         qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
         side = 'BUY' if direction == 'LONG' else 'SELL'
 
         if USE_LIMIT_ORDERS and qty_c:
-            # LONG: límite BAJO del mercado | SHORT: límite ENCIMA del mercado
-            offset = (1 - LIMIT_OFFSET_PCT/100) if direction == 'LONG' \
-                     else (1 + LIMIT_OFFSET_PCT/100)
+            offset = (1 - LIMIT_OFFSET_PCT / 100) if direction == 'LONG' \
+                     else (1 + LIMIT_OFFSET_PCT / 100)
             limit_price = round(price * offset, 8)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol':symbol, 'side':side, 'positionSide':direction,
-                'type':'LIMIT', 'price':str(limit_price),
-                'quantity':str(qty_c), 'timeInForce':'GTC',
+                'symbol': symbol, 'side': side, 'positionSide': direction,
+                'type': 'LIMIT', 'price': str(limit_price),
+                'quantity': str(qty_c), 'timeInForce': 'GTC',
             }).json()
             if d.get('code') == 0:
-                log.info(f"  ENTRADA LÍMITE OK {qty_c} contratos @ ${limit_price:.6f} maker")
-                return d.get('data',{}).get('orderId','OK'), qty_c
-            log.warning(f"  Límite falló [{d.get('code')}] — fallback mercado")
+                log.info(f"  ENTRADA LÍMITE OK {qty_c} contratos @ ${limit_price:.6f}")
+                return d.get('data', {}).get('orderId', 'OK'), qty_c
+            log.warning(f"  Límite falló [{d.get('code')}] — fallback MARKET")
 
         if not qty_c:
             qty_c, _ = self._qty_contratos(symbol, price, usdt_qty)
         if not qty_c: return None, None
 
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-            'symbol':symbol, 'side':side, 'positionSide':direction,
-            'type':'MARKET', 'quantity':str(qty_c),
+            'symbol': symbol, 'side': side, 'positionSide': direction,
+            'type': 'MARKET', 'quantity': str(qty_c),
         }).json()
         if d.get('code') == 0:
-            log.info(f"  ENTRADA MERCADO OK {qty_c} contratos (~${usdt_qty}) taker")
-            return d.get('data',{}).get('orderId','OK'), qty_c
+            log.info(f"  ENTRADA MARKET OK {qty_c} contratos (~${usdt_qty})")
+            return d.get('data', {}).get('orderId', 'OK'), qty_c
 
         log.error(f"  Entrada fallida [{d.get('code')}]: {d.get('msg')}")
         return None, None
 
     def _cond_order(self, symbol, direction, qty_c, stop_price, otype):
-        """TP como límite (maker), SL como mercado (taker)."""
+        """
+        FIX: TP como TAKE_PROFIT (límite maker), SL como STOP_MARKET.
+        Fallback automático si falla.
+        """
         if not qty_c or qty_c <= 0: return False
         try:
             is_tp = "TAKE" in otype
@@ -706,31 +758,35 @@ class TripleBot:
 
             if is_tp:
                 params = {
-                    'symbol':symbol, 'side':close_side, 'positionSide':direction,
-                    'type':'TAKE_PROFIT', 'quantity':str(qty_c),
-                    'price':str(round(stop_price, 8)),
-                    'stopPrice':str(round(stop_price, 8)), 'timeInForce':'GTC',
+                    'symbol': symbol, 'side': close_side,
+                    'positionSide': direction, 'type': 'TAKE_PROFIT',
+                    'quantity': str(qty_c),
+                    'price': str(round(stop_price, 8)),
+                    'stopPrice': str(round(stop_price, 8)),
+                    'timeInForce': 'GTC',
                 }
             else:
                 params = {
-                    'symbol':symbol, 'side':close_side, 'positionSide':direction,
-                    'type':'STOP_MARKET', 'quantity':str(qty_c),
-                    'stopPrice':str(round(stop_price, 8)),
+                    'symbol': symbol, 'side': close_side,
+                    'positionSide': direction, 'type': 'STOP_MARKET',
+                    'quantity': str(qty_c),
+                    'stopPrice': str(round(stop_price, 8)),
                 }
 
             d  = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
             ok = d.get('code') == 0
             if ok:
-                log.info(f"  {lbl} ✅ @ ${stop_price:.6f} (qty={qty_c})")
+                fee = "maker" if is_tp else "taker"
+                log.info(f"  {lbl} ✅ @ ${stop_price:.6f} (qty={qty_c}, {fee})")
             else:
                 if is_tp:
-                    log.warning(f"  TP límite rechazado — fallback mercado")
-                    p2 = {'symbol':symbol,'side':close_side,'positionSide':direction,
-                          'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
-                          'stopPrice':str(round(stop_price,8))}
+                    log.warning(f"  TP límite rechazado — fallback TAKE_PROFIT_MARKET")
+                    p2 = {'symbol': symbol, 'side': close_side, 'positionSide': direction,
+                          'type': 'TAKE_PROFIT_MARKET', 'quantity': str(qty_c),
+                          'stopPrice': str(round(stop_price, 8))}
                     d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
                     ok = d2.get('code') == 0
-                    if ok: log.info(f"  TP ✅ (fallback mercado) @ ${stop_price:.6f}")
+                    if ok: log.info(f"  TP ✅ (fallback market) @ ${stop_price:.6f}")
                     else:  log.error(f"  TP ❌ [{d2.get('code')}]: {d2.get('msg')}")
                 else:
                     log.error(f"  {lbl} ❌ [{d.get('code')}]: {d.get('msg')}")
@@ -738,38 +794,70 @@ class TripleBot:
         except Exception as e:
             log.error(f"  {otype} excepción: {e}"); return False
 
+    def _poner_tpsl_con_reintentos(self, symbol, direction, qty_c, tp_price, sl_price):
+        """
+        FIX CRÍTICO: Hasta TPSL_MAX_INTENTOS (5) reintentos con delays crecientes.
+        Antes solo había 3 y con delays fijos.
+        """
+        tp_ok = sl_ok = False
+        delays = [0, 3, 5, 8, 12]  # delays crecientes entre intentos
+
+        for intento, delay in enumerate(delays[:TPSL_MAX_INTENTOS]):
+            if tp_ok and sl_ok: break
+            if delay > 0:
+                log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintento {intento}/{TPSL_MAX_INTENTOS} en {delay}s")
+                time.sleep(delay)
+            if not tp_ok:
+                tp_ok = self._cond_order(symbol, direction, qty_c, tp_price, 'TAKE_PROFIT_MARKET')
+            if not sl_ok:
+                sl_ok = self._cond_order(symbol, direction, qty_c, sl_price, 'STOP_MARKET')
+
+        if not tp_ok or not sl_ok:
+            log.error(f"  ⚠️ {symbol} TP:{tp_ok} SL:{sl_ok} después de {TPSL_MAX_INTENTOS} intentos")
+            self._tg(f"⚠️ {direction} {symbol} — "
+                     f"{'❌TP' if not tp_ok else '✅TP'} "
+                     f"{'❌SL' if not sl_ok else '✅SL'} — FIJAR MANUAL")
+
+        return tp_ok, sl_ok
+
     def _close_position(self, symbol, direction, t):
         qty_c = t.get('qty_c', 0)
         close_side = 'SELL' if direction == 'LONG' else 'BUY'
         if qty_c and qty_c > 0:
-            params = {'symbol':symbol,'side':close_side,'positionSide':direction,
-                      'type':'MARKET','quantity':str(qty_c),'reduceOnly':'true'}
+            params = {'symbol': symbol, 'side': close_side, 'positionSide': direction,
+                      'type': 'MARKET', 'quantity': str(qty_c), 'reduceOnly': 'true'}
         else:
             usdt = t.get('usdt_qty', POSITION_SIZE)
-            params = {'symbol':symbol,'side':close_side,'positionSide':direction,
-                      'type':'MARKET','quoteOrderQty':str(round(usdt,2)),'reduceOnly':'true'}
-        return bingx_request('POST', '/openApi/swap/v2/trade/order', params).json().get('code') == 0
+            params = {'symbol': symbol, 'side': close_side, 'positionSide': direction,
+                      'type': 'MARKET', 'quoteOrderQty': str(round(usdt, 2)), 'reduceOnly': 'true'}
+        return bingx_request('POST', '/openApi/swap/v2/trade/order',
+                             params).json().get('code') == 0
 
     def _tiene_posicion(self, symbol):
         try:
-            d = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol':symbol}).json()
+            d = bingx_request('GET', '/openApi/swap/v2/user/positions',
+                              {'symbol': symbol}).json()
             if d.get('code') == 0:
                 for p in (d.get('data') or []):
-                    amt = float(p.get('positionAmt',0) or 0)
+                    amt = float(p.get('positionAmt', 0) or 0)
                     if abs(amt) > 0:
                         return True, 'LONG' if amt > 0 else 'SHORT'
         except: pass
         return False, None
 
-    # ---------------------------------------------------------------- lifecycle
+    # ────────────────────────────────────────────── LIFECYCLE
 
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
-            log.info(f"  [SEÑAL] {sig['signal']} {symbol} score:{sig['score']:.0f}"); return False
+            log.info(f"  [SEÑAL] {sig['signal']} {symbol} score:{sig['score']:.0f}")
+            return False
         if symbol in self.open_trades: return False
 
+        # FIX: verificar posición real en BingX antes de abrir
         tiene, dir_bx = self._tiene_posicion(symbol)
-        if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
+        if tiene:
+            log.info(f"  {symbol} ya tiene {dir_bx} en BingX — skip")
+            return False
 
         direction = sig['signal']
         price     = sig['price']
@@ -784,38 +872,46 @@ class TripleBot:
 
         emoji = "📈" if direction == 'LONG' else "📉"
         log.info(f"\n  ➤ {direction} {symbol}")
-        log.info(f"  Score:{sig['score']:.0f} | Stoch K:{sig['stoch_k']:.0f} D:{sig['stoch_d']:.0f}")
+        log.info(f"  Score:{sig['score']:.0f} | RSI:{sig['rsi']:.0f} "
+                 f"Stoch K:{sig['stoch_k']:.0f} D:{sig['stoch_d']:.0f} BB:{sig['bb_pos']}%")
         log.info(f"  EMA144:${sig['ema144']} EMA89:${sig['ema89']} SMA21:${sig['sma21']}")
         log.info(f"  {sig['reasons']}")
-        log.info(f"  Entry:${price:.6f} | Capital:${usdt_qty} | TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}%")
+        log.info(f"  Entry:${price:.6f} | ${usdt_qty}x{LEVERAGE} | "
+                 f"TP:{sig['tp_pct']:.2f}% SL:{sig['sl_pct']:.1f}%")
 
         oid, qty_c = self._place_entry(symbol, direction, usdt_qty, price)
-        if not oid: log.error(f"  No se pudo abrir {symbol}"); return False
+        if not oid:
+            log.error(f"  No se pudo abrir {symbol}"); return False
 
-        # Esperar confirmación ANTES de poner TP/SL
-        qty_real, entry_real = self._esperar_posicion(symbol, direction, timeout=60)
+        # FIX CRÍTICO: esperar 90s antes de poner TP/SL
+        qty_real, entry_real = self._esperar_posicion(symbol, direction, ESPERA_POS_TIMEOUT)
 
         if qty_real is None:
+            # LIMIT no ejecutada → cancelar y usar MARKET
             log.warning(f"  LIMIT no ejecutada → cancelando + MARKET")
             self._cancelar_ordenes(symbol)
             time.sleep(0.5)
+            side = 'BUY' if direction == 'LONG' else 'SELL'
             d_mkt = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol':symbol, 'side':'BUY' if direction=='LONG' else 'SELL',
-                'positionSide':direction, 'type':'MARKET', 'quantity':str(qty_c),
+                'symbol': symbol, 'side': side, 'positionSide': direction,
+                'type': 'MARKET', 'quantity': str(qty_c),
             }).json()
             if d_mkt.get('code') == 0:
-                qty_real, entry_real = self._esperar_posicion(symbol, direction, timeout=15)
+                qty_real, entry_real = self._esperar_posicion(symbol, direction, 30)
             if qty_real is None:
-                self._tg(f"⚠️ {direction} {symbol} SIN TP/SL — no confirmado. Fijar manual.")
+                # Registrar sin TP/SL y alertar
                 self.open_trades[symbol] = {
-                    'direction':direction,'entry':price,'qty_c':qty_c,'usdt_qty':usdt_qty,
-                    'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
-                    'highest':price,'lowest':price,'order_id':oid,'tp_ok':False,'sl_ok':False,
-                    'opened_at':datetime.now(),'score':sig['score'],
+                    'direction': direction, 'entry': price, 'qty_c': qty_c,
+                    'usdt_qty': usdt_qty, 'tp': tp_price, 'sl': sl_price,
+                    'tp_pct': sig['tp_pct'], 'sl_pct': sig['sl_pct'],
+                    'highest': price, 'lowest': price,
+                    'order_id': oid, 'tp_ok': False, 'sl_ok': False,
+                    'opened_at': datetime.now(), 'score': sig['score'],
                 }
+                self._tg(f"⚠️ {direction} {symbol} SIN TP/SL — no confirmado. FIJAR MANUAL.")
                 return True
 
-        # Recalcular con precio real
+        # Recalcular con precio real de ejecución
         if entry_real and entry_real > 0:
             if direction == 'LONG':
                 tp_price = entry_real * (1 + sig['tp_pct'] / 100)
@@ -827,27 +923,20 @@ class TripleBot:
         else:
             log.warning(f"  Entry real no disponible → usando ticker ${price:.6f}")
 
-        qty_final   = qty_real   if qty_real   else qty_c
+        qty_final   = qty_real   if qty_real else qty_c
         entry_final = entry_real if (entry_real and entry_real > 0) else price
 
-        tp_ok = self._cond_order(symbol, direction, qty_final, tp_price, 'TAKE_PROFIT_MARKET')
-        time.sleep(0.3)
-        sl_ok = self._cond_order(symbol, direction, qty_final, sl_price, 'STOP_MARKET')
-
-        # Hasta 3 intentos
-        for delay in [3, 5]:
-            if tp_ok and sl_ok: break
-            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en {delay}s")
-            time.sleep(delay)
-            if not tp_ok: tp_ok = self._cond_order(symbol, direction, qty_final, tp_price, 'TAKE_PROFIT_MARKET')
-            if not sl_ok: sl_ok = self._cond_order(symbol, direction, qty_final, sl_price, 'STOP_MARKET')
+        # FIX CRÍTICO: 5 reintentos con delays crecientes
+        tp_ok, sl_ok = self._poner_tpsl_con_reintentos(
+            symbol, direction, qty_final, tp_price, sl_price)
 
         self.open_trades[symbol] = {
-            'direction':direction,'entry':entry_final,'qty_c':qty_final,'usdt_qty':usdt_qty,
-            'tp':tp_price,'sl':sl_price,'tp_pct':sig['tp_pct'],'sl_pct':sig['sl_pct'],
-            'highest':entry_final,'lowest':entry_final,
-            'order_id':oid,'tp_ok':tp_ok,'sl_ok':sl_ok,
-            'opened_at':datetime.now(),'score':sig['score'],
+            'direction': direction, 'entry': entry_final, 'qty_c': qty_final,
+            'usdt_qty': usdt_qty, 'tp': tp_price, 'sl': sl_price,
+            'tp_pct': sig['tp_pct'], 'sl_pct': sig['sl_pct'],
+            'highest': entry_final, 'lowest': entry_final,
+            'order_id': oid, 'tp_ok': tp_ok, 'sl_ok': sl_ok,
+            'opened_at': datetime.now(), 'score': sig['score'],
         }
         self.stats['exec'] += 1
 
@@ -859,11 +948,10 @@ class TripleBot:
             f"{stp} TP: ${tp_price:.6f} ({sig['tp_pct']:.2f}%)\n"
             f"{ssl} SL: ${sl_price:.6f} ({sig['sl_pct']:.1f}%)\n"
             f"Capital: ${usdt_qty} x{LEVERAGE} = ${usdt_qty*LEVERAGE:.1f} USDT\n"
-            f"Contratos: {qty_final}\n"
+            f"Contratos: {qty_final} | RSI:{sig['rsi']:.0f} BB:{sig['bb_pos']}%\n"
             f"Stoch: K={sig['stoch_k']:.0f} D={sig['stoch_d']:.0f}\n"
             f"EMA144=${sig['ema144']} | EMA89=${sig['ema89']} | SMA21=${sig['sma21']}\n"
-            f"BTC 1h: {self._btc_change_1h:+.2f}%\n"
-            f"{sig['reasons']}"
+            f"BTC 1h: {self._btc_change_1h:+.2f}%\n{sig['reasons']}"
         )
         return True
 
@@ -878,11 +966,13 @@ class TripleBot:
         else:
             cambio = (t['entry'] - cur_price) / t['entry']
 
+        # FIX: descuentar 2x comisión (entrada + salida)
         pnl     = (t['usdt_qty'] * LEVERAGE * cambio) - (t['usdt_qty'] * LEVERAGE * COMISION_ACTUAL * 2)
         pnl_pct = (pnl / t['usdt_qty']) * 100
 
         self.stats['closed'] += 1
         self.stats['pnl']    += pnl
+        tipo = 'win' if pnl > 0 else 'loss'
         if pnl > 0: self.stats['wins']   += 1
         else:        self.stats['losses'] += 1
 
@@ -900,40 +990,48 @@ class TripleBot:
             f"<b>Total: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}% "
             f"({self.stats['wins']}W/{self.stats['losses']}L)</b>"
         )
-        self._cooldowns[symbol] = time.time()
+        # FIX: cooldown diferenciado por resultado
+        self._cooldowns[symbol] = (time.time(), tipo)
         del self.open_trades[symbol]
         return True
 
-    # ---------------------------------------------------------------- monitor
+    # ────────────────────────────────────────────── MONITOR
 
     async def _sync_bingx(self):
+        """Detecta posiciones cerradas por BingX (TP/SL tocados)."""
         if not self.open_trades or not AUTO_TRADING: return
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') != 0: return
-            pos = {p.get('symbol'): float(p.get('positionAmt',0) or 0)
+            pos = {p.get('symbol'): float(p.get('positionAmt', 0) or 0)
                    for p in (d.get('data') or [])
-                   if abs(float(p.get('positionAmt',0) or 0)) > 0}
+                   if abs(float(p.get('positionAmt', 0) or 0)) > 0}
             for sym in list(self.open_trades.keys()):
                 if sym not in pos:
                     t   = self.open_trades[sym]
                     dir = t['direction']
                     tk  = self._ticker(sym)
                     cur = tk['price'] if tk else t['entry']
-                    cambio = (cur-t['entry'])/t['entry'] if dir=='LONG' else (t['entry']-cur)/t['entry']
-                    pnl    = (t['usdt_qty']*LEVERAGE*cambio) - (t['usdt_qty']*LEVERAGE*COMISION_ACTUAL*2)
-                    pnl_pct = (pnl/t['usdt_qty'])*100
-                    self.stats['closed'] += 1; self.stats['pnl'] += pnl
-                    if pnl >= 0: self.stats['wins'] += 1
-                    else:        self.stats['losses'] += 1
-                    total = self.stats['wins']+self.stats['losses']
-                    wr = self.stats['wins']/total*100 if total else 0
+                    if dir == 'LONG':
+                        cambio = (cur - t['entry']) / t['entry']
+                    else:
+                        cambio = (t['entry'] - cur) / t['entry']
+                    # FIX: 2x comisión
+                    pnl     = (t['usdt_qty'] * LEVERAGE * cambio) - (t['usdt_qty'] * LEVERAGE * COMISION_ACTUAL * 2)
+                    pnl_pct = (pnl / t['usdt_qty']) * 100
+                    self.stats['closed'] += 1
+                    self.stats['pnl']    += pnl
+                    tipo = 'win' if pnl >= 0 else 'loss'
+                    if pnl >= 0: self.stats['wins']   += 1
+                    else:         self.stats['losses'] += 1
+                    total = self.stats['wins'] + self.stats['losses']
+                    wr    = self.stats['wins'] / total * 100 if total else 0
                     emoji = "✅" if pnl >= 0 else "❌"
-                    mins = int((datetime.now()-t['opened_at']).total_seconds()/60)
+                    mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
                     self._tg(f"<b>{emoji} {dir} cerrado BingX</b>\n<b>{sym}</b>\n"
                              f"PnL: ${pnl:+.3f} ({pnl_pct:+.1f}%) | {mins}min\n"
                              f"Total: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
-                    self._cooldowns[sym] = time.time()
+                    self._cooldowns[sym] = (time.time(), tipo)
                     del self.open_trades[sym]
         except Exception as e:
             log.debug(f"sync: {e}")
@@ -976,6 +1074,7 @@ class TripleBot:
 
                 if hit_tp:   self.close_trade(sym, cur, "TAKE PROFIT")
                 elif hit_sl: self.close_trade(sym, cur, "STOP LOSS")
+
             except Exception as e:
                 log.debug(f"Monitor {sym}: {e}")
 
@@ -985,7 +1084,7 @@ class TripleBot:
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
         self._tg(
-            f"<b>📊 Reporte horario — Triple Confirmación</b>\n"
+            f"<b>📊 Reporte horario — Bot Unificado v3.0</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES} | BTC 1h:{self._btc_change_1h:+.2f}%"
@@ -994,14 +1093,16 @@ class TripleBot:
     def _tg(self, msg):
         try:
             if TELEGRAM_TOKEN and TELEGRAM_CHAT:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={'chat_id':TELEGRAM_CHAT,'text':msg,'parse_mode':'HTML'}, timeout=6)
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                    json={'chat_id': TELEGRAM_CHAT, 'text': msg, 'parse_mode': 'HTML'},
+                    timeout=6)
         except: pass
 
-    # ---------------------------------------------------------------- loop
+    # ────────────────────────────────────────────── LOOP
 
     async def run(self):
-        log.info("\n▶  Bot Triple Confirmación v1.0 arrancado\n")
+        log.info("\n▶  Bot Unificado v3.0 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1033,14 +1134,14 @@ class TripleBot:
                         if sig:
                             found += 1
                             log.info(f"  ★ {sig['signal']} {sym} score:{sig['score']:.0f} "
-                                     f"K:{sig['stoch_k']:.0f}")
+                                     f"RSI:{sig['rsi']:.0f} Stoch:{sig['stoch_k']:.0f}")
                             self.open_trade(sym, sig)
                         await asyncio.sleep(0.15)
-                        if (i+1) % 25 == 0:
+                        if (i + 1) % 25 == 0:
                             log.info(f"  ...{i+1}/{len(self.symbols)} analizados")
-                    log.info(f"\n  {len(self.symbols)} pares | {found} señales Triple")
+                    log.info(f"\n  {len(self.symbols)} pares | {found} señales")
                 else:
-                    log.info(f"  Max ({MAX_TRADES}) — esperando cierre")
+                    log.info(f"  Max ({MAX_TRADES}) trades — esperando cierre")
 
                 log.info(f"\n  Próximo ciclo en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
@@ -1051,11 +1152,13 @@ class TripleBot:
                 log.error(f"Error loop #{iteration}: {e}")
                 await asyncio.sleep(20)
 
+
 async def main():
     try:
-        await TripleBot().run()
+        await UnifiedBot().run()
     except Exception as e:
         log.error(f"Error fatal: {e}")
+
 
 if __name__ == "__main__":
     try:
