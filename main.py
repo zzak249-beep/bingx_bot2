@@ -1,33 +1,22 @@
 #!/usr/bin/env python3
 """
-BOT LONGS PROFESIONAL v1.2
+BOT LONGS PROFESIONAL v1.2 — main.py para Railway/GitHub
 ════════════════════════════════════════════════════════════════
-Versión LONG del bot_shorts_v3.4 — lógica completamente espejada.
+ESTE ES EL ARCHIVO QUE RAILWAY EJECUTA DIRECTAMENTE.
+Súbelo a GitHub como main.py en la raíz del repo.
 
-DIFERENCIAS vs SHORTS:
-  ▸ side='BUY' / positionSide='LONG'
-  ▸ EMA: requiere ema9 > ema21 > ema50 (tendencia alcista)
-  ▸ RSI: busca sobreVENTA (RSI < 35) no sobrecompra
-  ▸ TP: precio SUBE → tp = entry * (1 + tp_pct/100)
-  ▸ SL: precio BAJA → sl = entry * (1 - sl_pct/100)
-  ▸ MACD: busca cruce alcista (ml > sg, hist > 0)
-  ▸ BB: precio cerca de banda INFERIOR (bb_pos < 0.15) → rebote
-  ▸ Trailing: sigue el MÁXIMO (highest), no el mínimo
-  ▸ Velas verdes recientes (cierre > apertura)
-  ▸ Tendencia 5 velas POSITIVA para confirmación
-  ▸ BTC filter: bloquea si BTC cae >1.5% en 1h (no abrir longs en caída)
-  ▸ MAE: busca precio en banda INFERIOR (zona de compra en rango)
-  ▸ Patrones chartistas ALCISTAS: Inv H&S, Double Bottom, Falling Wedge,
-    Bullish Flag, resistencia rota → soporte
+PROTECCIONES HARDCODEADAS (no se pueden cambiar desde .env):
+  ▸ LEVERAGE máximo: 3x  (aunque .env diga 15x o más)
+  ▸ MAX_TRADES máximo: 3  (aunque .env diga más)
+  ▸ FORCE_MIN_USDT: 8 USDT mínimo por trade
+  ▸ Sin quoteOrderQty — siempre quantity en contratos
 
-COMPARTE con shorts:
-  ▸ Misma API BingX, retry, rate limit
-  ▸ Mismo _qty_contratos con FORCE_MIN_USDT
-  ▸ Mismo _esperar_posicion y _cancelar_ordenes
-  ▸ Mismo sistema TP/SL maker-first con 6 reintentos
-  ▸ Mismo MAX_LOSS_PCT como seguro final
-  ▸ Mismo cooldown diferenciado TP/SL
-  ▸ Mismo trailing con TRAILING_START y TRAILING_LOCK
+FIXES v1.2:
+  ▸ Lock _abriendo — solo un trade a la vez
+  ▸ _contar_posiciones_reales() — verifica BingX antes de abrir
+  ▸ Pausa 3s tras cada apertura
+  ▸ RSI filtro: máximo 40 sin patrón, 50 absoluto
+  ▸ Timeout _esperar_posicion reducido 60→30s
 ════════════════════════════════════════════════════════════════
 """
 
@@ -36,7 +25,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 # ============================================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN — con hard caps de seguridad
 # ============================================================================
 
 def clean(key, default, typ='str'):
@@ -58,10 +47,8 @@ TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
 POSITION_SIZE = clean('MAX_POSITION_SIZE',      '10',   'float')
 MIN_TRADE     = clean('MIN_TRADE_USDT',          '8',   'float')
-LEVERAGE      = clean('LEVERAGE',                '3',   'int')
 TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5', 'float')
 SL_PCT        = clean('STOP_LOSS_PCT',           '1.5', 'float')
-MAX_TRADES    = clean('MAX_OPEN_TRADES',         '2',   'int')
 INTERVAL      = clean('CHECK_INTERVAL',          '60',  'int')
 MIN_VOLUME    = clean('MIN_VOLUME_24H',      '500000',  'float')
 MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '50',  'int')
@@ -70,17 +57,27 @@ TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
 TRAILING_START= clean('TRAILING_START_PCT',     '1.0',  'float')
 TRAILING_LOCK = clean('TRAILING_LOCK_PCT',       '60',  'float')
 USE_LIMIT_ORDERS   = clean('USE_LIMIT_ORDERS',      'true', 'bool')
-BTC_BEAR_BLOCK_PCT = clean('BTC_BEAR_BLOCK_PCT',    '1.5',  'float')  # bloquea LONG si BTC cae >1.5%
+BTC_BEAR_BLOCK_PCT = clean('BTC_BEAR_BLOCK_PCT',    '1.5',  'float')
 MAX_LOSS_PCT       = clean('MAX_LOSS_PCT',           '5.0',  'float')
 SL_LIMIT_OFFSET    = clean('SL_LIMIT_OFFSET_PCT',   '0.05', 'float') / 100
-FORCE_MIN_USDT     = clean('FORCE_MIN_USDT',         '8.0',  'float')
 COOLDOWN_MIN_TP    = clean('COOLDOWN_AFTER_TP_MIN',  '15',   'int')
 COOLDOWN_MIN_SL    = clean('COOLDOWN_AFTER_SL_MIN',  '45',   'int')
-
 MAE_PERIOD    = clean('MAE_PERIOD',     '20',  'int')
 MAE_PCT       = clean('MAE_PCT',        '2.0', 'float')
 PATTERN_SCORE = clean('PATTERN_SCORE', 'true', 'bool')
 REGIME_FILTER = clean('REGIME_FILTER', 'true', 'bool')
+
+# ══════════════════════════════════════════════════════════════
+# HARD CAPS — NO MODIFICAR — protegen contra .env mal configurado
+# ══════════════════════════════════════════════════════════════
+_lev_env   = clean('LEVERAGE',        '3', 'int')
+_trades_env= clean('MAX_OPEN_TRADES', '2', 'int')
+_min_env   = clean('FORCE_MIN_USDT',  '8.0', 'float')
+
+LEVERAGE       = min(_lev_env,    3)   # NUNCA más de 3x aunque .env diga 15x
+MAX_TRADES     = min(_trades_env, 3)   # NUNCA más de 3 trades simultáneos
+FORCE_MIN_USDT = max(_min_env,    8.0) # SIEMPRE mínimo 8 USDT por trade
+# ══════════════════════════════════════════════════════════════
 
 LIMIT_OFFSET_PCT = 0.05
 SKIP_HOURS_UTC   = {0, 1}
@@ -360,16 +357,22 @@ class LongBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 70)
-        log.info("  BOT LONGS PROFESIONAL v1.2")
-        log.info("  Espejo del Shorts v3.4 — lógica completamente invertida para LONG")
+        log.info("  BOT LONGS PROFESIONAL v1.2 — main.py")
+        log.info("  HARD CAPS: LEVERAGE≤3x | MAX_TRADES≤3 | MIN_USDT≥8")
         log.info("=" * 70)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
-        log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x")
+        log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x (cap 3x)")
         log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR≥1.7:1")
-        log.info(f"  Min trade: ${FORCE_MIN_USDT} USDT")
+        log.info(f"  Min trade: ${FORCE_MIN_USDT} USDT (cap 8)")
+        log.info(f"  MAX trades:{MAX_TRADES} simultáneos (cap 3)")
         log.info(f"  Órdenes:   {fee_lbl}")
         log.info(f"  BTC filtro:{BTC_BEAR_BLOCK_PCT}% caída bloquea LONG")
         log.info("=" * 70)
+
+        if _lev_env > 3:
+            log.warning(f"  ⚠️  LEVERAGE={_lev_env}x en .env → forzado a 3x por hard cap")
+        if _trades_env > 3:
+            log.warning(f"  ⚠️  MAX_OPEN_TRADES={_trades_env} en .env → forzado a 3 por hard cap")
 
         self.symbols      = []
         self.open_trades  = {}
@@ -384,9 +387,10 @@ class LongBot:
         self._get_symbols()
         self._tg(
             f"<b>🟢 Bot LONGS v1.2 iniciado</b>\n"
-            f"FIX: mínimo {FORCE_MIN_USDT} USDT garantizado\n"
+            f"<b>HARD CAPS: LEV≤3x | MAX≤3 trades | MIN≥8 USDT</b>\n"
             f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
-            f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}"
+            f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}\n"
+            f"{'⚠️ LEVERAGE estaba en '+str(_lev_env)+'x → cap a 3x' if _lev_env > 3 else ''}"
         )
 
     # ---------------------------------------------------------------- setup
