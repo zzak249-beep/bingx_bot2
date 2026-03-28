@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BOT LONGS PROFESIONAL v1.1
+BOT LONGS PROFESIONAL v1.2
 ════════════════════════════════════════════════════════════════
 Versión LONG del bot_shorts_v3.4 — lógica completamente espejada.
 
@@ -360,7 +360,7 @@ class LongBot:
         fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
         log.info("=" * 70)
-        log.info("  BOT LONGS PROFESIONAL v1.1")
+        log.info("  BOT LONGS PROFESIONAL v1.2")
         log.info("  Espejo del Shorts v3.4 — lógica completamente invertida para LONG")
         log.info("=" * 70)
         log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
@@ -383,7 +383,7 @@ class LongBot:
         self._load_contracts()
         self._get_symbols()
         self._tg(
-            f"<b>🟢 Bot LONGS v1.1 iniciado</b>\n"
+            f"<b>🟢 Bot LONGS v1.2 iniciado</b>\n"
             f"FIX: mínimo {FORCE_MIN_USDT} USDT garantizado\n"
             f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
             f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}"
@@ -586,9 +586,12 @@ class LongBot:
             pattern_total, pattern_list = scan_bullish_patterns(closes, highs, lows, volumes)
 
         # ── FILTROS OBLIGATORIOS LONG ────────────────────────────────
-        # 1. RSI: buscar sobreVENTA (< 35) o neutro-bajo (< 45 con patrón)
-        if rsi_min > 45 and not pattern_list:
-            return None   # no sobrevendido sin patrón
+        # 1. RSI: sobreVENTA real (< 40) o patrón fuerte con RSI < 50
+        #    v1.2: bajado de 45 a 40 para evitar demasiadas señales en bull market
+        if rsi_min > 40 and not pattern_list:
+            return None   # no sobrevendido sin patrón confirmado
+        if rsi_min > 50:
+            return None   # nunca entrar con RSI > 50 aunque haya patrón
 
         # 2. Volumen mínimo
         if vs < 1.2:
@@ -872,6 +875,26 @@ class LongBot:
         else:  log.error(f"  Cierre LONG falló [{d.get('code')}]: {d.get('msg')}")
         return ok
 
+    def _contar_posiciones_reales(self):
+        """
+        v1.2 FIX: cuenta posiciones LONG reales en BingX antes de abrir.
+        Evita abrir de más cuando open_trades local está desfasado
+        (ej: durante _esperar_posicion de otro símbolo).
+        """
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
+            if d.get('code') == 0:
+                longs = sum(
+                    1 for p in (d.get('data') or [])
+                    if float(p.get('positionAmt', 0) or 0) > 0
+                )
+                log.info(f"  [REAL] Posiciones LONG en BingX: {longs}/{MAX_TRADES}")
+                return longs
+        except Exception as e:
+            log.warning(f"  [REAL] Error contando posiciones: {e}")
+        # Fallback al conteo local si la API falla
+        return len(self.open_trades)
+
     def _tiene_posicion(self, symbol):
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {'symbol':symbol}).json()
@@ -885,12 +908,35 @@ class LongBot:
 
     # ---------------------------------------------------------------- lifecycle
 
+    # v1.2: lock para evitar aperturas simultáneas durante _esperar_posicion
+    _abriendo = False
+
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
             log.info(f"  [SEÑAL] LONG {symbol} score:{sig['score']:.0f}"); return False
         if symbol in self.open_trades: return False
+
+        # v1.2 FIX: bloquear si ya se está abriendo otro trade
+        if LongBot._abriendo:
+            log.info(f"  {symbol} — skip: ya abriendo otro trade"); return False
+
+        # v1.2 FIX: verificar posiciones REALES en BingX antes de abrir
+        pos_reales = self._contar_posiciones_reales()
+        if pos_reales >= MAX_TRADES:
+            log.info(f"  Max trades en BingX: {pos_reales}/{MAX_TRADES} — skip")
+            return False
+
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
+
+        LongBot._abriendo = True
+        try:
+            return self._open_trade_inner(symbol, sig)
+        finally:
+            LongBot._abriendo = False
+
+    def _open_trade_inner(self, symbol, sig):
+        """Lógica real de apertura — llamada solo cuando el lock está activo."""
 
         price    = sig['price']
         usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)
@@ -911,7 +957,8 @@ class LongBot:
         oid, qty_c = self._place_long_entry(symbol, usdt_qty, price)
         if not oid: log.error(f"  No se pudo abrir {symbol}"); return False
 
-        qty_real, entry_real = self._esperar_posicion(symbol, timeout=60)
+        # v1.2: reducido 60→30s para no bloquear el lock demasiado tiempo
+        qty_real, entry_real = self._esperar_posicion(symbol, timeout=30)
         if qty_real is None:
             self._cancelar_ordenes(symbol); time.sleep(0.5)
             d_mkt = bingx_request('POST', '/openApi/swap/v2/trade/order', {
@@ -919,7 +966,7 @@ class LongBot:
                 'type':'MARKET','quantity':str(qty_c),
             }).json()
             if d_mkt.get('code') == 0:
-                qty_real, entry_real = self._esperar_posicion(symbol, timeout=30)
+                qty_real, entry_real = self._esperar_posicion(symbol, timeout=15)
             if qty_real is None:
                 log.error(f"  CRÍTICO: No confirmada posición {symbol} — cerrando")
                 self._tg(f"<b>🚨 CRÍTICO LONG {symbol}</b>\nNo confirmada. Cerrando emergencia.")
@@ -1096,7 +1143,7 @@ class LongBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot LONG v1.1 arrancado\n")
+        log.info("\n▶  Bot LONG v1.2 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1121,22 +1168,34 @@ class LongBot:
                 await self.monitor_trades()
                 self._reporte_horario()
 
-                if len(self.open_trades) < MAX_TRADES:
+                # v1.2 FIX: usar posiciones REALES de BingX para decidir si analizar
+                pos_reales = self._contar_posiciones_reales()
+                trades_locales = len(self.open_trades)
+                slots_libres = MAX_TRADES - max(pos_reales, trades_locales)
+
+                log.info(f"  Slots libres: {slots_libres} (BingX={pos_reales} local={trades_locales})")
+
+                if slots_libres > 0:
                     found = 0
                     for i, sym in enumerate(self.symbols):
-                        if len(self.open_trades) >= MAX_TRADES: break
+                        # Recheck en cada iteración — open_trade puede haber cambiado
+                        if max(self._contar_posiciones_reales(), len(self.open_trades)) >= MAX_TRADES:
+                            break
                         sig = self.analyze(sym)
                         if sig:
                             found += 1
                             pat_str = f" [{','.join(sig['patterns'])}]" if sig['patterns'] else ""
                             log.info(f"  ★ LONG {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} RR:{sig['rr']:.2f}{pat_str}")
-                            self.open_trade(sym, sig)
-                        await asyncio.sleep(0.12)
+                            abierto = self.open_trade(sym, sig)
+                            if abierto:
+                                # v1.2: pausa tras apertura para que BingX registre la posición
+                                await asyncio.sleep(3)
+                        await asyncio.sleep(0.15)
                         if (i+1) % 25 == 0:
                             log.info(f"  ...{i+1}/{len(self.symbols)} analizados")
                     log.info(f"\n  {len(self.symbols)} pares | {found} señales LONG")
                 else:
-                    log.info(f"  Max ({MAX_TRADES}) — esperando cierre")
+                    log.info(f"  Max ({MAX_TRADES}) trades — esperando cierre")
 
                 log.info(f"\n  Próximo ciclo en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
