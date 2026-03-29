@@ -758,7 +758,20 @@ class LongBot:
         log.error(f"  ❌ TODOS FALLARON [{d.get('code')}]: {d.get('msg')}")
         return None, None
 
-    def _esperar_posicion(self, symbol, timeout=60):
+    def _set_leverage(self, symbol):
+        """Fuerza el leverage en BingX antes de abrir — hard cap a LEVERAGE (max 3x)."""
+        try:
+            for side in ['LONG', 'SHORT']:
+                bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
+                    'symbol': symbol,
+                    'side':   side,
+                    'leverage': str(LEVERAGE),  # ya está capeado a 3 por hard cap
+                })
+            log.info(f"  Leverage {symbol} → {LEVERAGE}x (ambos lados)")
+        except Exception as e:
+            log.warning(f"  _set_leverage {symbol}: {e}")
+
+    def _esperar_posicion(self, symbol, timeout=30):  # v1.2: default 30s no 60s
         log.info(f"  Esperando confirmación LONG {symbol}...")
         for i in range(timeout):
             try:
@@ -957,6 +970,9 @@ class LongBot:
         log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | RR:{sig['rr']:.2f}")
         log.info(f"  {sig['reasons']}")
         log.info(f"  Entry:${price:.6f} | TP:${tp_price:.6f} (+{sig['tp_pct']:.2f}%) SL:${sl_price:.6f} (-{sig['sl_pct']:.2f}%)")
+
+        # Forzar leverage en BingX antes de abrir (evita que use el 15x previo)
+        self._set_leverage(symbol)
 
         oid, qty_c = self._place_long_entry(symbol, usdt_qty, price)
         if not oid: log.error(f"  No se pudo abrir {symbol}"); return False
