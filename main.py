@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
 """
-BOT LONGS PROFESIONAL v1.2 — main.py para Railway/GitHub
+BOT LONGS PROFESIONAL v1.3 — main.py para Railway/GitHub
 ════════════════════════════════════════════════════════════════
-ESTE ES EL ARCHIVO QUE RAILWAY EJECUTA DIRECTAMENTE.
-Súbelo a GitHub como main.py en la raíz del repo.
+FIXES v1.3 — 3 bugs críticos que impedían abrir trades:
 
-PROTECCIONES HARDCODEADAS (no se pueden cambiar desde .env):
-  ▸ LEVERAGE máximo: 3x  (aunque .env diga 15x o más)
-  ▸ MAX_TRADES máximo: 3  (aunque .env diga más)
-  ▸ FORCE_MIN_USDT: 8 USDT mínimo por trade
-  ▸ Sin quoteOrderQty — siempre quantity en contratos
+  FIX-A  RECOVERY AL REINICIAR (bug principal)
+         _sync_bingx() solo corría si open_trades no era vacío.
+         Al reiniciar Railway, open_trades={} → nunca sincronizaba
+         → Telegram reportaba "0/2" aunque BingX tuviera 7 posiciones.
+         Ahora: _recover_open_positions() corre al arrancar SIEMPRE,
+         reconstruye open_trades desde la API de BingX.
 
-FIXES v1.2:
+  FIX-B  FILTRO RSI CORREGIDO (segundo bug — bloqueaba todo)
+         RSI<40 sin patrón + RSI<50 con patrón era imposible:
+         - Si RSI<40 → precio cayendo fuerte → EMAs bajistas
+         - Filtro EMA requería ema9>ema21>ema50 (alcista)
+         → CONTRADICCIÓN: ambos filtros no pueden pasar juntos.
+         Ahora: RSI<55 sin patrón, RSI<65 con patrón.
+         Mercado alcista (BTC>0): RSI<60 sin patrón.
+         Las EMA se relajan si hay régimen TREND_UP o patrón fuerte.
+
+  FIX-C  NOTIONAL CORRECTO (mismo bug que shorts v3.4)
+         _qty_contratos enviaba POSITION_SIZE como notional.
+         Con SIZE=10 y LEV=3 → 10 USDT notional = 3.3 USDT margen.
+         Ahora: notional = POSITION_SIZE * LEVERAGE.
+         Con SIZE=10 y LEV=3 → 30 USDT notional = 10 USDT margen.
+
+  HERENCIA v1.2:
+  ▸ LEVERAGE ≤ 3x hard cap
+  ▸ MAX_TRADES ≤ 3 hard cap
+  ▸ FORCE_MIN_USDT ≥ 8 hard cap
   ▸ Lock _abriendo — solo un trade a la vez
-  ▸ _contar_posiciones_reales() — verifica BingX antes de abrir
-  ▸ Pausa 3s tras cada apertura
-  ▸ RSI filtro: máximo 40 sin patrón, 50 absoluto
-  ▸ Timeout _esperar_posicion reducido 60→30s
+  ▸ _contar_posiciones_reales() antes de abrir
+  ▸ set_leverage vía API antes de cada trade
+  ▸ SL/TP maker-first con 6 reintentos
 ════════════════════════════════════════════════════════════════
 """
 
@@ -25,7 +42,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 # ============================================================================
-# CONFIGURACIÓN — con hard caps de seguridad
+# CONFIGURACIÓN
 # ============================================================================
 
 def clean(key, default, typ='str'):
@@ -45,14 +62,14 @@ TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
-POSITION_SIZE = clean('MAX_POSITION_SIZE',      '10',   'float')
+POSITION_SIZE = clean('MAX_POSITION_SIZE',      '10',   'float')   # MARGEN por trade
 MIN_TRADE     = clean('MIN_TRADE_USDT',          '8',   'float')
 TP_PCT        = clean('TAKE_PROFIT_PCT',         '2.5', 'float')
 SL_PCT        = clean('STOP_LOSS_PCT',           '1.5', 'float')
 INTERVAL      = clean('CHECK_INTERVAL',          '60',  'int')
 MIN_VOLUME    = clean('MIN_VOLUME_24H',      '500000',  'float')
 MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '50',  'int')
-MIN_SCORE     = clean('MIN_SCORE',               '82',  'float')
+MIN_SCORE     = clean('MIN_SCORE',               '75',  'float')   # FIX-B: bajado de 82→75
 TRAILING      = clean('TRAILING_STOP_ENABLED', 'true',  'bool')
 TRAILING_START= clean('TRAILING_START_PCT',     '1.0',  'float')
 TRAILING_LOCK = clean('TRAILING_LOCK_PCT',       '60',  'float')
@@ -68,15 +85,15 @@ PATTERN_SCORE = clean('PATTERN_SCORE', 'true', 'bool')
 REGIME_FILTER = clean('REGIME_FILTER', 'true', 'bool')
 
 # ══════════════════════════════════════════════════════════════
-# HARD CAPS — NO MODIFICAR — protegen contra .env mal configurado
+# HARD CAPS
 # ══════════════════════════════════════════════════════════════
-_lev_env   = clean('LEVERAGE',        '3', 'int')
-_trades_env= clean('MAX_OPEN_TRADES', '2', 'int')
-_min_env   = clean('FORCE_MIN_USDT',  '8.0', 'float')
+_lev_env    = clean('LEVERAGE',        '3', 'int')
+_trades_env = clean('MAX_OPEN_TRADES', '2', 'int')
+_min_env    = clean('FORCE_MIN_USDT',  '8.0', 'float')
 
-LEVERAGE       = min(_lev_env,    3)   # NUNCA más de 3x aunque .env diga 15x
-MAX_TRADES     = min(_trades_env, 3)   # NUNCA más de 3 trades simultáneos
-FORCE_MIN_USDT = max(_min_env,    8.0) # SIEMPRE mínimo 8 USDT por trade
+LEVERAGE       = min(_lev_env,    3)
+MAX_TRADES     = min(_trades_env, 3)
+FORCE_MIN_USDT = max(_min_env,    8.0)
 # ══════════════════════════════════════════════════════════════
 
 LIMIT_OFFSET_PCT = 0.05
@@ -164,44 +181,28 @@ def vol_spike(volumes):
     return (volumes[-1] / avg) if avg > 0 else 1.0
 
 # ============================================================================
-# MAE — LÓGICA LONG (espejo del shorts)
+# MAE — LÓGICA LONG
 # ============================================================================
 
-def calc_sma_val(prices, period):
-    if len(prices) < period: return sum(prices) / len(prices)
-    return sum(prices[-period:]) / period
-
 def mae_long_score(prices, period=20, pct=2.0):
-    """
-    MAE para LONG: busca precio cerca de banda INFERIOR.
-    - Rango: precio bajo la banda -2% = zona de compra (reversión a media)
-    - Bajista: precio rebotando desde la banda inferior en downtrend
-    - Alcista: precio sobre MA = señal de continuación
-    """
     if len(prices) < period:
         ma = sum(prices) / len(prices)
     else:
-        ma = calc_sma_val(prices, period)
-
+        ma = calc_sma(prices, period)
     factor = pct / 100.0
     upper  = ma * (1 + factor)
     lower  = ma * (1 - factor)
     price  = prices[-1]
-
     band_width = upper - lower
     pos = (price - lower) / band_width if band_width > 0 else 0.5
-
-    # Pendiente de MA
     if len(prices) >= period + 5:
-        ma_old       = calc_sma_val(prices[:-5], period)
+        ma_old       = calc_sma(prices[:-5], period)
         ma_slope_pct = (ma - ma_old) / ma_old * 100 if ma_old > 0 else 0
     else:
         ma_slope_pct = 0
-
     is_uptrend   = ma_slope_pct >  0.3
     is_downtrend = ma_slope_pct < -0.5
     is_ranging   = not is_uptrend and not is_downtrend
-
     score, desc = 0, ""
     if is_ranging:
         regime = "RANGO"
@@ -212,21 +213,19 @@ def mae_long_score(prices, period=20, pct=2.0):
         else:             score = 0;   desc = f"MAE_NEUTRAL(0) pos:{pos:.2f}"
     elif is_uptrend:
         regime = "ALCISTA"
-        # En uptrend, retroceso a la MA = buena entrada long
         if pos <= 0.30:   score = 25; desc = f"MAE_RETROCESO_ALCISTA(25) pos:{pos:.2f}"
         elif pos <= 0.50: score = 15; desc = f"MAE_MEDIO_ALCISTA(15) pos:{pos:.2f}"
         else:             score = 5;  desc = f"MAE_ALCISTA_OK(5) pos:{pos:.2f}"
-    else:  # DOWNTREND
+    else:
         regime = "BAJISTA"
         if pos < -0.05:   score = -25; desc = f"MAE_IMPULSO_BAJISTA(-25) pos:{pos:.2f}"
         elif pos < 0.10:  score = -12; desc = f"MAE_BAJISTA_FUERTE(-12) pos:{pos:.2f}"
         elif pos > 0.60:  score = 10;  desc = f"MAE_REBOTE_BAJISTA(10) pos:{pos:.2f}"
         else:             score = -5;  desc = f"MAE_BAJISTA(-5) pos:{pos:.2f}"
-
     return score, desc, regime, pos, upper, ma, lower
 
 # ============================================================================
-# DETECCIÓN DE PATRONES CHARTISTAS ALCISTAS
+# PATRONES ALCISTAS
 # ============================================================================
 
 def find_pivots(prices, window=3):
@@ -239,40 +238,32 @@ def find_pivots(prices, window=3):
     return highs, lows
 
 def detect_double_bottom(closes, lows_list, tolerance=0.015):
-    """Double Bottom: dos mínimos similares → LONG."""
     if len(lows_list) < 2: return False, 0, ""
     l1_idx, l1_val = lows_list[-2]
     l2_idx, l2_val = lows_list[-1]
-    diff = abs(l1_val - l2_val) / max(l1_val, l2_val)
-    if diff > tolerance: return False, 0, ""
+    if abs(l1_val - l2_val) / max(l1_val, l2_val) > tolerance: return False, 0, ""
     peak_prices = closes[l1_idx:l2_idx]
     if not peak_prices: return False, 0, ""
     peak = max(peak_prices)
-    neck_rise = (peak - min(l1_val, l2_val)) / min(l1_val, l2_val)
-    if neck_rise < 0.01: return False, 0, ""
+    if (peak - min(l1_val, l2_val)) / min(l1_val, l2_val) < 0.01: return False, 0, ""
     cur = closes[-1]
-    if cur >= peak * 0.995:   # rompe el cuello → confirmado
-        return True, 40, f"DoubleBottom_NECK(40)"
-    if cur <= l2_val * 1.015: # cerca del segundo mínimo → anticipado
-        return True, 32, f"DoubleBottom_BOT(32)"
+    if cur >= peak * 0.995:   return True, 40, "DoubleBottom_NECK(40)"
+    if cur <= l2_val * 1.015: return True, 32, "DoubleBottom_BOT(32)"
     return False, 0, ""
 
 def detect_inv_head_shoulders(closes, lows_list, tolerance=0.02):
-    """Inverse H&S: cabeza más baja entre dos hombros → LONG."""
     if len(lows_list) < 3: return False, 0, ""
     ls_idx, ls_val = lows_list[-3]
     h_idx,  h_val  = lows_list[-2]
     rs_idx, rs_val = lows_list[-1]
     if not (h_val < ls_val and h_val < rs_val): return False, 0, ""
-    shoulder_diff = abs(ls_val - rs_val) / max(ls_val, rs_val)
-    if shoulder_diff > tolerance: return False, 0, ""
+    if abs(ls_val - rs_val) / max(ls_val, rs_val) > tolerance: return False, 0, ""
     cur = closes[-1]
-    if cur >= rs_val * 1.005: return True, 38, f"InvH&S_BREAK(38)"
-    if cur <= rs_val * 1.01:  return True, 28, f"InvH&S_SHOULDER(28)"
+    if cur >= rs_val * 1.005: return True, 38, "InvH&S_BREAK(38)"
+    if cur <= rs_val * 1.01:  return True, 28, "InvH&S_SHOULDER(28)"
     return False, 0, ""
 
 def detect_falling_wedge(closes, highs_list, lows_list, min_points=3):
-    """Falling Wedge: máximos y mínimos bajando pero convergiendo → LONG."""
     if len(highs_list) < min_points or len(lows_list) < min_points:
         return False, 0, ""
     def slope(points):
@@ -281,44 +272,34 @@ def detect_falling_wedge(closes, highs_list, lows_list, min_points=3):
         return (y2 - y1) / (x2 - x1) if x2 != x1 else 0
     sh = slope(highs_list[-min_points:])
     sl_s = slope(lows_list[-min_points:])
-    if sh >= 0 or sl_s >= 0: return False, 0, ""       # deben bajar
-    if not (sl_s < sh * 0.7): return False, 0, ""       # mínimos bajan más lento → convergencia
+    if sh >= 0 or sl_s >= 0: return False, 0, ""
+    if not (sl_s < sh * 0.7): return False, 0, ""
     cur = closes[-1]
-    last_low = lows_list[-1][1]
-    last_high = highs_list[-1][1]
+    last_low = lows_list[-1][1]; last_high = highs_list[-1][1]
     rng = last_high - last_low
-    if rng > 0 and (cur - last_low) / rng <= 0.25:      # precio en la parte baja de la cuña
-        return True, 30, f"FallingWedge_BOT(30)"
+    if rng > 0 and (cur - last_low) / rng <= 0.25:
+        return True, 30, "FallingWedge_BOT(30)"
     return False, 0, ""
 
 def detect_bullish_flag(closes, volumes, lows_list):
-    """Bullish Flag: subida fuerte + consolidación → LONG continuación."""
     if len(closes) < 20: return False, 0, ""
-    mast_change = (closes[-6] - closes[-12]) / closes[-12] * 100
-    if mast_change < 2.5: return False, 0, ""           # necesita mástil alcista
+    if (closes[-6] - closes[-12]) / closes[-12] * 100 < 2.5: return False, 0, ""
     flag_prices = closes[-5:]
-    flag_range  = (max(flag_prices) - min(flag_prices)) / min(flag_prices) * 100
-    if flag_range > 2.0: return False, 0, ""
-    if len(volumes) >= 10:
-        vol_ok = sum(volumes[-5:]) / 5 < sum(volumes[-10:-5]) / 5
-    else:
-        vol_ok = True
+    if (max(flag_prices) - min(flag_prices)) / min(flag_prices) * 100 > 2.0: return False, 0, ""
+    vol_ok = (sum(volumes[-5:]) / 5 < sum(volumes[-10:-5]) / 5) if len(volumes) >= 10 else True
     return (True, 32, "BullishFlag(32)") if vol_ok else (True, 18, "BullishFlag_noVol(18)")
 
 def detect_resistance_break(closes, highs_list, tolerance=0.008):
-    """Ruptura de resistencia → LONG momentum."""
     if len(highs_list) < 2 or len(closes) < 5: return False, 0, ""
     recent_highs_vals = [v for _, v in highs_list[-6:]]
     if len(recent_highs_vals) < 2: return False, 0, ""
     resist_level = None
     for high in recent_highs_vals:
-        touches = sum(1 for h in recent_highs_vals if abs(h - high) / high < tolerance)
-        if touches >= 2:
+        if sum(1 for h in recent_highs_vals if abs(h - high) / high < tolerance) >= 2:
             resist_level = high; break
     if not resist_level: return False, 0, ""
-    cur = closes[-1]
-    if cur > resist_level * (1 + tolerance):
-        return True, 28, f"ResistBreak(28)"
+    if closes[-1] > resist_level * (1 + tolerance):
+        return True, 28, "ResistBreak(28)"
     return False, 0, ""
 
 def scan_bullish_patterns(closes, highs_raw, lows_raw, volumes):
@@ -338,12 +319,12 @@ def scan_bullish_patterns(closes, highs_raw, lows_raw, volumes):
 
 def detect_market_regime(closes, period=20):
     if len(closes) < period + 5: return "UNKNOWN"
-    ma_now  = calc_sma_val(closes, period)
-    ma_old  = calc_sma_val(closes[:-5], period)
+    ma_now  = calc_sma(closes, period)
+    ma_old  = calc_sma(closes[:-5], period)
     slope_pct = (ma_now - ma_old) / ma_old * 100 if ma_old > 0 else 0
     deviations = [abs(c - ma_now) / ma_now * 100 for c in closes[-period:]]
     avg_dev = sum(deviations) / len(deviations)
-    if slope_pct > 0.6 and avg_dev > 0.8:  return "TREND_UP"
+    if slope_pct > 0.6 and avg_dev > 0.8:   return "TREND_UP"
     elif slope_pct < -0.4 and avg_dev > 0.6: return "TREND_DOWN"
     else: return "RANGING"
 
@@ -354,25 +335,27 @@ def detect_market_regime(closes, period=20):
 class LongBot:
 
     def __init__(self):
-        fee_lbl = f"LÍMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
+        fee_lbl = f"LIMITE maker {COMISION_MAKER*100:.2f}%" if USE_LIMIT_ORDERS \
                   else f"MERCADO taker {COMISION_TAKER*100:.2f}%"
+        rr_min = round(TP_PCT / SL_PCT, 2)
         log.info("=" * 70)
-        log.info("  BOT LONGS PROFESIONAL v1.2 — main.py")
-        log.info("  HARD CAPS: LEVERAGE≤3x | MAX_TRADES≤3 | MIN_USDT≥8")
+        log.info("  BOT LONGS PROFESIONAL v1.3")
+        log.info("  FIXES: recovery+reinicio | RSI correcto | notional*leverage")
         log.info("=" * 70)
-        log.info(f"  Modo:      {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
-        log.info(f"  Capital:   ${POSITION_SIZE} USDT | Leverage: {LEVERAGE}x (cap 3x)")
-        log.info(f"  TP/SL:     {TP_PCT}% / {SL_PCT}%  RR≥1.7:1")
-        log.info(f"  Min trade: ${FORCE_MIN_USDT} USDT (cap 8)")
-        log.info(f"  MAX trades:{MAX_TRADES} simultáneos (cap 3)")
-        log.info(f"  Órdenes:   {fee_lbl}")
-        log.info(f"  BTC filtro:{BTC_BEAR_BLOCK_PCT}% caída bloquea LONG")
+        log.info(f"  Modo:       {'AUTO' if AUTO_TRADING else 'SENALES'}")
+        log.info(f"  Margen:     ${POSITION_SIZE} USDT x{LEVERAGE} = ~${POSITION_SIZE*LEVERAGE:.0f} notional")
+        log.info(f"  TP/SL:      {TP_PCT}% / {SL_PCT}%  RR≥{rr_min}:1")
+        log.info(f"  Min trade:  ${FORCE_MIN_USDT} USDT margen")
+        log.info(f"  MAX trades: {MAX_TRADES} (cap 3)")
+        log.info(f"  Score min:  {MIN_SCORE}")
+        log.info(f"  Ordenes:    {fee_lbl}")
+        log.info(f"  BTC filtro: -{BTC_BEAR_BLOCK_PCT}% bloquea LONG")
         log.info("=" * 70)
 
         if _lev_env > 3:
-            log.warning(f"  ⚠️  LEVERAGE={_lev_env}x en .env → forzado a 3x por hard cap")
+            log.warning(f"  LEVERAGE={_lev_env}x en .env → forzado a 3x")
         if _trades_env > 3:
-            log.warning(f"  ⚠️  MAX_OPEN_TRADES={_trades_env} en .env → forzado a 3 por hard cap")
+            log.warning(f"  MAX_OPEN_TRADES={_trades_env} → forzado a 3")
 
         self.symbols      = []
         self.open_trades  = {}
@@ -385,12 +368,15 @@ class LongBot:
         self._verify()
         self._load_contracts()
         self._get_symbols()
+
+        # FIX-A: Recuperar posiciones abiertas ANTES de empezar el loop
+        self._recover_open_positions()
+
         self._tg(
-            f"<b>🟢 Bot LONGS v1.2 iniciado</b>\n"
-            f"<b>HARD CAPS: LEV≤3x | MAX≤3 trades | MIN≥8 USDT</b>\n"
-            f"TP:{TP_PCT}% SL:{SL_PCT}% RR≥1.7 LEV:{LEVERAGE}x\n"
-            f"Score≥{MIN_SCORE} | Capital: ${POSITION_SIZE}\n"
-            f"{'⚠️ LEVERAGE estaba en '+str(_lev_env)+'x → cap a 3x' if _lev_env > 3 else ''}"
+            f"<b>🟢 Bot LONGS v1.3 iniciado</b>\n"
+            f"FIX: recovery+RSI+notional | LEV:{LEVERAGE}x | Score≥{MIN_SCORE}\n"
+            f"Margen: ${POSITION_SIZE} x{LEVERAGE} = ~${POSITION_SIZE*LEVERAGE:.0f} USDT notional\n"
+            f"TP:{TP_PCT}% SL:{SL_PCT}% | Recuperadas: {len(self.open_trades)} posiciones"
         )
 
     # ---------------------------------------------------------------- setup
@@ -452,8 +438,76 @@ class LongBot:
                 log.info(f"Pares: {len(self.symbols)} | Excluidos: {len(excl)}")
                 return
         except Exception as e:
-            log.warning(f"Error símbolos: {e}")
+            log.warning(f"Error simbolos: {e}")
         self.symbols = ['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT']
+
+    # ---------------------------------------------------------------- FIX-A: recovery al reiniciar
+
+    def _recover_open_positions(self):
+        """
+        FIX-A CRITICO: Recupera posiciones LONG abiertas desde BingX al arrancar.
+        En v1.2, si Railway reiniciaba, open_trades quedaba vacío y _sync_bingx()
+        nunca corría (solo se ejecutaba si open_trades no era vacío).
+        Resultado: Telegram decía '0/2' aunque BingX tuviera 7 posiciones abiertas.
+        """
+        if not AUTO_TRADING:
+            return
+        log.info("  [RECOVERY] Buscando posiciones LONG abiertas en BingX...")
+        try:
+            d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
+            if d.get('code') != 0:
+                log.warning(f"  [RECOVERY] API error: {d.get('msg')}")
+                return
+            recovered = 0
+            for p in (d.get('data') or []):
+                amt  = float(p.get('positionAmt', 0) or 0)
+                side = str(p.get('positionSide', '')).upper()
+                sym  = p.get('symbol', '')
+                if not sym or not (amt > 0 or side == 'LONG'):
+                    continue
+                if sym in self.open_trades:
+                    continue
+                entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
+                qty   = abs(amt)
+                if qty <= 0 or entry <= 0:
+                    continue
+                # Reconstruir trade con TP/SL conservadores basados en entry
+                tp_price = entry * (1 + TP_PCT / 100)
+                sl_price = entry * (1 - SL_PCT / 100)
+                # Estimar USDT qty desde el notional
+                info  = self._contracts.get(sym, {'ctval': 1.0})
+                ctval = max(info.get('ctval', 1.0), 1e-9)
+                usdt_notional = qty * entry * ctval
+                usdt_margin   = usdt_notional / LEVERAGE
+                self.open_trades[sym] = {
+                    'entry':    entry,
+                    'qty_c':    qty,
+                    'usdt_qty': max(usdt_margin, FORCE_MIN_USDT),
+                    'tp':       tp_price,
+                    'sl':       sl_price,
+                    'tp_pct':   TP_PCT,
+                    'sl_pct':   SL_PCT,
+                    'highest':  entry,
+                    'order_id': 'RECOVERED',
+                    'tp_ok':    True,
+                    'sl_ok':    True,
+                    'opened_at': datetime.now(),
+                    'score':    0,
+                    'patterns': [],
+                    'recovered': True,
+                }
+                recovered += 1
+                log.info(f"  [RECOVERY] {sym}: {qty:.4f} cts @ ${entry:.6f} → TP:${tp_price:.6f} SL:${sl_price:.6f}")
+            if recovered > 0:
+                log.info(f"  [RECOVERY] {recovered} posiciones LONG recuperadas")
+                self._tg(
+                    f"<b>♻️ RECOVERY: {recovered} posiciones recuperadas</b>\n"
+                    + "\n".join(f"  • {sym}: entry ${t['entry']:.6f}" for sym, t in self.open_trades.items())
+                )
+            else:
+                log.info("  [RECOVERY] No hay posiciones LONG abiertas en BingX")
+        except Exception as e:
+            log.warning(f"  [RECOVERY] Error: {e}")
 
     # ---------------------------------------------------------------- datos
 
@@ -487,44 +541,69 @@ class LongBot:
                 self._btc_1h = (closes[-1] - closes[-2]) / closes[-2] * 100
         except: pass
 
-    # ---------------------------------------------------------------- sizing
+    # ---------------------------------------------------------------- FIX-C: sizing con margen correcto
 
-    def _qty_contratos(self, symbol, price, usdt_amount=None):
-        """v1.1 FIX: notional correcto. qty = usdt_amount / (price × contractSize)."""
-        if usdt_amount is None: usdt_amount = POSITION_SIZE
-        usdt_amount = max(usdt_amount, FORCE_MIN_USDT, MIN_TRADE)
+    def _set_leverage(self, symbol):
+        """Fuerza el leverage en BingX antes de abrir — hard cap a LEVERAGE (max 3x)."""
+        try:
+            for side in ['LONG', 'SHORT']:
+                d = bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
+                    'symbol': symbol, 'side': side, 'leverage': str(LEVERAGE),
+                }).json()
+                if d.get('code') == 0:
+                    lev_real = d.get('data', {}).get('leverage', LEVERAGE)
+                    log.info(f"  Leverage {side} {symbol}: {lev_real}x OK")
+                else:
+                    log.warning(f"  set_leverage {side} [{d.get('code')}]: {d.get('msg')}")
+        except Exception as e:
+            log.warning(f"  _set_leverage {symbol}: {e}")
+
+    def _qty_contratos(self, symbol, price, margin_usdt=None):
+        """
+        FIX-C CRITICO: margin_usdt es el MARGEN real deseado.
+        Notional enviado al exchange = margin_usdt * LEVERAGE.
+        ANTES: enviaba 10 USDT notional a 3x = 3.3 USDT margen real.
+        AHORA:  envia 10*3=30 USDT notional a 3x = 10 USDT margen real.
+        """
+        if margin_usdt is None: margin_usdt = POSITION_SIZE
+        margin_usdt   = max(margin_usdt, FORCE_MIN_USDT, MIN_TRADE)
+        usdt_notional = margin_usdt * LEVERAGE  # FIX-C: multiplicar por leverage
+
         info  = self._contracts.get(symbol, {'step': 1.0, 'prec': 2, 'ctval': 1.0})
         step  = max(info.get('step', 1.0), 0.0001)
         prec  = info.get('prec', 2)
-        ctval = max(info.get('ctval', 1.0), 0.000000001)
-        ppc   = price * ctval  # precio por contrato = notional por contrato
+        ctval = max(info.get('ctval', 1.0), 1e-9)
+        ppc   = price * ctval   # precio (notional) por contrato
         if ppc <= 0: return None, 0
-        qty = round(math.ceil(usdt_amount / ppc / step) * step, prec)
-        val = qty * ppc
-        min_val = max(MIN_TRADE, FORCE_MIN_USDT)
+
+        qty = round(math.ceil(usdt_notional / ppc / step) * step, prec)
+        val_notional = qty * ppc
+        val_margin   = val_notional / LEVERAGE
         i = 0
-        while val < min_val and i < 200:
-            qty += step; qty = round(qty, prec); val = qty * ppc; i += 1
-        if val < min_val:
-            log.error(f"  [QTY] {symbol} no alcanza mínimo: ${val:.4f} < ${min_val}")
+        min_margin = max(MIN_TRADE, FORCE_MIN_USDT)
+        while val_margin < min_margin and i < 200:
+            qty += step; qty = round(qty, prec)
+            val_notional = qty * ppc; val_margin = val_notional / LEVERAGE; i += 1
+        if val_margin < min_margin:
+            log.error(f"  [QTY] {symbol} no alcanza minimo: margen ${val_margin:.2f} < ${min_margin}")
             return None, 0
-        if val > usdt_amount * 1.3:
-            qty = round(math.floor((usdt_amount * 1.3 / ppc) / step) * step, prec)
-            val = qty * ppc
-            if val < min_val:
-                qty = round(math.ceil(min_val / ppc / step) * step, prec)
-                val = qty * ppc
-        log.info(f"  [QTY] {symbol}: {qty} cts × ${ppc:.6f}/ct = ${val:.2f} USDT notional")
-        return qty, round(val, 4)
+        if val_margin > margin_usdt * 1.3:
+            qty = round(math.floor((margin_usdt * 1.3 * LEVERAGE / ppc) / step) * step, prec)
+            val_notional = qty * ppc; val_margin = val_notional / LEVERAGE
+            if val_margin < min_margin:
+                qty = round(math.ceil((min_margin * LEVERAGE / ppc) / step) * step, prec)
+                val_notional = qty * ppc; val_margin = val_notional / LEVERAGE
+        log.info(f"  [QTY] {symbol}: {qty} cts x ${ppc:.6f} = ${val_notional:.2f} notional | MARGEN: ${val_margin:.2f} @ {LEVERAGE}x")
+        return qty, round(val_notional, 4)
 
     def _notional_ok(self, symbol, qty_c, price):
-        """Valida notional >= FORCE_MIN_USDT."""
         info  = self._contracts.get(symbol, {'ctval': 1.0})
-        ctval = max(info.get('ctval', 1.0), 0.000000001)
-        val   = qty_c * price * ctval
-        ok    = val >= FORCE_MIN_USDT
-        log.info(f"  [VAL] {symbol}: {qty_c} cts = ${val:.2f} USDT {'✅' if ok else '❌'}")
-        return ok, round(val, 2)
+        ctval = max(info.get('ctval', 1.0), 1e-9)
+        val_notional = qty_c * price * ctval
+        val_margin   = val_notional / LEVERAGE
+        ok = val_margin >= FORCE_MIN_USDT
+        log.info(f"  [VAL] {symbol}: notional ${val_notional:.2f} | margen ${val_margin:.2f} {'OK' if ok else 'INSUFICIENTE'}")
+        return ok, round(val_margin, 2)
 
     # ---------------------------------------------------------------- cooldown
 
@@ -544,12 +623,11 @@ class LongBot:
     def _hora_ok(self):
         return datetime.utcnow().hour not in SKIP_HOURS_UTC
 
-    # ---------------------------------------------------------------- análisis LONG
+    # ---------------------------------------------------------------- FIX-B: análisis LONG con RSI corregido
 
     def analyze(self, symbol):
         if symbol in self.open_trades or not self._cooldown_ok(symbol): return None
         if not self._hora_ok(): return None
-        # BTC filter: no abrir LONG si BTC está cayendo
         if self._btc_1h <= -BTC_BEAR_BLOCK_PCT: return None
 
         closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 80)
@@ -559,7 +637,6 @@ class LongBot:
         price  = ticker['price']
         change = ticker['change']
 
-        # Indicadores
         ema9  = calc_ema(closes, 9)
         ema21 = calc_ema(closes, 21)
         ema50 = calc_ema(closes, min(50, len(closes)))
@@ -570,124 +647,134 @@ class LongBot:
         atr   = calc_atr(highs, lows, closes, 14)
         vs    = vol_spike(volumes)
 
-        ema_gap  = abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
-        trend_5  = (closes[-1] - closes[-6])  / closes[-6]  * 100 if len(closes) >= 6  else 0
-        trend_10 = (closes[-1] - closes[-11]) / closes[-11] * 100 if len(closes) >= 11 else 0
-        bb_pos   = (price - bb_l) / (bb_u - bb_l) if (bb_u - bb_l) > 0 else 0.5
-        near_low     = price <= min(closes[-15:]) * 1.02 if len(closes) >= 15 else False
+        ema_gap   = abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
+        trend_5   = (closes[-1] - closes[-6])  / closes[-6]  * 100 if len(closes) >= 6  else 0
+        trend_10  = (closes[-1] - closes[-11]) / closes[-11] * 100 if len(closes) >= 11 else 0
+        bb_pos    = (price - bb_l) / (bb_u - bb_l) if (bb_u - bb_l) > 0 else 0.5
+        near_low  = price <= min(closes[-15:]) * 1.02 if len(closes) >= 15 else False
         green_candles = sum(1 for i in range(-4, 0) if opens and closes[i] > opens[i]) if opens else 0
-        atr_pct      = (atr / price * 100) if price > 0 else 0
+        atr_pct   = (atr / price * 100) if price > 0 else 0
+        rsi_min   = min(rsi, rsi_r)
 
-        rsi_min = min(rsi, rsi_r)  # para LONG buscamos RSI BAJO (sobrevendido)
-
-        # MAE y régimen
         mae_score, mae_desc, mae_regime, mae_pos, _, _, _ = mae_long_score(closes, MAE_PERIOD, MAE_PCT)
         regime = detect_market_regime(closes)
 
-        # Patrones alcistas
         pattern_total, pattern_list = 0, []
         if PATTERN_SCORE:
             pattern_total, pattern_list = scan_bullish_patterns(closes, highs, lows, volumes)
 
-        # ── FILTROS OBLIGATORIOS LONG ────────────────────────────────
-        # 1. RSI: sobreVENTA real (< 40) o patrón fuerte con RSI < 50
-        #    v1.2: bajado de 45 a 40 para evitar demasiadas señales en bull market
-        if rsi_min > 40 and not pattern_list:
-            return None   # no sobrevendido sin patrón confirmado
-        if rsi_min > 50:
-            return None   # nunca entrar con RSI > 50 aunque haya patrón
+        # ── FIX-B: FILTROS RSI CORREGIDOS ────────────────────────────────────
+        # Mercado alcista (BTC subiendo): RSI hasta 60 sin patrón, 68 con patrón
+        # Mercado neutro/bajista: RSI hasta 55 sin patrón, 65 con patrón
+        # v1.2 tenía 40/50 — imposible cuando EMAs deben ser alcistas
+        btc_alcista = self._btc_1h > 0.3
+        rsi_max_sin_patron = 60 if btc_alcista else 55
+        rsi_max_con_patron = 68 if btc_alcista else 65
 
-        # 2. Volumen mínimo
-        if vs < 1.2:
+        if rsi_min > rsi_max_sin_patron and not pattern_list:
+            return None   # sobrecomprado sin confirmación de patrón
+        if rsi_min > rsi_max_con_patron:
+            return None   # nunca entrar en sobrecompra extrema
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ATR mínimo (necesitamos volatilidad para el TP)
+        if atr_pct < 0.3:   # FIX-B: bajado de 0.4 a 0.3
             return None
 
-        # 3. ATR mínimo (necesitamos movimiento para el TP)
-        if atr_pct < 0.4:
-            return None
-
-        # 4. BTC pánico alcista: si BTC sube >4% en 1h puede estar en techo
+        # BTC pánico alcista extremo
         if self._btc_1h > 4.0:
-            return None   # euforia = riesgo de reversal bajista
-
-        # 5. Al menos 1 vela verde reciente
-        if opens and green_candles < 1:
             return None
 
-        # ── EMA alignment LONG ───────────────────────────────────────
+        # EMA alignment LONG — FIX-B: más flexible
         ema_long_ok = ema9 > ema21 > ema50
-        if not ema_long_ok and (not pattern_list or pattern_total < 35):
+        # Relajar EMA si: mercado alcista, hay patrón fuerte, o régimen alcista
+        ema_excepcion = (
+            regime == "TREND_UP" or
+            pattern_total >= 28 or
+            (btc_alcista and ema9 > ema21)  # al menos las 2 cortas alcistas
+        )
+        if not ema_long_ok and not ema_excepcion:
             return None
 
-        # ── Filtro de régimen ────────────────────────────────────────
+        # Régimen
         if REGIME_FILTER and regime == "TREND_DOWN" and not pattern_list:
             return None
 
-        # ── Scoring LONG ─────────────────────────────────────────────
-        score_min = MIN_SCORE + (10 if self._btc_1h < -0.5 else 0)  # más estricto si BTC baja
+        # ── Scoring ──────────────────────────────────────────────────────────
+        # FIX-B: score_min más bajo si BTC alcista (más oportunidades)
+        score_min = MIN_SCORE + (8 if self._btc_1h < -0.5 else 0) - (5 if btc_alcista else 0)
         ss, sr = 0, []
 
         # EMA
         if ema_long_ok:
             p = min(35, 28 + int(ema_gap * 4)) if ema_gap > 1.5 else min(28, 20 + int(ema_gap * 5))
             ss += p; sr.append(f"EMA_OK({p})")
+        elif ema9 > ema21:
+            ss += 10; sr.append("EMA_PARCIAL(10)")
         else:
-            ss -= 15; sr.append("EMA_ROTA(-15)")
+            ss -= 10; sr.append("EMA_ROTA(-10)")
 
-        # RSI (invertido vs shorts: queremos RSI BAJO)
+        # RSI (LONG: bajo = sobreventa = oportunidad de compra)
         if   rsi_min < 25: ss += 38; sr.append(f"RSI{rsi_min:.0f}(38)")
-        elif rsi_min < 30: ss += 28; sr.append(f"RSI{rsi_min:.0f}(28)")
-        elif rsi_min < 35: ss += 18; sr.append(f"RSI{rsi_min:.0f}(18)")
-        elif rsi_min < 45: ss += 8;  sr.append(f"RSI{rsi_min:.0f}(8)")
+        elif rsi_min < 30: ss += 30; sr.append(f"RSI{rsi_min:.0f}(30)")
+        elif rsi_min < 35: ss += 22; sr.append(f"RSI{rsi_min:.0f}(22)")
+        elif rsi_min < 40: ss += 15; sr.append(f"RSI{rsi_min:.0f}(15)")
+        elif rsi_min < 50: ss += 8;  sr.append(f"RSI{rsi_min:.0f}(8)")
+        elif rsi_min < 60: ss += 3;  sr.append(f"RSI{rsi_min:.0f}(3)")
+        else:              ss -= 8;  sr.append(f"RSI{rsi_min:.0f}(-8)")
 
         # MACD alcista
         if ml > sg and hist > 0:
             p = 22 if abs(hist) > abs(ml) * 0.35 else 15
             ss += p; sr.append(f"MACD+({p})")
         elif ml < 0 and hist < 0:
-            ss -= 15; sr.append("MACD-(-15)")
+            ss -= 12; sr.append("MACD-(-12)")
 
-        # Bollinger (precio cerca de banda INFERIOR = zona de compra)
+        # Bollinger (precio cerca de banda inferior = zona de compra)
         if   bb_pos <= 0.05: ss += 25; sr.append("BB_bot(25)")
         elif bb_pos <= 0.15: ss += 17; sr.append("BB_low(17)")
         elif bb_pos <= 0.30: ss += 8;  sr.append("BB_mid-(8)")
-        elif bb_pos >= 0.60: ss -= 12; sr.append("BB_high(-12)")
+        elif bb_pos >= 0.70: ss -= 10; sr.append("BB_high(-10)")
 
-        # Volumen
+        # Volumen (FIX-B: ya no es filtro obligatorio, solo scoring)
         if vs >= 2.0 and trend_5 > 0.3:
             p = min(18, int(vs*8)); ss += p; sr.append(f"VolCompra{vs:.1f}x({p})")
         elif vs >= 1.5:
             p = min(12, int(vs*6)); ss += p; sr.append(f"Vol{vs:.1f}x({p})")
         elif vs >= 1.2:
             ss += 4; sr.append(f"Vol{vs:.1f}x(4)")
+        elif vs < 0.8:
+            ss -= 5; sr.append(f"VolBajo(-5)")
 
-        # Tendencia corta (LONG: buscamos rebote, no impulso bajista)
+        # Tendencia corta
         if trend_5 > 1.5 and trend_10 > 2.5: ss += 20; sr.append("Subida++(20)")
         elif trend_5 > 0.8:                   ss += 12; sr.append("Subida+(12)")
-        elif trend_5 < -1.0:                  ss -= 15; sr.append("Bajada(-15)")
+        elif trend_5 < -1.0:                  ss -= 12; sr.append("Bajada(-12)")
 
-        # Cambio 24h (para LONG: baja fuerte 24h = oportunidad de rebote)
+        # Cambio 24h (caída fuerte = oportunidad de rebote)
         if   change < -6.0: p = min(15, int(abs(change)*2));   ss += p; sr.append(f"24h{change:.1f}%({p})")
         elif change < -3.0: p = min(10, int(abs(change)*1.5)); ss += p; sr.append(f"24h{change:.1f}%({p})")
-        elif change > 4.0:  ss -= 12; sr.append(f"24h+{change:.1f}%(-12)")
+        elif change > 4.0:  ss -= 10; sr.append(f"24h+{change:.1f}%(-10)")
 
-        # Cerca del mínimo reciente
-        if near_low:          ss += 12; sr.append("NearLow(12)")
-        if green_candles >= 3: ss += 10; sr.append(f"Verdes{green_candles}(10)")
-        elif green_candles >= 2: ss += 5; sr.append(f"Verdes{green_candles}(5)")
-        if atr_pct > 1.5:    ss += 8; sr.append(f"ATR{atr_pct:.1f}%(8)")
-        elif atr_pct > 0.8:  ss += 4; sr.append(f"ATR{atr_pct:.1f}%(4)")
+        # Cercanía a mínimos y velas verdes
+        if near_low:              ss += 12; sr.append("NearLow(12)")
+        if green_candles >= 3:    ss += 10; sr.append(f"Verdes{green_candles}(10)")
+        elif green_candles >= 2:  ss += 5;  sr.append(f"Verdes{green_candles}(5)")
+        elif green_candles >= 1:  ss += 2;  sr.append(f"Verde{green_candles}(2)")
+        if atr_pct > 1.5:         ss += 8;  sr.append(f"ATR{atr_pct:.1f}%(8)")
+        elif atr_pct > 0.8:       ss += 4;  sr.append(f"ATR{atr_pct:.1f}%(4)")
+
+        # BTC contexto
+        if btc_alcista:           ss += 5;  sr.append(f"BTC+{self._btc_1h:.1f}%(5)")
 
         # MAE
         if mae_score != 0:
             ss += mae_score; sr.append(mae_desc)
 
         # Régimen
-        if regime == "TREND_UP":
-            ss += 10; sr.append("RegimeAlcista(+10)")
-        elif regime == "RANGING":
-            ss += 5;  sr.append("RegimeRango(+5)")
-        elif regime == "TREND_DOWN":
-            ss -= 10; sr.append("RegimeBajista(-10)")
+        if regime == "TREND_UP":    ss += 12; sr.append("RegimeAlcista(+12)")
+        elif regime == "RANGING":   ss += 5;  sr.append("RegimeRango(+5)")
+        elif regime == "TREND_DOWN": ss -= 10; sr.append("RegimeBajista(-10)")
 
         # Patrones
         if pattern_total > 0:
@@ -695,7 +782,7 @@ class LongBot:
             for p_name in pattern_list:
                 sr.append(p_name)
 
-        # TP/SL dinámicos con RR≥1.7 garantizado
+        # TP/SL dinámicos
         sl_dyn = max(SL_PCT, atr_pct * 0.8) if atr_pct > 0 else SL_PCT
         sl_dyn = round(min(sl_dyn, SL_PCT * 2.0), 3)
         tp_dyn = max(TP_PCT, sl_dyn * 1.7, atr_pct * 2.0, TP_MIN_RENTABLE)
@@ -716,22 +803,23 @@ class LongBot:
 
     # ---------------------------------------------------------------- órdenes LONG
 
-    def _place_long_entry(self, symbol, usdt_qty, price):
-        """v1.1 FIX: NUNCA usa quoteOrderQty. Siempre quantity en contratos."""
-        usdt_qty = max(usdt_qty, FORCE_MIN_USDT, MIN_TRADE)
-        qty_c, qty_val = self._qty_contratos(symbol, price, usdt_qty)
+    def _place_long_entry(self, symbol, margin_usdt, price):
+        """FIX-C: margin_usdt es el MARGEN. Notional = margen * LEVERAGE."""
+        margin_usdt   = max(margin_usdt, FORCE_MIN_USDT, MIN_TRADE)
+        usdt_notional = margin_usdt * LEVERAGE
 
+        qty_c, qty_val = self._qty_contratos(symbol, price, margin_usdt)
         if not qty_c or qty_c <= 0:
-            log.error(f"  ENTRADA ABORTADA {symbol}: qty_c inválido"); return None, None
+            log.error(f"  ABORTADO {symbol}: qty_c invalido"); return None, None
 
-        notional_ok, notional_val = self._notional_ok(symbol, qty_c, price)
+        notional_ok, margin_real = self._notional_ok(symbol, qty_c, price)
         if not notional_ok:
-            log.error(f"  ENTRADA ABORTADA {symbol}: notional ${notional_val:.2f} < ${FORCE_MIN_USDT}")
+            log.error(f"  ABORTADO {symbol}: margen ${margin_real:.2f} < ${FORCE_MIN_USDT}")
             return None, None
 
-        log.info(f"  LONG {symbol}: {qty_c} contratos = ${notional_val:.2f} USDT notional")
+        log.info(f"  LONG {symbol}: margen=${margin_usdt:.2f} x{LEVERAGE} → notional~${usdt_notional:.2f}")
 
-        # Método 1: LIMIT (LONG = BUY ligeramente POR DEBAJO del mercado → maker)
+        # Método 1: LIMIT maker (BUY ligeramente POR DEBAJO)
         if USE_LIMIT_ORDERS:
             limit_price = round(price * (1 - LIMIT_OFFSET_PCT / 100), 8)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
@@ -740,39 +828,26 @@ class LongBot:
                 'quantity':str(qty_c),'timeInForce':'GTC',
             }).json()
             if d.get('code') == 0:
-                log.info(f"  ✅ LIMIT maker {qty_c} cts @ ${limit_price:.6f} (${notional_val:.2f})")
+                log.info(f"  LIMIT maker OK {qty_c} cts @ ${limit_price:.6f}")
                 return d.get('data',{}).get('orderId','OK'), qty_c
             if 'margin' in str(d.get('msg','')).lower():
                 log.error(f"  Margen insuficiente"); return None, None
-            log.warning(f"  LIMIT falló [{d.get('code')}] — MARKET")
+            log.warning(f"  LIMIT fallo [{d.get('code')}] — MARKET")
 
-        # Método 2: MARKET con quantity (nunca quoteOrderQty)
+        # Método 2: MARKET con quantity
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'BUY','positionSide':'LONG',
             'type':'MARKET','quantity':str(qty_c),
         }).json()
         if d.get('code') == 0:
-            log.info(f"  ✅ MARKET {qty_c} cts (${notional_val:.2f})")
+            log.info(f"  MARKET OK {qty_c} cts")
             return d.get('data',{}).get('orderId','OK'), qty_c
 
-        log.error(f"  ❌ TODOS FALLARON [{d.get('code')}]: {d.get('msg')}")
+        log.error(f"  TODOS FALLARON [{d.get('code')}]: {d.get('msg')}")
         return None, None
 
-    def _set_leverage(self, symbol):
-        """Fuerza el leverage en BingX antes de abrir — hard cap a LEVERAGE (max 3x)."""
-        try:
-            for side in ['LONG', 'SHORT']:
-                bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
-                    'symbol': symbol,
-                    'side':   side,
-                    'leverage': str(LEVERAGE),  # ya está capeado a 3 por hard cap
-                })
-            log.info(f"  Leverage {symbol} → {LEVERAGE}x (ambos lados)")
-        except Exception as e:
-            log.warning(f"  _set_leverage {symbol}: {e}")
-
-    def _esperar_posicion(self, symbol, timeout=30):  # v1.2: default 30s no 60s
-        log.info(f"  Esperando confirmación LONG {symbol}...")
+    def _esperar_posicion(self, symbol, timeout=30):
+        log.info(f"  Esperando confirmacion LONG {symbol}...")
         for i in range(timeout):
             try:
                 d = bingx_request('GET', '/openApi/swap/v2/user/positions',
@@ -789,7 +864,7 @@ class LongBot:
                                 return qty_real, entry_real
             except: pass
             time.sleep(1)
-        log.warning(f"  Timeout {timeout}s — posición no confirmada")
+        log.warning(f"  Timeout {timeout}s — no confirmada")
         return None, None
 
     def _cancelar_ordenes(self, symbol):
@@ -805,13 +880,10 @@ class LongBot:
         except: pass
 
     def _cond_order(self, symbol, qty_c, stop_price, otype):
-        """TP/SL maker-first para LONG — espejo exacto del shorts."""
         if not qty_c or qty_c <= 0: return False
         try:
             is_tp = "TAKE" in otype
-
             if is_tp:
-                # TP LONG: venta a precio más alto (precio sube → vende)
                 params = {
                     'symbol':symbol,'side':'SELL','positionSide':'LONG',
                     'type':'TAKE_PROFIT','quantity':str(qty_c),
@@ -820,19 +892,16 @@ class LongBot:
                 }
                 d = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
                 ok = d.get('code') == 0
-                if ok:
-                    log.info(f"  TP ✅ límite maker @ ${stop_price:.6f} (LONG)")
+                if ok: log.info(f"  TP limite maker @ ${stop_price:.6f}")
                 else:
-                    log.warning(f"  TP límite rechazado — fallback TAKE_PROFIT_MARKET")
                     p2 = {'symbol':symbol,'side':'SELL','positionSide':'LONG',
                           'type':'TAKE_PROFIT_MARKET','quantity':str(qty_c),
                           'stopPrice':str(round(stop_price, 8))}
                     d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
                     ok = d2.get('code') == 0
-                    if ok: log.info(f"  TP ✅ market fallback (LONG)")
-                    else:  log.error(f"  TP ❌ [{d2.get('code')}]: {d2.get('msg')}")
+                    if ok:  log.info(f"  TP market fallback OK")
+                    else:   log.error(f"  TP [{d2.get('code')}]: {d2.get('msg')}")
             else:
-                # SL LONG: compra/venta límite ligeramente POR DEBAJO del trigger
                 limit_price = round(stop_price * (1 - SL_LIMIT_OFFSET), 8)
                 params = {
                     'symbol':symbol,'side':'SELL','positionSide':'LONG',
@@ -842,28 +911,23 @@ class LongBot:
                 }
                 d = bingx_request('POST', '/openApi/swap/v2/trade/order', params).json()
                 ok = d.get('code') == 0
-                if ok:
-                    log.info(f"  SL ✅ límite maker trigger=${stop_price:.6f} (LONG)")
+                if ok: log.info(f"  SL limite maker trigger=${stop_price:.6f}")
                 else:
-                    log.warning(f"  SL límite rechazado — fallback STOP_MARKET")
                     p2 = {'symbol':symbol,'side':'SELL','positionSide':'LONG',
                           'type':'STOP_MARKET','quantity':str(qty_c),
                           'stopPrice':str(round(stop_price, 8))}
                     d2 = bingx_request('POST', '/openApi/swap/v2/trade/order', p2).json()
                     ok = d2.get('code') == 0
-                    if ok: log.info(f"  SL ✅ STOP_MARKET fallback (LONG)")
-                    else:  log.error(f"  SL ❌ [{d2.get('code')}]: {d2.get('msg')}")
+                    if ok:  log.info(f"  SL STOP_MARKET fallback OK")
+                    else:   log.error(f"  SL [{d2.get('code')}]: {d2.get('msg')}")
             return ok
         except Exception as e:
-            log.error(f"  {otype} excepción: {e}"); return False
+            log.error(f"  {otype} excepcion: {e}"); return False
 
     def _close_long(self, symbol, t):
-        """v1.1: cierre siempre con quantity en contratos. Sin quoteOrderQty."""
         qty_c = t.get('qty_c', 0)
         if not qty_c or qty_c <= 0:
             log.error(f"  Cierre LONG {symbol}: sin qty_c"); return False
-
-        # Intentar límite IOC (maker)
         cur_price = t.get('entry', 0)
         try:
             tk = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker",
@@ -879,37 +943,27 @@ class LongBot:
                 'price':str(limit_price),'timeInForce':'IOC','reduceOnly':'true',
             }).json()
             if d.get('code') == 0:
-                log.info(f"  Cierre LONG LIMIT IOC {qty_c} cts @ ${limit_price:.6f}")
+                log.info(f"  Cierre LIMIT IOC OK @ ${limit_price:.6f}")
                 return True
-
-        # Fallback MARKET con quantity (nunca quoteOrderQty)
         d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
             'symbol':symbol,'side':'SELL','positionSide':'LONG',
             'type':'MARKET','quantity':str(qty_c),'reduceOnly':'true',
         }).json()
         ok = d.get('code') == 0
-        if ok: log.info(f"  Cierre LONG MARKET {qty_c} cts OK")
-        else:  log.error(f"  Cierre LONG falló [{d.get('code')}]: {d.get('msg')}")
+        if ok: log.info(f"  Cierre MARKET OK")
+        else:  log.error(f"  Cierre fallo [{d.get('code')}]: {d.get('msg')}")
         return ok
 
     def _contar_posiciones_reales(self):
-        """
-        v1.2 FIX: cuenta posiciones LONG reales en BingX antes de abrir.
-        Evita abrir de más cuando open_trades local está desfasado
-        (ej: durante _esperar_posicion de otro símbolo).
-        """
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') == 0:
-                longs = sum(
-                    1 for p in (d.get('data') or [])
-                    if float(p.get('positionAmt', 0) or 0) > 0
-                )
+                longs = sum(1 for p in (d.get('data') or [])
+                            if float(p.get('positionAmt', 0) or 0) > 0)
                 log.info(f"  [REAL] Posiciones LONG en BingX: {longs}/{MAX_TRADES}")
                 return longs
         except Exception as e:
-            log.warning(f"  [REAL] Error contando posiciones: {e}")
-        # Fallback al conteo local si la API falla
+            log.warning(f"  [REAL] Error: {e}")
         return len(self.open_trades)
 
     def _tiene_posicion(self, symbol):
@@ -925,27 +979,19 @@ class LongBot:
 
     # ---------------------------------------------------------------- lifecycle
 
-    # v1.2: lock para evitar aperturas simultáneas durante _esperar_posicion
     _abriendo = False
 
     def open_trade(self, symbol, sig):
         if not AUTO_TRADING:
-            log.info(f"  [SEÑAL] LONG {symbol} score:{sig['score']:.0f}"); return False
+            log.info(f"  [SENAL] LONG {symbol} score:{sig['score']:.0f}"); return False
         if symbol in self.open_trades: return False
-
-        # v1.2 FIX: bloquear si ya se está abriendo otro trade
         if LongBot._abriendo:
-            log.info(f"  {symbol} — skip: ya abriendo otro trade"); return False
-
-        # v1.2 FIX: verificar posiciones REALES en BingX antes de abrir
+            log.info(f"  {symbol} — skip: ya abriendo otro"); return False
         pos_reales = self._contar_posiciones_reales()
         if pos_reales >= MAX_TRADES:
-            log.info(f"  Max trades en BingX: {pos_reales}/{MAX_TRADES} — skip")
-            return False
-
+            log.info(f"  Max trades BingX: {pos_reales}/{MAX_TRADES} — skip"); return False
         tiene, dir_bx = self._tiene_posicion(symbol)
         if tiene: log.info(f"  {symbol} ya tiene {dir_bx} — skip"); return False
-
         LongBot._abriendo = True
         try:
             return self._open_trade_inner(symbol, sig)
@@ -953,31 +999,27 @@ class LongBot:
             LongBot._abriendo = False
 
     def _open_trade_inner(self, symbol, sig):
-        """Lógica real de apertura — llamada solo cuando el lock está activo."""
-
         price    = sig['price']
-        usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)
+        usdt_qty = round(max(POSITION_SIZE, FORCE_MIN_USDT, MIN_TRADE), 2)  # = MARGEN
 
         test_qty, test_val = self._qty_contratos(symbol, price, usdt_qty)
-        if not test_qty or test_val < FORCE_MIN_USDT:
-            log.warning(f"  {symbol} rechazado: ${test_val:.2f} < ${FORCE_MIN_USDT}"); return False
+        if not test_qty or (test_val / LEVERAGE) < FORCE_MIN_USDT:
+            log.warning(f"  {symbol} rechazado: margen insuficiente"); return False
 
-        tp_price = price * (1 + sig['tp_pct'] / 100)   # LONG: TP ARRIBA
-        sl_price = price * (1 - sig['sl_pct'] / 100)   # LONG: SL ABAJO
+        tp_price = price * (1 + sig['tp_pct'] / 100)
+        sl_price = price * (1 - sig['sl_pct'] / 100)
 
-        patterns_str = f"Patrones: {', '.join(sig['patterns'])}" if sig['patterns'] else "Sin patrón"
-        log.info(f"\n  ➤ LONG {symbol}")
+        log.info(f"\n  > LONG {symbol}")
         log.info(f"  Score:{sig['score']:.0f}/{sig['score_min']:.0f} | RSI:{sig['rsi']:.0f} | RR:{sig['rr']:.2f}")
         log.info(f"  {sig['reasons']}")
-        log.info(f"  Entry:${price:.6f} | TP:${tp_price:.6f} (+{sig['tp_pct']:.2f}%) SL:${sl_price:.6f} (-{sig['sl_pct']:.2f}%)")
+        log.info(f"  Entry:${price:.6f} | MARGEN:${usdt_qty} x{LEVERAGE}=~${usdt_qty*LEVERAGE:.0f} notional")
+        log.info(f"  TP:${tp_price:.6f} (+{sig['tp_pct']:.2f}%) | SL:${sl_price:.6f} (-{sig['sl_pct']:.2f}%)")
 
-        # Forzar leverage en BingX antes de abrir (evita que use el 15x previo)
         self._set_leverage(symbol)
 
         oid, qty_c = self._place_long_entry(symbol, usdt_qty, price)
         if not oid: log.error(f"  No se pudo abrir {symbol}"); return False
 
-        # v1.2: reducido 60→30s para no bloquear el lock demasiado tiempo
         qty_real, entry_real = self._esperar_posicion(symbol, timeout=30)
         if qty_real is None:
             self._cancelar_ordenes(symbol); time.sleep(0.5)
@@ -988,8 +1030,8 @@ class LongBot:
             if d_mkt.get('code') == 0:
                 qty_real, entry_real = self._esperar_posicion(symbol, timeout=15)
             if qty_real is None:
-                log.error(f"  CRÍTICO: No confirmada posición {symbol} — cerrando")
-                self._tg(f"<b>🚨 CRÍTICO LONG {symbol}</b>\nNo confirmada. Cerrando emergencia.")
+                log.error(f"  CRITICO: no confirmada {symbol} — cerrando")
+                self._tg(f"<b>CRITICO LONG {symbol}</b>\nNo confirmada. Cerrando emergencia.")
                 for _ in range(2):
                     try:
                         bingx_request('POST', '/openApi/swap/v2/trade/order', {
@@ -1010,14 +1052,14 @@ class LongBot:
 
         for delay in [1, 2, 3, 5, 8, 13]:
             if tp_ok and sl_ok: break
-            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando en {delay}s")
+            log.warning(f"  TP:{tp_ok} SL:{sl_ok} — reintentando {delay}s")
             self._cancelar_ordenes(symbol); time.sleep(delay)
             if not tp_ok: tp_ok = self._cond_order(symbol, qty_final, tp_price, 'TAKE_PROFIT_MARKET')
             if not sl_ok: sl_ok = self._cond_order(symbol, qty_final, sl_price, 'STOP_MARKET')
 
         if not sl_ok:
-            log.error(f"  CRÍTICO: SL fallido {symbol} — cerrando")
-            self._tg(f"<b>🚨 CRÍTICO SL FALLIDO — LONG {symbol}</b>\nCerrando para evitar liquidación.")
+            log.error(f"  CRITICO: SL fallido {symbol} — cerrando")
+            self._tg(f"<b>CRITICO SL FALLIDO — LONG {symbol}</b>")
             time.sleep(1)
             self._close_long(symbol, {'qty_c':qty_final,'usdt_qty':usdt_qty,'entry':entry_final})
             return False
@@ -1031,13 +1073,13 @@ class LongBot:
         self.stats['exec'] += 1
         pat_str = f"\nPatrones: {', '.join(sig['patterns'])}" if sig['patterns'] else ""
         self._tg(
-            f"<b>🟢 LONG ABIERTO</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/100\n"
+            f"<b>LONG ABIERTO v1.3</b>\n<b>{symbol}</b> | Score:{sig['score']:.0f}/{sig['score_min']:.0f}\n"
             f"Entrada: ${entry_final:.6f}\n"
-            f"{'✅' if tp_ok else '❌'} TP: ${tp_price:.6f} (+{sig['tp_pct']:.2f}%)\n"
-            f"{'✅' if sl_ok else '❌'} SL: ${sl_price:.6f} (-{sig['sl_pct']:.2f}%)\n"
-            f"RR: {sig['rr']:.2f}:1 | Capital: ${usdt_qty} x{LEVERAGE}\n"
+            f"{'OK' if tp_ok else 'FALLO'} TP: ${tp_price:.6f} (+{sig['tp_pct']:.2f}%)\n"
+            f"{'OK' if sl_ok else 'FALLO'} SL: ${sl_price:.6f} (-{sig['sl_pct']:.2f}%)\n"
+            f"RR: {sig['rr']:.2f}:1 | Margen: ${usdt_qty} x{LEVERAGE}\n"
             f"RSI:{sig['rsi']:.0f} BB:{sig['bb_pos']}% ATR:{sig['atr_pct']:.2f}%"
-            f"{pat_str}\n{sig['reasons']}"
+            f"{pat_str}"
         )
         return True
 
@@ -1045,26 +1087,22 @@ class LongBot:
         if symbol not in self.open_trades: return False
         t = self.open_trades[symbol]
         self._close_long(symbol, t)
-
-        cambio  = (cur_price - t['entry']) / t['entry']   # LONG: ganancia si precio sube
+        cambio  = (cur_price - t['entry']) / t['entry']
         pnl     = (t['usdt_qty'] * LEVERAGE * cambio) - (t['usdt_qty'] * LEVERAGE * COMISION_ACTUAL)
         pnl_pct = (pnl / t['usdt_qty']) * 100
-
         self.stats['closed'] += 1; self.stats['pnl'] += pnl
         if pnl > 0: self.stats['wins'] += 1
         else:        self.stats['losses'] += 1
-
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
         mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
-        emoji = "✅" if pnl > 0 else "❌"
+        emoji = "OK" if pnl > 0 else "X"
         reason_cd = 'TP' if 'PROFIT' in reason else 'SL'
-
-        log.info(f"  {emoji} {reason} LONG {symbol} PnL:${pnl:+.3f}({pnl_pct:+.1f}%) {mins}min")
+        log.info(f"  [{emoji}] {reason} LONG {symbol} PnL:${pnl:+.3f}({pnl_pct:+.1f}%) {mins}min")
         self._tg(
             f"<b>{emoji} LONG CERRADO — {reason}</b>\n<b>{symbol}</b>\n"
-            f"PnL: ${pnl:+.3f} ({pnl_pct:+.1f}%)\n"
-            f"Entry: ${t['entry']:.6f} → Exit: ${cur_price:.6f} | {mins}min\n"
+            f"PnL: ${pnl:+.3f} ({pnl_pct:+.1f}%) | {mins}min\n"
+            f"Entry: ${t['entry']:.6f} → Exit: ${cur_price:.6f}\n"
             f"<b>Total: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%</b>"
         )
         self._set_cooldown(symbol, reason_cd)
@@ -1074,7 +1112,11 @@ class LongBot:
     # ---------------------------------------------------------------- monitor
 
     async def _sync_bingx(self):
-        if not self.open_trades or not AUTO_TRADING: return
+        """
+        FIX-A: Ahora corre siempre (no solo si open_trades no vacío).
+        Detecta posiciones cerradas por TP/SL y las elimina del dict local.
+        """
+        if not AUTO_TRADING: return
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') != 0: return
@@ -1094,7 +1136,7 @@ class LongBot:
                     else:         self.stats['losses'] += 1
                     total = self.stats['wins'] + self.stats['losses']
                     wr    = self.stats['wins'] / total * 100 if total else 0
-                    emoji = "✅" if pnl >= 0 else "❌"
+                    emoji = "OK" if pnl >= 0 else "X"
                     self._tg(f"<b>{emoji} LONG cerrado BingX</b>\n<b>{sym}</b>\n"
                              f"PnL: ${pnl:+.3f} ({pnl_pct:+.1f}%) | WR:{wr:.1f}%")
                     self._set_cooldown(sym, 'TP' if pnl >= 0 else 'SL')
@@ -1103,16 +1145,14 @@ class LongBot:
             log.debug(f"sync: {e}")
 
     async def monitor_trades(self):
-        await self._sync_bingx()
+        await self._sync_bingx()   # FIX-A: siempre corre
         for sym in list(self.open_trades.keys()):
             try:
                 t   = self.open_trades[sym]
                 tk  = self._ticker(sym)
                 if not tk: continue
                 cur     = tk['price']
-                pnl_pct = (cur - t['entry']) / t['entry'] * 100   # LONG: positivo si sube
-
-                # Trailing LONG: sigue el máximo
+                pnl_pct = (cur - t['entry']) / t['entry'] * 100
                 if TRAILING and cur > t['highest']:
                     t['highest'] = cur
                     if pnl_pct >= TRAILING_START:
@@ -1120,17 +1160,13 @@ class LongBot:
                         if new_sl > t['sl']:
                             t['sl'] = new_sl
                             log.info(f"  Trailing LONG {sym}: SL=${new_sl:.6f}")
-
-                # Seguro MAX_LOSS_PCT
                 pnl_leverage = pnl_pct * LEVERAGE
                 if pnl_leverage < -MAX_LOSS_PCT:
-                    log.error(f"  EMERGENCIA LONG {sym}: {pnl_leverage:+.1f}% — cerrando")
-                    self._tg(f"<b>🚨 EMERGENCIA LONG {sym}</b>\nPnL: {pnl_leverage:+.1f}%")
+                    log.error(f"  EMERGENCIA LONG {sym}: {pnl_leverage:+.1f}%")
+                    self._tg(f"<b>EMERGENCIA LONG {sym}</b>\nPnL: {pnl_leverage:+.1f}%")
                     self.close_trade(sym, cur, "STOP LOSS EMERGENCIA"); continue
-
                 if abs(pnl_pct) > 0.3:
                     log.info(f"  LONG {sym}: {pnl_pct:+.2f}% | cur:${cur:.6f}")
-
                 if cur >= t['tp']:   self.close_trade(sym, cur, "TAKE PROFIT")
                 elif cur <= t['sl']: self.close_trade(sym, cur, "STOP LOSS")
             except Exception as e:
@@ -1141,12 +1177,15 @@ class LongBot:
         self._last_report = datetime.now()
         total = self.stats['wins'] + self.stats['losses']
         wr    = self.stats['wins'] / total * 100 if total else 0
-        pos_txt = "".join(
-            f"  {sym}: {(( self._ticker(sym) or {'price':t['entry']})['price'] - t['entry'])/t['entry']*100:+.2f}%\n"
-            for sym, t in self.open_trades.items()
-        )
+        pos_txt = ""
+        for sym, t in self.open_trades.items():
+            tk = self._ticker(sym)
+            cur = tk['price'] if tk else t['entry']
+            pnl_pct = (cur - t['entry']) / t['entry'] * 100
+            rec = " [REC]" if t.get('recovered') else ""
+            pos_txt += f"  {sym}: {pnl_pct:+.2f}%{rec}\n"
         self._tg(
-            f"<b>📊 Reporte horario LONGS</b>\n"
+            f"<b>Reporte horario LONGS v1.3</b>\n"
             f"PnL: ${self.stats['pnl']:+.3f} | WR:{wr:.1f}%\n"
             f"({self.stats['wins']}W/{self.stats['losses']}L | {self.stats['closed']} trades)\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES} | BTC 1h:{self._btc_1h:+.2f}%\n"
@@ -1163,7 +1202,7 @@ class LongBot:
     # ---------------------------------------------------------------- loop
 
     async def run(self):
-        log.info("\n▶  Bot LONG v1.2 arrancado\n")
+        log.info("\n>  Bot LONG v1.3 arrancado\n")
         iteration, last_refresh = 0, 0
         while True:
             try:
@@ -1175,8 +1214,8 @@ class LongBot:
 
                 total = self.stats['wins'] + self.stats['losses']
                 wr    = self.stats['wins'] / total * 100 if total else 0
-                btc_st = "⚠️ BLOQUEADO" if self._btc_1h <= -BTC_BEAR_BLOCK_PCT else "OK"
-                hora_st = "🌙 HORA BAJA" if not self._hora_ok() else "☀️"
+                btc_st = "BLOQUEADO" if self._btc_1h <= -BTC_BEAR_BLOCK_PCT else "OK"
+                hora_st = "HORA BAJA" if not self._hora_ok() else "activo"
 
                 log.info(f"\n{'='*70}")
                 log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
@@ -1188,36 +1227,32 @@ class LongBot:
                 await self.monitor_trades()
                 self._reporte_horario()
 
-                # v1.2 FIX: usar posiciones REALES de BingX para decidir si analizar
                 pos_reales = self._contar_posiciones_reales()
                 trades_locales = len(self.open_trades)
                 slots_libres = MAX_TRADES - max(pos_reales, trades_locales)
-
                 log.info(f"  Slots libres: {slots_libres} (BingX={pos_reales} local={trades_locales})")
 
                 if slots_libres > 0:
                     found = 0
                     for i, sym in enumerate(self.symbols):
-                        # Recheck en cada iteración — open_trade puede haber cambiado
                         if max(self._contar_posiciones_reales(), len(self.open_trades)) >= MAX_TRADES:
                             break
                         sig = self.analyze(sym)
                         if sig:
                             found += 1
                             pat_str = f" [{','.join(sig['patterns'])}]" if sig['patterns'] else ""
-                            log.info(f"  ★ LONG {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} RR:{sig['rr']:.2f}{pat_str}")
+                            log.info(f"  * LONG {sym} score:{sig['score']:.0f} RSI:{sig['rsi']:.0f} RR:{sig['rr']:.2f}{pat_str}")
                             abierto = self.open_trade(sym, sig)
                             if abierto:
-                                # v1.2: pausa tras apertura para que BingX registre la posición
                                 await asyncio.sleep(3)
                         await asyncio.sleep(0.15)
                         if (i+1) % 25 == 0:
                             log.info(f"  ...{i+1}/{len(self.symbols)} analizados")
-                    log.info(f"\n  {len(self.symbols)} pares | {found} señales LONG")
+                    log.info(f"\n  {len(self.symbols)} pares | {found} senales LONG")
                 else:
                     log.info(f"  Max ({MAX_TRADES}) trades — esperando cierre")
 
-                log.info(f"\n  Próximo ciclo en {INTERVAL}s\n")
+                log.info(f"\n  Proximo ciclo en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
 
             except KeyboardInterrupt:
