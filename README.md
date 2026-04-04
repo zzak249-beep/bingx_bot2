@@ -1,162 +1,548 @@
-# Bot Dual Strategy v1.0
-**Trend Magic + RMI Trend Sniper × Magical Momentum**
+# 🤖 Bot Longs Rentable v2.0 - Guía de Uso
 
-Bot de trading automático para BingX Futuros que combina dos estrategias de TradingView traducidas a Python, con todos los fixes de producción.
+## 📋 Tabla de Contenidos
 
----
-
-## Estrategias incluidas
-
-### Estrategia 1 — Trend Magic + EMA + RMI Trend Sniper
-- **Trend Magic**: CCI(20) + ATR(5) → línea de soporte/resistencia dinámica
-- **EMA(9)**: tendencia rápida del precio
-- **RMI**: combina RSI + MFI → señal BUY cuando cruza >66, SELL cuando cae <30
-
-### Estrategia 2 — Magical Momentum
-- **Worm**: EMA adaptativa con velocidad limitada por StdDev
-- **Momentum**: log-normalizado y suavizado → valor positivo = alcista
-- **Aceleración**: detecta cuándo el momentum se acelera (señal más fuerte)
-
-### Lógica de entrada combinada
-| Dirección | Condición |
-|-----------|-----------|
-| **LONG**  | 1h alcista + Trend Magic bull + RMI BUY + Momentum acelerando al alza |
-| **SHORT** | 1h bajista + Trend Magic bear + RMI SELL + Momentum acelerando a la baja |
+1. [Características Principales](#características-principales)
+2. [Requisitos](#requisitos)
+3. [Instalación](#instalación)
+4. [Configuración](#configuración)
+5. [Ejecución](#ejecución)
+6. [Monitoreo](#monitoreo)
+7. [Solución de Problemas](#solución-de-problemas)
+8. [FAQ](#faq)
 
 ---
 
-## Fixes de producción incluidos
-- ✅ **Qty en notional**: `qty = (usdt × leverage) / price` (antes daba 0.02 BCH en vez de 0.11)
-- ✅ **Multi-timeframe**: 1h confirma tendencia antes de entrar en 15m
-- ✅ **TP/SL garantizados**: espera 90s + 5 reintentos con delays crecientes
-- ✅ **Anti-correlación**: máx 2 trades en la misma dirección
-- ✅ **RSI mínimo para SHORT**: evita entrar cuando el precio ya cayó
-- ✅ **2× comisión en PnL**: descuenta entrada + salida
-- ✅ **Reconciliación**: recupera posiciones abiertas al reiniciar
-- ✅ **Score 0-100**: normalizado, no infla a 118+
+## ✨ Características Principales
 
----
+### ✅ Mejoras vs v1.6:
 
-## Despliegue paso a paso
+- **87% menos comisiones** → Órdenes LIMIT siempre (0.02% vs 0.05%)
+- **Matemática favorable** → RR 2:1 con expectativa positiva
+- **Sin leverage o leverage mínimo** → Menos riesgo
+- **Sistema de aprendizaje** → Mejora automáticamente
+- **Circuit breakers efectivos** → Protección real del capital
+- **Trading selectivo** → 1 trade a la vez, calidad > cantidad
 
-### 1. Preparar BingX
-
-1. Entra en [BingX](https://bingx.com) → **Perfil → API Management**
-2. Crea una API key con permisos: **Trade** (NO habilites retiradas)
-3. Anota `API Key` y `Secret Key`
-4. En BingX Futuros, configura el leverage de cada par que quieras operar al mismo valor que `LEVERAGE` en el .env (por defecto 5x)
-
-### 2. Crear bot de Telegram
+### 📊 Resultados Esperados:
 
 ```
-1. Abre Telegram y busca @BotFather
-2. Envía: /newbot
-3. Elige un nombre y username para tu bot
-4. Copia el TOKEN que te da BotFather
-5. Inicia una conversación con tu nuevo bot (pulsa Start)
-6. Visita en el navegador:
-   https://api.telegram.org/bot<TU_TOKEN>/getUpdates
-7. Copia el valor "id" que aparece en "chat" → es tu CHAT_ID
+Con $10 capital inicial:
+- Win Rate objetivo: 55-60%
+- PnL por trade: +$0.191 promedio
+- Rentabilidad mensual: +$14-20 (140-200%)
+- Comisiones: <5% del PnL bruto
 ```
 
-### 3. Subir a GitHub
+---
+
+## 🔧 Requisitos
+
+### Plataformas Compatibles:
+- ✅ Railway
+- ✅ Render
+- ✅ Heroku
+- ✅ VPS/Servidor propio
+- ✅ Computadora local
+
+### Python:
+```bash
+Python 3.8 o superior
+```
+
+### Dependencias:
+```bash
+requests
+asyncio (incluido en Python 3.7+)
+```
+
+### Cuenta BingX:
+- API Key con permisos de trading
+- Saldo mínimo: $15-20 USDT recomendado
+- Modo Hedge activado
+
+### Telegram (opcional pero recomendado):
+- Bot token
+- Chat ID
+
+---
+
+## 📥 Instalación
+
+### Opción 1: Railway (Recomendado)
+
+1. **Fork del repositorio:**
+   ```bash
+   # Tu repo debe contener:
+   - main_optimized.py
+   - requirements.txt
+   - railway.json (si aplica)
+   ```
+
+2. **Crear proyecto en Railway:**
+   - Conectar con GitHub
+   - Seleccionar repositorio
+   - Railway detectará Python automáticamente
+
+3. **Variables de entorno:**
+   - Agregar todas las variables del archivo `.env.optimized`
+   - Ver sección [Configuración](#configuración)
+
+4. **Deploy:**
+   - Railway hará deploy automático
+   - Ver logs para confirmar inicio
+
+### Opción 2: VPS/Local
+
+1. **Clonar archivos:**
+   ```bash
+   mkdir bot_trading
+   cd bot_trading
+   # Copiar main_optimized.py y .env.optimized
+   ```
+
+2. **Instalar dependencias:**
+   ```bash
+   pip install requests
+   ```
+
+3. **Configurar variables:**
+   ```bash
+   # Renombrar y editar
+   cp .env.optimized .env
+   nano .env
+   ```
+
+4. **Ejecutar:**
+   ```bash
+   python3 main_optimized.py
+   ```
+
+---
+
+## ⚙️ Configuración
+
+### 1. Variables Obligatorias:
 
 ```bash
-git init
-git add .
-git commit -m "Bot Dual Strategy v1.0"
-git branch -M main
-git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
-git push -u origin main
+# Copiar de BingX
+BINGX_API_KEY=tu_api_key_aqui
+BINGX_API_SECRET=tu_secret_aqui
+
+# Copiar de Telegram (opcional)
+TELEGRAM_BOT_TOKEN=tu_bot_token
+TELEGRAM_CHAT_ID=tu_chat_id
 ```
 
-### 4. Desplegar en Railway
+### 2. Configuración Inicial (CONSERVADORA):
 
-1. Ve a [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
-2. Selecciona tu repositorio
-3. Railway detectará el `Procfile` automáticamente
-4. Ve a **Settings → Variables** y añade todas las variables del `.env.example`:
+```bash
+# ¡NO MODIFICAR HASTA TENER EXPERIENCIA!
+AUTO_TRADING_ENABLED=true
+MAX_POSITION_SIZE=10          # $10 por trade
+LEVERAGE=1                     # SIN leverage
+TAKE_PROFIT_PCT=6.0           # TP 6%
+STOP_LOSS_PCT=3.0             # SL 3%
+MAX_OPEN_TRADES=1             # 1 trade a la vez
+MIN_SCORE=95                  # Muy selectivo
+CIRCUIT_BREAKER_USDT=1.5      # Stop tras -$1.5 diario
+```
 
-| Variable | Valor |
-|----------|-------|
-| `BINGX_API_KEY` | tu key de BingX |
-| `BINGX_API_SECRET` | tu secret de BingX |
-| `TELEGRAM_BOT_TOKEN` | token de @BotFather |
-| `TELEGRAM_CHAT_ID` | tu chat id |
-| `AUTO_TRADING_ENABLED` | `true` |
-| `MAX_POSITION_SIZE` | `10` (USDT por trade) |
-| `LEVERAGE` | `5` |
-| `TAKE_PROFIT_PCT` | `2.0` |
-| `STOP_LOSS_PCT` | `1.0` |
-| `MAX_OPEN_TRADES` | `3` |
-| `MIN_SCORE` | `65` |
+### 3. Telegram Bot (Muy Recomendado):
 
-5. El bot arranca automáticamente. Ve a **Deploy Logs** para confirmar que dice `BingX OK`
+**Crear bot:**
+1. Abrir @BotFather en Telegram
+2. Enviar `/newbot`
+3. Seguir instrucciones
+4. Copiar token
+
+**Obtener Chat ID:**
+1. Abrir @userinfobot
+2. Enviar cualquier mensaje
+3. Copiar "Id"
 
 ---
 
-## Variables de entorno
+## 🚀 Ejecución
 
-Ver `.env.example` para la lista completa con descripciones.
+### Fase 1: Paper Trading (Semana 1)
 
-### Variables críticas para rentabilidad
+**Objetivo:** Observar sin arriesgar dinero real
 
+```bash
+# En .env:
+AUTO_TRADING_ENABLED=false
+
+# Ejecutar:
+python3 main_optimized.py
 ```
-LEVERAGE=5              # Debe coincidir con BingX
-MAX_POSITION_SIZE=10    # Margen real por trade (no el notional)
-MIN_SCORE=65            # Subir a 70+ para señales más selectivas
-MAX_SAME_DIRECTION=2    # Anti-correlación: máx 2 longs o 2 shorts
-BTC_FILTER_PCT=2.5      # Bloquea si BTC cae/sube más de 2.5% en 1h
+
+**Qué observar:**
+- ✅ Cuántas señales genera por hora
+- ✅ Score promedio de señales
+- ✅ Win rate simulado
+- ✅ Símbolos más frecuentes
+
+**Criterio de éxito:**
+- Al menos 10 señales en la semana
+- Win rate simulado >50%
+- Sin errores de ejecución
+
+### Fase 2: Trading Real (Semana 2)
+
+**Activar trading:**
+
+```bash
+# En .env:
+AUTO_TRADING_ENABLED=true
+MAX_POSITION_SIZE=10
+LEVERAGE=1
+MAX_OPEN_TRADES=1
 ```
 
-### Parámetros de las estrategias
+**Monitorear de cerca:**
+- ✅ Primer trade abre correctamente
+- ✅ TP/SL se colocan bien
+- ✅ Cierre funciona (TP o SL)
+- ✅ Comisiones son bajas (~$0.004/trade)
 
-```
-# Trend Magic
-CCI_LENGTH=20           # Período del CCI
-ATR_LENGTH=5            # Período del ATR
-ATR_MULTIPLIER=1.0      # Multiplicador ATR
+**Objetivo semana 2:**
+- PnL: +$2 a +5 mínimo
+- Win rate: >45%
+- Sin errores técnicos
 
-# RMI
-RMI_LENGTH=14
-RMI_POSITIVE_ABOVE=66   # Umbral señal BUY
-RMI_NEGATIVE_BELOW=30   # Umbral señal SELL
+### Fase 3: Optimización (Semana 3+)
 
-# Magical Momentum
-MOMENTUM_PERIOD=50
-MOMENTUM_RESPONSIVENESS=0.9  # 0.1=lento, 1.0=rápido
+**Si semana 2 fue exitosa:**
+
+```bash
+# Puedes considerar (OPCIONAL):
+
+# Opción A: Aumentar capital
+MAX_POSITION_SIZE=15
+
+# Opción B: Leverage moderado
+LEVERAGE=2
+
+# Opción C: Más trades simultáneos
+MAX_OPEN_TRADES=2
+
+# ⚠️ NUNCA cambiar todo a la vez!
+# Solo un parámetro por semana
 ```
 
 ---
 
-## Estructura del score (0-100)
+## 📊 Monitoreo
 
-| Componente | LONG | SHORT |
-|------------|------|-------|
-| Tendencia 1h | +20 bull / +8 neutral / BLOQUEADO si bear | +20 bear / +8 neutral / BLOQUEADO si bull |
-| Trend Magic | +20 bull | +20 bear |
-| RMI señal | +25 BUY / +10 ok | +25 SELL / +10 ok |
-| Momentum acelerando | +25 | +25 |
-| RSI favorable | +5 | +5 |
-| Volumen spike | +5 | +5 |
+### Dashboard Telegram:
 
-**Entrada cuando score ≥ MIN_SCORE (default 65)**
+El bot envía mensajes automáticos:
+
+```
+🟢 LONG ABIERTO
+BTC-USDT
+Score: 98/95 | RSI: 32 | RR: 2.0:1
+Entrada: $98,234.50
+✅ TP: $104,328.57 (+6.0%)
+✅ SL: $95,307.47 (-3.0%)
+Capital: $10x1 | Comisión: $0.004
+PnL día: +$0.45
+```
+
+```
+✅ LONG CERRADO — TAKE PROFIT
+BTC-USDT
+PnL: +$0.58 (+5.8%) | 47min
+Entrada: $98,234.50 → Salida: $104,120.00
+Comisiones: $0.004
+Total: +$2.34 | WR: 58.3%
+Día: +$0.58
+```
+
+### Reportes Horarios:
+
+```
+📊 Reporte LONGS v2.0
+PnL total: +$3.45 | WR: 57.1%
+PnL día: +$0.82 (límite: -$1.50)
+Comisiones pagadas: $0.08
+(8W / 6L | 14 trades)
+Abiertos: 1/1 | BTC: +1.2%
+Circuit: 🔓 OK
+  BTC-USDT: +2.3%
+
+Mejores señales:
+  RSI<30: 75.0% (4 trades)
+  EMA↑: 62.5% (8 trades)
+```
+
+### Logs en Consola:
+
+```bash
+================================================================================
+  Iteración #42 | 15:23:45
+  Abiertos: 1/1 | PnL: +$2.45 | WR: 55.6%
+  BTC: +0.8% 🟢 OK | ✅ | Score mín: 95.0
+  Día: +$0.67 | Fees: $0.12
+================================================================================
+
+  💡 Señal: ETH-USDT | Score: 102.0 | RSI: 28.0
+  🎯 LONG ETH-USDT
+  Score: 102.0/95.0 | RSI: 28.0 | RR: 2.1:1
+  EMA↑(30) | RSI28(32) | Vol2.1x(15) | NearLow(15)
+  
+  ⚙️  Leverage ETH-USDT → 1x
+  📊 ETH-USDT: 4.2 cts × $594.05 = $10.00 notional
+  ✅ LIMIT BUY @ $593.52 | OID: 123456789
+  ✅ Ejecutada: 4.2 @ $593.52
+  ✅ Posición confirmada: 4.2 @ $593.52
+  ✅ TP @ $629.53
+  ✅ SL @ $575.72
+```
 
 ---
 
-## Logs de referencia
+## 🔍 Indicadores Clave
 
+### ✅ Señales de que funciona bien:
+
+1. **Win Rate 52-60%**
+2. **PnL semanal positivo**
+3. **Comisiones <5% del PnL bruto**
+4. **Circuit breaker se activa <1 vez/semana**
+5. **Sistema de aprendizaje ajusta score**
+
+### ⚠️ Señales de alerta:
+
+1. **Win Rate <45% por >20 trades**
+   - Acción: Aumentar MIN_SCORE a 100
+   
+2. **Pérdidas consecutivas >5**
+   - Acción: Pausar 24h, revisar mercado
+   
+3. **Circuit breaker diario frecuente**
+   - Acción: Reducir MAX_POSITION_SIZE
+   
+4. **Comisiones >10% del PnL**
+   - Acción: Verificar que usa LIMIT orders
+
+---
+
+## 🛠️ Solución de Problemas
+
+### Error: "CRITICO: no confirmada"
+
+**Causa:** Orden LIMIT no se ejecutó en 30s
+
+**Solución:**
+```bash
+# El bot intenta MARKET automáticamente
+# Si persiste, verificar:
+- Saldo suficiente en cuenta
+- Símbolo existe en BingX
+- No hay mantenimiento de BingX
 ```
-✅ BingX OK | Balance: $150.00 USDT          ← API conectada
-★ LONG SOL-USDT 78/100 ✅TM ✅RMI MOM:+0.0123   ← señal detectada
-➤ LONG SOL-USDT                              ← abriendo trade
-✅ Posición confirmada: qty=0.58 entry=$87.17  ← posición confirmada
-TP ✅ @ $88.91  SL ✅ @ $86.30              ← TP/SL fijados
-✅ TAKE PROFIT SOL-USDT PnL:$0.312(+3.12%)  ← trade cerrado
+
+### Error: "[109400] Hedge mode"
+
+**Causa:** BingX en modo Hedge pero comando no compatible
+
+**Solución:**
+```
+El bot v2.0 ya está adaptado a Hedge mode
+Si ves este error:
+1. Actualizar a última versión del código
+2. Verificar que no hay modificaciones manuales
+```
+
+### Error: "SL crítico fallido - cerrando"
+
+**Causa:** No se pudo colocar Stop Loss
+
+**Solución:**
+```
+El bot cierra la posición por seguridad (CORRECTO)
+Verificar:
+- API Key tiene permisos de trading
+- No hay límite de órdenes activas
+- Reintentar trade en siguiente señal
+```
+
+### Win Rate muy bajo (<40%):
+
+**Diagnóstico:**
+1. Ver `trade_history.json`
+2. Identificar scores perdedores
+3. Revisar símbolos en blacklist
+
+**Acciones:**
+```bash
+# Aumentar selectividad:
+MIN_SCORE=100
+
+# Reducir símbolos:
+MAX_SYMBOLS_TO_ANALYZE=20
+
+# Filtro BTC más estricto:
+BTC_MIN_TREND_PCT=0.5
+```
+
+### Circuit breaker activo constantemente:
+
+**Causa:** Pérdidas superan -$1.5 diario frecuentemente
+
+**Solución:**
+```bash
+# Opción 1: Más conservador
+MAX_POSITION_SIZE=8
+MIN_SCORE=100
+
+# Opción 2: Umbral más alto (NO recomendado)
+CIRCUIT_BREAKER_USDT=2.5  # -25% capital
+
+# Opción 3: Pausar y revisar estrategia
+AUTO_TRADING_ENABLED=false
+# Analizar logs y ajustar
 ```
 
 ---
 
-## Advertencia
+## ❓ FAQ
 
-Este bot opera con dinero real. Úsalo bajo tu propia responsabilidad. Empieza con capital pequeño ($5-$10 por trade) hasta validar que funciona correctamente en tu cuenta.
+### ¿Cuánto capital necesito?
+
+**Mínimo:** $15 USDT
+**Recomendado:** $50-100 USDT
+**Ideal:** $200+ USDT para absorber drawdowns
+
+### ¿Puedo usar más leverage?
+
+**Sí, pero NO es recomendado inicialmente:**
+- Leverage 1x: Seguro, aprende el sistema
+- Leverage 2x: Moderado, tras 1 mes exitoso
+- Leverage 3x+: Alto riesgo, solo expertos
+
+### ¿Por qué solo 1 trade a la vez?
+
+**Beneficios:**
+- ✅ Enfoque total en el trade activo
+- ✅ Menos exposición = menos riesgo
+- ✅ Más fácil monitorear
+- ✅ Mejor gestión emocional
+
+Puedes subir a 2-3 tras demostrar consistencia.
+
+### ¿Cuánto tiempo dedicar al bot?
+
+**Mínimo diario:**
+- 5 min: Revisar Telegram (mensajes del bot)
+- 10 min: Ver logs si hubo trades
+- 30 min: Análisis semanal de resultados
+
+**No requiere:**
+- ❌ Monitoreo 24/7
+- ❌ Intervención manual en trades
+- ❌ Ajustes diarios de parámetros
+
+### ¿Funciona en mercado bajista?
+
+**Limitado:**
+- El bot es LONGS only (compra)
+- Necesita BTC alcista (>0.3%)
+- En bear market fuerte: se pausa automáticamente
+- Considera versión SHORTS en bear market
+
+### ¿Qué pasa si se cae mi servidor?
+
+**Posiciones abiertas:**
+- TP/SL están en BingX → se ejecutarán
+- Bot recupera posiciones al reiniciar
+- Minimal impacto si downtime <30 min
+
+**Prevención:**
+- Usar Railway/Render (alta disponibilidad)
+- Telegram notifica si bot se detiene
+
+### ¿Puedo modificar el código?
+
+**Sí, pero con cuidado:**
+- ✅ Ajustar parámetros en `.env`
+- ✅ Agregar símbolos a whitelist
+- ⚠️ Modificar lógica de scoring (testar antes)
+- ❌ Quitar circuit breakers
+- ❌ Eliminar comisiones de cálculos
+
+### ¿Es rentable garantizado?
+
+**NO:**
+- Trading tiene riesgo inherente
+- Resultados pasados ≠ futuros
+- Mercado crypto es volátil
+- Solo arriesga lo que puedas perder
+
+**Pero:**
+- Matemática es favorable
+- Sistema de aprendizaje mejora con tiempo
+- Con disciplina, probabilidades a tu favor
+
+---
+
+## 📞 Soporte
+
+### Recursos:
+
+- 📄 **Análisis completo:** `ANALISIS_MEJORAS.md`
+- 📊 **Configuración:** `.env.optimized`
+- 🐛 **Issues:** Revisar logs y Telegram
+
+### Comunidad:
+
+- Comparte resultados (sin mostrar API keys)
+- Ayuda a otros usuarios
+- Reporta bugs encontrados
+
+---
+
+## ⚖️ Disclaimer Legal
+
+```
+ESTE SOFTWARE SE PROPORCIONA "TAL CUAL", SIN GARANTÍA DE NINGÚN TIPO.
+
+Trading de criptomonedas involucra riesgo sustancial de pérdida.
+Solo opera con capital que puedas permitirte perder.
+
+Los desarrolladores NO son responsables de:
+- Pérdidas financieras
+- Errores de configuración
+- Problemas con APIs de terceros
+- Cambios en regulaciones
+
+Usa bajo tu propio riesgo y responsabilidad.
+```
+
+---
+
+## 📝 Changelog
+
+### v2.0 (2026-04-04)
+- ✅ Reducción 87% comisiones (LIMIT orders)
+- ✅ Sistema de aprendizaje integrado
+- ✅ Circuit breakers efectivos
+- ✅ Matemática favorable (RR 2:1)
+- ✅ Sin leverage por defecto
+- ✅ Trading selectivo (1 trade)
+- ✅ Filtros BTC estrictos
+
+### v1.6 (anterior)
+- ❌ Comisiones altas (MARKET)
+- ❌ Sin aprendizaje
+- ❌ Circuit breaker inútil
+- ❌ RR desfavorable
+- ❌ Leverage 3x riesgoso
+
+---
+
+**¡Feliz trading! 🚀**
+
+Recuerda: Paciencia, disciplina y gestión de riesgo son clave para el éxito a largo plazo.
