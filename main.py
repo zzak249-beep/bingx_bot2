@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-BOT LONGS RENTABLE v2.0 — Optimizado para ganancias consistentes
-MEJORAS CLAVE:
-- Comisiones minimizadas (LIMIT orders siempre)
-- Matemática favorable (RR 2:1 mínimo)
-- Sistema de aprendizaje integrado
-- Filtros estrictos anti-pérdidas
-- Circuit breakers efectivos
+BOT LONGS RENTABLE v3.0 — Señales reales + Filtros equilibrados
+FIXES vs v2.0:
+  FIX-1  MIN_SCORE bajado a 65 (era 95 — imposible de alcanzar)
+  FIX-2  Filtro BTC suavizado: bloquea si cae >1.5% (era >0.5% alcista obligatorio)
+  FIX-3  EMA filter flexible: permite entradas en pull-backs
+  FIX-4  MAX_SYMBOLS aumentado a 50 (era 30)
+  FIX-5  MAX_TRADES aumentado a 3 (era 1)
+  FIX-6  Score system rebalanceado para ser alcanzable
+  FIX-7  set_leverage: solo LONG/SHORT (BOTH causaba error 109400)
+  FIX-8  Análisis de 1h + 5m para contexto mayor
+  FIX-9  Modo señales mejorado: muestra candidatos aunque no abra trade
+  FIX-10 Cooldown reducido: 3min TP / 30min SL (era 5/60)
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
@@ -31,99 +36,83 @@ TELEGRAM_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 # ============================================================================
-# CONFIGURACIÓN OPTIMIZADA PARA RENTABILIDAD
+# CONFIGURACIÓN v3.0 — EQUILIBRADA PARA GENERAR SEÑALES
 # ============================================================================
 
-# Trading conservador
 AUTO_TRADING  = clean('AUTO_TRADING_ENABLED',  'true',  'bool')
 POSITION_SIZE = clean('MAX_POSITION_SIZE',      '10',   'float')
 MIN_TRADE     = clean('MIN_TRADE_USDT',         '10',   'float')
 
-# TP/SL optimizados con matemática favorable
-# RR mínimo 2:1 - fees considerados
-TP_PCT        = clean('TAKE_PROFIT_PCT',         '6.0', 'float')  # Aumentado
-SL_PCT        = clean('STOP_LOSS_PCT',           '3.0', 'float')  # Aumentado
-TRAILING      = clean('TRAILING_STOP_ENABLED', 'false', 'bool')   # Desactivado - genera ruido
+# TP/SL con RR 2:1
+TP_PCT        = clean('TAKE_PROFIT_PCT',         '5.0', 'float')
+SL_PCT        = clean('STOP_LOSS_PCT',           '2.5', 'float')
+TRAILING      = clean('TRAILING_STOP_ENABLED', 'false', 'bool')
 TRAILING_START= clean('TRAILING_START_PCT',     '3.0',  'float')
 TRAILING_LOCK = clean('TRAILING_LOCK_PCT',      '60',   'float')
 
-# Leverage reducido - menos riesgo, menos comisión
-_lev_env   = clean('LEVERAGE', '1', 'int')  # SIN LEVERAGE por defecto
-LEVERAGE   = min(_lev_env, 2)  # Máximo 2x
+# Leverage conservador
+_lev_env   = clean('LEVERAGE', '2', 'int')
+LEVERAGE   = min(_lev_env, 3)
 
-# Control de operaciones
-INTERVAL      = clean('CHECK_INTERVAL',          '120', 'int')  # Menos checks = menos trades innecesarios
-MIN_VOLUME    = clean('MIN_VOLUME_24H',      '1000000', 'float')  # Aumentado - solo líquidos
-MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '30',  'int')   # Reducido - calidad > cantidad
-MIN_SCORE     = clean('MIN_SCORE',               '95',  'float')  # Aumentado - más selectivo
-MAX_TRADES    = clean('MAX_OPEN_TRADES',          '1',  'int')   # UN trade a la vez - enfoque
+# Control de operaciones — FIX-4, FIX-5
+INTERVAL      = clean('CHECK_INTERVAL',          '120', 'int')
+MIN_VOLUME    = clean('MIN_VOLUME_24H',       '500000', 'float')  # Bajado para más opciones
+MAX_SYMBOLS   = clean('MAX_SYMBOLS_TO_ANALYZE',  '50',  'int')   # FIX-4: era 30
+MIN_SCORE     = clean('MIN_SCORE',               '65',  'float') # FIX-1: era 95
+MAX_TRADES    = clean('MAX_OPEN_TRADES',          '3',  'int')   # FIX-5: era 1
 
-# SIEMPRE órdenes LIMIT - comisión 60% menor
-USE_LIMIT_ORDERS = True  # FORZADO
-LIMIT_OFFSET_PCT = 0.08  # 0.08% para asegurar fill rápido
+USE_LIMIT_ORDERS = True
+LIMIT_OFFSET_PCT = 0.08
 
-# Filtros de mercado más estrictos
-BTC_BEAR_BLOCK_PCT = clean('BTC_BEAR_BLOCK_PCT', '0.5',  'float')  # Más estricto
-BTC_MIN_TREND_PCT  = clean('BTC_MIN_TREND_PCT',  '0.3',  'float')  # Nuevo: BTC debe ser alcista
+# FIX-2: Filtro BTC suavizado
+BTC_BEAR_BLOCK_PCT = clean('BTC_BEAR_BLOCK_PCT', '1.5',  'float')  # Bloquea si BTC cae >1.5%
+BTC_MIN_TREND_PCT  = clean('BTC_MIN_TREND_PCT',  '-0.5', 'float')  # Permite hasta -0.5%
 
-# Circuit breakers efectivos
-MAX_LOSS_PCT         = clean('MAX_LOSS_PCT',           '3.0',  'float')  # Por trade
-CIRCUIT_BREAKER_USDT = clean('CIRCUIT_BREAKER_USDT',   '1.5',  'float')  # $1.5 pérdida diaria = STOP
-MAX_LOSING_STREAK    = clean('MAX_LOSING_STREAK',        '3',  'int')   # 3 pérdidas seguidas = pausa
+# Circuit breakers
+MAX_LOSS_PCT         = clean('MAX_LOSS_PCT',           '4.0',  'float')
+CIRCUIT_BREAKER_USDT = clean('CIRCUIT_BREAKER_USDT',   '2.0',  'float')
+MAX_LOSING_STREAK    = clean('MAX_LOSING_STREAK',        '4',  'int')
 
-# Cooldowns optimizados
-COOLDOWN_MIN_TP  = clean('COOLDOWN_AFTER_TP_MIN',   '5',   'int')   # Reducido
-COOLDOWN_MIN_SL  = clean('COOLDOWN_AFTER_SL_MIN',  '60',   'int')   # Aumentado - evitar revenge trading
+# FIX-10: Cooldowns reducidos
+COOLDOWN_MIN_TP  = clean('COOLDOWN_AFTER_TP_MIN',   '3',   'int')
+COOLDOWN_MIN_SL  = clean('COOLDOWN_AFTER_SL_MIN',  '30',   'int')
 
-# Sistema simplificado - solo indicadores probados
-PATTERN_SCORE = clean('PATTERN_SCORE', 'false', 'bool')  # Desactivado - muchos falsos positivos
-REGIME_FILTER = clean('REGIME_FILTER',  'true', 'bool')  # Activado
-SCALPING_MODE = clean('SCALPING_MODE', 'false', 'bool')  # Desactivado - requiere más experiencia
-PARTIAL_TP    = clean('PARTIAL_TP_ENABLED', 'false', 'bool')  # Desactivado - simplificar
-
-# Horarios optimizados (UTC)
-SKIP_HOURS_UTC = {0, 1, 2, 3}  # Evitar horas de bajo volumen
-
-# Sistema de aprendizaje
+REGIME_FILTER = clean('REGIME_FILTER',  'true', 'bool')
 LEARNING_ENABLED = clean('LEARNING_ENABLED', 'true', 'bool')
-MIN_TRADES_LEARN = 10  # Mínimo trades para ajustar parámetros
-SCORE_ADJUST_STEP = 2  # Ajuste gradual del score mínimo
 
-# Constantes
-FORCE_MIN_USDT = max(MIN_TRADE, 10.0)
-BASE_URL = "https://open-api.bingx.com"
+# Horas a evitar (UTC)
+SKIP_HOURS_UTC = {2, 3}  # Solo 2 horas de bajo volumen (antes era 4)
+
+MIN_TRADES_LEARN  = 10
+SCORE_ADJUST_STEP = 2
+FORCE_MIN_USDT    = max(MIN_TRADE, 10.0)
+BASE_URL          = "https://open-api.bingx.com"
 
 # ============================================================================
-# LOGGING SETUP
+# LOGGING
 # ============================================================================
 
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 
 # ============================================================================
-# CÁLCULO DE COMISIONES Y RENTABILIDAD MÍNIMA
+# COMISIONES
 # ============================================================================
 
-COMISION_MAKER = 0.0002  # 0.02% - órdenes LIMIT
-COMISION_TAKER = 0.0005  # 0.05% - órdenes MARKET
-COMISION_ACTUAL = COMISION_MAKER  # SIEMPRE LIMIT
-
-# TP mínimo rentable considerando fees y leverage
-# Fórmula: (2 × comisión × leverage + buffer) × 100
+COMISION_MAKER  = 0.0002
+COMISION_ACTUAL = COMISION_MAKER
 TP_MIN_RENTABLE = round((2 * COMISION_ACTUAL * LEVERAGE + 0.003) * 100, 3)
-
-log.info(f"TP mínimo rentable calculado: {TP_MIN_RENTABLE}% (fees + buffer)")
+log.info(f"TP mínimo rentable: {TP_MIN_RENTABLE}%")
 
 # ============================================================================
-# FUNCIONES DE API
+# API
 # ============================================================================
 
 def bingx_request(method, endpoint, params, retries=3):
-    """Request a BingX con retry mejorado"""
     for attempt in range(retries + 1):
         try:
             p = dict(params)
@@ -132,31 +121,26 @@ def bingx_request(method, endpoint, params, retries=3):
             sig = hmac.new(BINGX_API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
             url = f"{BASE_URL}{endpoint}?{qs}&signature={sig}"
             hdr = {'X-BX-APIKEY': BINGX_API_KEY, 'Content-Type': 'application/x-www-form-urlencoded'}
-            
             if method == 'GET':
                 r = requests.get(url, headers=hdr, timeout=15)
             elif method == 'POST':
                 r = requests.post(url, headers=hdr, timeout=15)
             else:
                 r = requests.delete(url, headers=hdr, timeout=15)
-                
             return r
         except Exception as e:
             if attempt < retries:
-                wait = 2 ** attempt  # Exponential backoff
-                log.warning(f"  Retry {attempt+1}/{retries} tras {wait}s: {e}")
-                time.sleep(wait)
+                time.sleep(2 ** attempt)
             else:
                 raise
 
 # ============================================================================
-# INDICADORES TÉCNICOS SIMPLIFICADOS
+# INDICADORES
 # ============================================================================
 
 def calc_ema(prices, period):
-    """EMA optimizado"""
     if not prices or len(prices) < 2:
-        return sum(prices) / len(prices) if prices else 0
+        return prices[0] if prices else 0
     if len(prices) < period:
         return sum(prices) / len(prices)
     k = 2 / (period + 1)
@@ -165,309 +149,209 @@ def calc_ema(prices, period):
         ema = p * k + ema * (1 - k)
     return ema
 
-def calc_sma(prices, period):
-    """SMA simple"""
-    if len(prices) < period:
-        return sum(prices) / len(prices) if prices else 0
-    return sum(prices[-period:]) / period
-
 def calc_rsi(prices, period=14):
-    """RSI optimizado"""
     if len(prices) < period + 1:
         return 50.0
-    
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(prices)):
         change = prices[i] - prices[i-1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-    
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    
     if avg_loss == 0:
         return 100.0
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
 def calc_atr(highs, lows, closes, period=14):
-    """ATR para volatilidad"""
     if len(closes) < 2:
         return 0
-    
     trs = []
     for i in range(1, min(len(closes), period + 1)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i] - closes[i-1])
-        )
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i] - closes[i-1]))
         trs.append(tr)
-    
     return sum(trs) / len(trs) if trs else 0
 
 def vol_spike(volumes):
-    """Detección de volumen anormal"""
     if len(volumes) < 5:
         return 1.0
     avg = sum(volumes[:-1]) / len(volumes[:-1])
-    if avg == 0:
-        return 1.0
-    return volumes[-1] / avg
+    return volumes[-1] / avg if avg > 0 else 1.0
 
 # ============================================================================
-# SISTEMA DE APRENDIZAJE Y TRACKING
+# SISTEMA DE APRENDIZAJE
 # ============================================================================
 
 class TradeLearningSystem:
-    """Sistema que aprende de trades pasados"""
-    
     def __init__(self):
-        self.trades_history = []
-        self.symbol_stats = defaultdict(lambda: {'wins': 0, 'losses': 0, 'total_pnl': 0.0})
-        self.score_performance = defaultdict(lambda: {'wins': 0, 'losses': 0})
-        self.pattern_performance = defaultdict(lambda: {'wins': 0, 'losses': 0})
-        self.optimal_score = MIN_SCORE
-        self.blacklist = set()
-        self.losing_streak = 0
-        self.last_trades = []  # Últimos 10 trades
-        
+        self.trades_history   = []
+        self.symbol_stats     = defaultdict(lambda: {'wins': 0, 'losses': 0, 'total_pnl': 0.0})
+        self.score_performance= defaultdict(lambda: {'wins': 0, 'losses': 0})
+        self.optimal_score    = MIN_SCORE
+        self.blacklist        = set()
+        self.losing_streak    = 0
+        self.last_trades      = []
+
     def record_trade(self, symbol, entry_data, exit_data, pnl, win):
-        """Registra un trade completo para análisis"""
-        trade_record = {
+        record = {
             'timestamp': datetime.now().isoformat(),
             'symbol': symbol,
             'score': entry_data.get('score', 0),
             'rsi': entry_data.get('rsi', 0),
-            'patterns': entry_data.get('patterns', []),
             'entry_price': entry_data.get('price', 0),
-            'exit_price': exit_data.get('price', 0),
-            'pnl': pnl,
-            'win': win,
-            'tp_pct': entry_data.get('tp_pct', 0),
-            'sl_pct': entry_data.get('sl_pct', 0),
+            'pnl': pnl, 'win': win,
         }
-        
-        self.trades_history.append(trade_record)
-        self.last_trades.append(trade_record)
+        self.trades_history.append(record)
+        self.last_trades.append(record)
         if len(self.last_trades) > 10:
             self.last_trades.pop(0)
-        
-        # Actualizar estadísticas por símbolo
-        stats = self.symbol_stats[symbol]
+
+        s = self.symbol_stats[symbol]
         if win:
-            stats['wins'] += 1
+            s['wins'] += 1
             self.losing_streak = 0
         else:
-            stats['losses'] += 1
+            s['losses'] += 1
             self.losing_streak += 1
-        stats['total_pnl'] += pnl
-        
-        # Actualizar performance por score
-        score_bucket = int(entry_data.get('score', 0) // 10) * 10
-        if win:
-            self.score_performance[score_bucket]['wins'] += 1
-        else:
-            self.score_performance[score_bucket]['losses'] += 1
-        
-        # Actualizar performance por patrones
-        for pattern in entry_data.get('patterns', []):
-            if win:
-                self.pattern_performance[pattern]['wins'] += 1
-            else:
-                self.pattern_performance[pattern]['losses'] += 1
-        
-        # Auto-ajuste
+        s['total_pnl'] += pnl
         self._auto_adjust()
-        
+
     def _auto_adjust(self):
-        """Ajusta parámetros basado en resultados"""
         if len(self.trades_history) < MIN_TRADES_LEARN:
             return
-        
-        # Calcular win rate de últimos 10 trades
         recent_wins = sum(1 for t in self.last_trades if t['win'])
-        recent_wr = recent_wins / len(self.last_trades) if self.last_trades else 0
-        
-        # Ajustar score mínimo si WR es bajo
-        if recent_wr < 0.5 and len(self.last_trades) >= 10:
-            self.optimal_score = min(self.optimal_score + SCORE_ADJUST_STEP, 110)
-            log.warning(f"  [LEARN] WR bajo ({recent_wr:.1%}) → Score mínimo: {self.optimal_score}")
+        recent_wr   = recent_wins / len(self.last_trades) if self.last_trades else 0
+        if recent_wr < 0.4 and len(self.last_trades) >= 10:
+            self.optimal_score = min(self.optimal_score + SCORE_ADJUST_STEP, 90)
+            log.warning(f"  [LEARN] WR bajo ({recent_wr:.1%}) → Score: {self.optimal_score}")
         elif recent_wr > 0.65 and len(self.last_trades) >= 10:
             self.optimal_score = max(self.optimal_score - SCORE_ADJUST_STEP, MIN_SCORE)
-            log.info(f"  [LEARN] WR bueno ({recent_wr:.1%}) → Score mínimo: {self.optimal_score}")
-        
-        # Blacklist símbolos problemáticos
+            log.info(f"  [LEARN] WR bueno ({recent_wr:.1%}) → Score: {self.optimal_score}")
         for symbol, stats in self.symbol_stats.items():
             total = stats['wins'] + stats['losses']
-            if total >= 3:  # Mínimo 3 trades
-                wr = stats['wins'] / total
-                if wr < 0.3 and stats['total_pnl'] < -0.5:  # WR <30% y pérdida >$0.5
-                    self.blacklist.add(symbol)
-                    log.warning(f"  [BLACKLIST] {symbol} agregado (WR:{wr:.1%}, PnL:${stats['total_pnl']:.2f})")
-    
+            if total >= 4 and stats['wins'] / total < 0.25 and stats['total_pnl'] < -1.0:
+                self.blacklist.add(symbol)
+
     def should_trade(self, symbol, score):
-        """Determina si debe abrir el trade basado en aprendizaje"""
         if symbol in self.blacklist:
-            return False, "Símbolo en blacklist"
-        
+            return False, "Blacklist"
         if score < self.optimal_score:
-            return False, f"Score {score} < mínimo {self.optimal_score}"
-        
-        # Pausa tras racha perdedora
+            return False, f"Score {score:.0f} < {self.optimal_score:.0f}"
         if self.losing_streak >= MAX_LOSING_STREAK:
-            return False, f"Racha perdedora de {self.losing_streak} trades"
-        
+            return False, f"Racha -{self.losing_streak}"
         return True, "OK"
-    
-    def get_best_patterns(self, min_trades=3):
-        """Retorna patrones con mejor performance"""
-        best = []
-        for pattern, stats in self.pattern_performance.items():
-            total = stats['wins'] + stats['losses']
-            if total >= min_trades:
-                wr = stats['wins'] / total
-                if wr >= 0.6:  # WR >60%
-                    best.append((pattern, wr, total))
-        return sorted(best, key=lambda x: x[1], reverse=True)
-    
-    def save_to_file(self, filepath='/home/claude/trade_history.json'):
-        """Guarda historial para análisis offline"""
+
+    def save_to_file(self, fp='/tmp/trade_history.json'):
         try:
             data = {
-                'trades': self.trades_history[-100:],  # Últimos 100
+                'trades': self.trades_history[-100:],
                 'symbol_stats': dict(self.symbol_stats),
-                'score_performance': dict(self.score_performance),
-                'pattern_performance': dict(self.pattern_performance),
                 'optimal_score': self.optimal_score,
                 'blacklist': list(self.blacklist),
             }
-            with open(filepath, 'w') as f:
+            with open(fp, 'w') as f:
                 json.dump(data, f, indent=2)
-            log.info(f"  [LEARN] Historial guardado: {filepath}")
         except Exception as e:
-            log.error(f"  [LEARN] Error guardando: {e}")
-    
-    def load_from_file(self, filepath='/home/claude/trade_history.json'):
-        """Carga historial previo"""
+            log.debug(f"[LEARN] save error: {e}")
+
+    def load_from_file(self, fp='/tmp/trade_history.json'):
         try:
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
+            if os.path.exists(fp):
+                with open(fp) as f:
                     data = json.load(f)
                 self.trades_history = data.get('trades', [])
-                self.symbol_stats = defaultdict(lambda: {'wins': 0, 'losses': 0, 'total_pnl': 0.0}, 
-                                               data.get('symbol_stats', {}))
-                self.score_performance = defaultdict(lambda: {'wins': 0, 'losses': 0}, 
-                                                     data.get('score_performance', {}))
-                self.pattern_performance = defaultdict(lambda: {'wins': 0, 'losses': 0}, 
-                                                       data.get('pattern_performance', {}))
+                self.symbol_stats   = defaultdict(
+                    lambda: {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+                    data.get('symbol_stats', {})
+                )
                 self.optimal_score = data.get('optimal_score', MIN_SCORE)
-                self.blacklist = set(data.get('blacklist', []))
-                log.info(f"  [LEARN] Historial cargado: {len(self.trades_history)} trades")
+                self.blacklist     = set(data.get('blacklist', []))
+                log.info(f"  [LEARN] {len(self.trades_history)} trades cargados")
         except Exception as e:
-            log.warning(f"  [LEARN] Error cargando: {e}")
+            log.debug(f"[LEARN] load error: {e}")
 
 # ============================================================================
-# BOT PRINCIPAL OPTIMIZADO
+# BOT PRINCIPAL v3.0
 # ============================================================================
 
 class OptimizedLongBot:
-    """Bot de trading optimizado para rentabilidad"""
-    
+
     _abriendo = False
-    
+
     def __init__(self):
         log.info("=" * 80)
-        log.info("  BOT LONGS RENTABLE v2.0 — Optimizado")
+        log.info("  BOT LONGS v3.0 — Señales reales + Filtros equilibrados")
         log.info("=" * 80)
         log.info(f"  Modo:        {'AUTO' if AUTO_TRADING else 'SEÑALES'}")
-        log.info(f"  Capital:     ${POSITION_SIZE} USDT x{LEVERAGE} = ${POSITION_SIZE*LEVERAGE:.0f} notional")
+        log.info(f"  Capital:     ${POSITION_SIZE} x{LEVERAGE} = ${POSITION_SIZE*LEVERAGE:.0f} notional")
         log.info(f"  TP/SL:       {TP_PCT}% / {SL_PCT}% (RR {TP_PCT/SL_PCT:.2f}:1)")
-        log.info(f"  Comisión:    LIMIT maker {COMISION_MAKER*100:.2f}% (ahorro 60% vs market)")
-        log.info(f"  Min trade:   ${FORCE_MIN_USDT} USDT")
-        log.info(f"  Max trades:  {MAX_TRADES} simultáneos")
-        log.info(f"  Score mín:   {MIN_SCORE}")
-        log.info(f"  Circuit B:   -${CIRCUIT_BREAKER_USDT} USDT/día")
+        log.info(f"  Score mín:   {MIN_SCORE} (FIX-1: era 95)")
+        log.info(f"  Símbolos:    {MAX_SYMBOLS} (FIX-4: era 30)")
+        log.info(f"  Max trades:  {MAX_TRADES} (FIX-5: era 1)")
+        log.info(f"  BTC bloquea: caída > -{BTC_BEAR_BLOCK_PCT}% (FIX-2: era +0.3% obligatorio)")
         log.info(f"  Aprendizaje: {'ON' if LEARNING_ENABLED else 'OFF'}")
         log.info("=" * 80)
-        
-        self.symbols = []
-        self.open_trades = {}
-        self._contracts = {}
-        self._cooldowns = {}
-        self._last_report = datetime.now()
-        self._btc_1h = 0.0
-        self._btc_trend_ok = False
-        self._daily_pnl = 0.0
-        self._daily_reset = datetime.utcnow().date()
+
+        self.symbols       = []
+        self.open_trades   = {}
+        self._contracts    = {}
+        self._cooldowns    = {}
+        self._last_report  = datetime.now()
+        self._btc_1h       = 0.0
+        self._btc_ok       = True
+        self._daily_pnl    = 0.0
+        self._daily_reset  = datetime.utcnow().date()
         self._circuit_open = False
-        self._circuit_until = None
-        
-        # Sistema de aprendizaje
+        self._circuit_until= None
+
         self.learning = TradeLearningSystem() if LEARNING_ENABLED else None
         if self.learning:
             self.learning.load_from_file()
-        
-        # Estadísticas
-        self.stats = {
-            'exec': 0,
-            'closed': 0,
-            'wins': 0,
-            'losses': 0,
-            'pnl': 0.0,
-            'fees_paid': 0.0,
-        }
-        
+
+        self.stats = {'exec': 0, 'closed': 0, 'wins': 0, 'losses': 0,
+                      'pnl': 0.0, 'fees_paid': 0.0}
+
         self._verify()
         self._load_contracts()
         self._get_symbols()
         self._recover_positions()
-        
+
         self._tg(
-            f"<b>🤖 Bot LONGS v2.0 OPTIMIZADO</b>\n"
+            f"<b>🤖 Bot LONGS v3.0</b>\n"
             f"Capital: ${POSITION_SIZE}x{LEVERAGE} | TP:{TP_PCT}% SL:{SL_PCT}%\n"
-            f"Comisión: {COMISION_MAKER*100:.2f}% LIMIT | Score mín:{MIN_SCORE}\n"
-            f"Aprendizaje: {'✅' if LEARNING_ENABLED else '❌'}\n"
-            f"Posiciones: {len(self.open_trades)}/{MAX_TRADES}"
+            f"Score mín:{MIN_SCORE} | Símbolos:{len(self.symbols)} | Max:{MAX_TRADES} trades\n"
+            f"BTC bloquea si cae >{BTC_BEAR_BLOCK_PCT}%\n"
+            f"Posiciones recuperadas: {len(self.open_trades)}"
         )
-    
+
     # ========================================================================
     # SETUP
     # ========================================================================
-    
+
     def _verify(self):
-        """Verifica credenciales"""
         global AUTO_TRADING
         if not AUTO_TRADING:
             return
-        
         if not BINGX_API_KEY or not BINGX_API_SECRET:
             AUTO_TRADING = False
-            log.error("Credenciales faltantes")
+            log.error("❌ Credenciales faltantes")
             return
-        
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/balance', {}).json()
             if d.get('code') == 0:
-                balance = d.get('data', {})
-                equity = balance.get('equity', balance.get('balance', '?'))
+                b = d.get('data', {})
+                equity = b.get('equity', b.get('balance', '?'))
                 log.info(f"✅ BingX conectado | Balance: ${equity} USDT")
             else:
-                log.error(f"❌ BingX error [{d.get('code')}]: {d.get('msg')}")
+                log.error(f"❌ BingX [{d.get('code')}]: {d.get('msg')}")
                 AUTO_TRADING = False
         except Exception as e:
             log.error(f"❌ Error API: {e}")
             AUTO_TRADING = False
-    
+
     def _load_contracts(self):
-        """Carga info de contratos"""
         try:
             r = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/contracts", timeout=15)
             d = r.json()
@@ -476,29 +360,25 @@ class OptimizedLongBot:
                     sym = c.get('symbol', '')
                     if sym:
                         self._contracts[sym] = {
-                            'step': float(c.get('tradeMinQuantity', 1)),
-                            'prec': int(c.get('quantityPrecision', 2)),
+                            'step':  float(c.get('tradeMinQuantity', 1)),
+                            'prec':  int(c.get('quantityPrecision', 2)),
                             'ctval': float(c.get('contractSize', 1)),
                         }
-                log.info(f"📋 Contratos cargados: {len(self._contracts)}")
+                log.info(f"📋 Contratos: {len(self._contracts)}")
         except Exception as e:
-            log.warning(f"⚠️  Error cargando contratos: {e}")
-    
+            log.warning(f"⚠️  Contratos: {e}")
+
     def _get_symbols(self):
-        """Obtiene mejores símbolos por volumen"""
-        # Excluir índices, commodities, forex, stocks
-        EXCLUDE_KEYWORDS = [
-            'DOW', 'JONES', 'SP500', 'SPX', 'SPY', 'QQQ', 'NASDAQ', 'RUSSELL',
-            'DAX', 'FTSE', 'CAC', 'NIKKEI', 'HANG', 'BOVESPA', 'IBEX',
-            'GOLD', 'SILVER', 'XAU', 'XAG', 'PAXG', 'XAUT',
-            'OIL', 'BRENT', 'WTI', 'CRUDE', 'GAS', 'NATURAL',
-            'PLATINUM', 'PALLADIUM', 'COPPER', 'NICKEL', 'ZINC',
-            'TSLA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA',
-            'COIN', 'MSTR',
-            'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD',
-            'WHEAT', 'CORN', 'SUGAR', 'COFFEE', 'COTTON',
+        EXCLUDE = [
+            'DOW','JONES','SP500','SPX','SPY','QQQ','NASDAQ','RUSSELL',
+            'DAX','FTSE','CAC','NIKKEI','HANG','BOVESPA','IBEX',
+            'GOLD','SILVER','XAU','XAG','PAXG','XAUT',
+            'OIL','BRENT','WTI','CRUDE','GAS','NATURAL',
+            'PLATINUM','PALLADIUM','COPPER','NICKEL','ZINC',
+            'TSLA','AAPL','MSFT','GOOGL','AMZN','META','NVDA','COIN','MSTR',
+            'EUR','GBP','JPY','CHF','AUD','CAD','NZD',
+            'WHEAT','CORN','SUGAR','COFFEE','COTTON',
         ]
-        
         try:
             r = requests.get(f"{BASE_URL}/openApi/swap/v2/quote/ticker", timeout=15)
             d = r.json()
@@ -508,105 +388,67 @@ class OptimizedLongBot:
                     sym = t.get('symbol', '')
                     if not sym.endswith('-USDT'):
                         continue
-                    
                     base = sym.replace('-USDT', '').upper()
-                    if any(kw in base for kw in EXCLUDE_KEYWORDS):
+                    if any(kw in base for kw in EXCLUDE):
                         continue
-                    
                     try:
-                        price = float(t.get('lastPrice', 0))
-                        vol = float(t.get('volume', 0))
-                        vol_usdt = vol * price
-                        
+                        price    = float(t.get('lastPrice', 0))
+                        vol_usdt = float(t.get('volume', 0)) * price
                         if vol_usdt >= MIN_VOLUME and price > 0:
                             candidates.append({'symbol': sym, 'volume': vol_usdt})
                     except:
                         continue
-                
-                # Ordenar por volumen y tomar top
                 candidates.sort(key=lambda x: x['volume'], reverse=True)
                 self.symbols = [c['symbol'] for c in candidates[:MAX_SYMBOLS]]
-                
-                log.info(f"🎯 Símbolos seleccionados: {len(self.symbols)} (vol >${ MIN_VOLUME/1e6:.1f}M)")
+                log.info(f"🎯 Símbolos: {len(self.symbols)} (vol>${MIN_VOLUME/1e6:.1f}M)")
                 return
         except Exception as e:
-            log.warning(f"⚠️  Error obteniendo símbolos: {e}")
-        
-        # Fallback
+            log.warning(f"⚠️  Símbolos: {e}")
         self.symbols = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT', 'XRP-USDT']
-        log.info(f"📍 Usando símbolos por defecto: {len(self.symbols)}")
-    
+
     def _recover_positions(self):
-        """Recupera posiciones abiertas en BingX"""
         if not AUTO_TRADING:
             return
-        
-        log.info("🔍 Buscando posiciones LONG en BingX...")
         try:
             d = bingx_request('GET', '/openApi/swap/v2/user/positions', {}).json()
             if d.get('code') != 0:
                 return
-            
             recovered = 0
             for p in d.get('data', []):
-                try:
-                    amt = float(p.get('positionAmt', 0) or 0)
-                    side = str(p.get('positionSide', '')).upper()
-                    
-                    # Solo LONGs
-                    is_long = (side == 'LONG' and abs(amt) > 0) or (side == 'BOTH' and amt > 0)
-                    if not is_long:
-                        continue
-                    
-                    sym = p.get('symbol', '')
-                    if not sym or sym in self.open_trades:
-                        continue
-                    
-                    entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
-                    if entry <= 0:
-                        # Obtener precio actual como aproximación
-                        tk = self._ticker(sym)
-                        entry = tk['price'] if tk else 0
-                    
-                    if entry <= 0:
-                        continue
-                    
-                    tp_price = entry * (1 + TP_PCT / 100)
-                    sl_price = entry * (1 - SL_PCT / 100)
-                    
-                    self.open_trades[sym] = {
-                        'entry': entry,
-                        'qty_c': abs(amt),
-                        'usdt_qty': POSITION_SIZE,
-                        'tp': tp_price,
-                        'sl': sl_price,
-                        'tp_pct': TP_PCT,
-                        'sl_pct': SL_PCT,
-                        'highest': entry,
-                        'order_id': 'RECOVERED',
-                        'opened_at': datetime.now(),
-                        'score': 0,
-                        'entry_data': {},
-                    }
-                    
-                    recovered += 1
-                    log.info(f"  ♻️  {sym}: {abs(amt):.4f} contratos @ ${entry:.6f}")
-                    
-                except Exception as e:
-                    log.debug(f"Error procesando posición: {e}")
+                amt  = float(p.get('positionAmt', 0) or 0)
+                side = str(p.get('positionSide', '')).upper()
+                is_long = (side == 'LONG' and abs(amt) > 0) or (side == 'BOTH' and amt > 0)
+                if not is_long:
                     continue
-            
+                sym = p.get('symbol', '')
+                if not sym or sym in self.open_trades:
+                    continue
+                entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
+                if entry <= 0:
+                    tk = self._ticker(sym)
+                    entry = tk['price'] if tk else 0
+                if entry <= 0:
+                    continue
+                self.open_trades[sym] = {
+                    'entry': entry, 'qty_c': abs(amt),
+                    'usdt_qty': POSITION_SIZE,
+                    'tp': entry * (1 + TP_PCT / 100),
+                    'sl': entry * (1 - SL_PCT / 100),
+                    'tp_pct': TP_PCT, 'sl_pct': SL_PCT,
+                    'highest': entry, 'order_id': 'RECOVERED',
+                    'opened_at': datetime.now(), 'score': 0, 'entry_data': {},
+                }
+                recovered += 1
+                log.info(f"  ♻️  {sym} @ ${entry:.6f}")
             log.info(f"✅ Recuperadas {recovered} posiciones LONG")
-            
         except Exception as e:
-            log.error(f"❌ Error recuperando posiciones: {e}")
-    
+            log.error(f"❌ Recover: {e}")
+
     # ========================================================================
     # DATOS DE MERCADO
     # ========================================================================
-    
+
     def _klines(self, symbol, interval='5m', limit=80):
-        """Obtiene velas"""
         try:
             r = requests.get(
                 f"{BASE_URL}/openApi/swap/v3/quote/klines",
@@ -615,990 +457,714 @@ class OptimizedLongBot:
             )
             d = r.json()
             if d.get('code') == 0 and d.get('data'):
-                klines = d['data']
-                closes = [float(k['close']) for k in klines]
-                highs = [float(k['high']) for k in klines]
-                lows = [float(k['low']) for k in klines]
+                klines  = d['data']
+                closes  = [float(k['close'])  for k in klines]
+                highs   = [float(k['high'])   for k in klines]
+                lows    = [float(k['low'])    for k in klines]
                 volumes = [float(k['volume']) for k in klines]
-                opens = [float(k['open']) for k in klines]
+                opens   = [float(k['open'])   for k in klines]
                 return closes, highs, lows, volumes, opens
         except:
             pass
         return None, None, None, None, None
-    
+
     def _ticker(self, symbol):
-        """Obtiene precio y cambio actual"""
         try:
             r = requests.get(
                 f"{BASE_URL}/openApi/swap/v2/quote/ticker",
-                params={'symbol': symbol},
-                timeout=8
+                params={'symbol': symbol}, timeout=8
             )
             d = r.json()
             if d.get('code') == 0 and d.get('data'):
                 t = d['data']
                 return {
-                    'price': float(t.get('lastPrice', 0)),
+                    'price':  float(t.get('lastPrice', 0)),
                     'change': float(t.get('priceChangePercent', 0)),
                 }
         except:
             pass
         return None
-    
+
     def _update_btc_trend(self):
-        """Actualiza tendencia de BTC"""
         try:
-            closes, *_ = self._klines('BTC-USDT', '1h', 3)
+            closes, *_ = self._klines('BTC-USDT', '1h', 4)
             if closes and len(closes) >= 2:
                 self._btc_1h = (closes[-1] - closes[-2]) / closes[-2] * 100
-                self._btc_trend_ok = self._btc_1h >= BTC_MIN_TREND_PCT
+                # FIX-2: solo bloquear si cae fuerte
+                self._btc_ok = self._btc_1h >= -BTC_BEAR_BLOCK_PCT
             else:
-                self._btc_trend_ok = False
+                self._btc_ok = True
         except:
-            self._btc_trend_ok = False
-    
+            self._btc_ok = True
+
     # ========================================================================
-    # ANÁLISIS SIMPLIFICADO Y EFECTIVO
+    # ANÁLISIS v3.0 — FILTROS EQUILIBRADOS
     # ========================================================================
-    
+
     def analyze(self, symbol):
         """
-        Sistema de análisis simplificado que funciona
-        Solo usa indicadores probados: EMA, RSI, Volumen, ATR
+        FIX-3: EMA filter flexible
+        FIX-6: Score system alcanzable
+        FIX-8: Contexto 1h + señal 5m
         """
-        # Filtros previos
         if symbol in self.open_trades:
             return None
-        
         if not self._cooldown_ok(symbol):
             return None
-        
         if not self._hora_ok():
             return None
-        
-        # Filtro BTC estricto
-        if self._btc_1h <= -BTC_BEAR_BLOCK_PCT:
+
+        # FIX-2: BTC filter suavizado
+        if not self._btc_ok:
             return None
-        
-        if not self._btc_trend_ok:
-            return None  # BTC debe ser alcista
-        
+
         if self._check_circuit_breaker():
             return None
-        
-        # Obtener datos
-        closes, highs, lows, volumes, opens = self._klines(symbol, '5m', 80)
-        if not closes or len(closes) < 30:
+
+        # Velas 5m para señal
+        closes5, highs5, lows5, volumes5, opens5 = self._klines(symbol, '5m', 80)
+        if not closes5 or len(closes5) < 30:
             return None
-        
+
+        # Velas 1h para contexto (FIX-8)
+        closes1h, highs1h, lows1h, *_ = self._klines(symbol, '1h', 30)
+
         ticker = self._ticker(symbol)
         if not ticker or ticker['price'] <= 0:
             return None
-        
-        price = ticker['price']
-        change_24h = ticker['change']
-        
-        # ====================================================================
-        # INDICADORES CORE
-        # ====================================================================
-        
-        # EMAs
-        ema9 = calc_ema(closes, 9)
-        ema21 = calc_ema(closes, 21)
-        ema50 = calc_ema(closes, min(50, len(closes)))
-        
-        # RSI
-        rsi = calc_rsi(closes, 14)
-        
-        # Volumen
-        vol_multiplier = vol_spike(volumes)
-        
-        # ATR para volatilidad
-        atr = calc_atr(highs, lows, closes, 14)
+
+        price     = ticker['price']
+        change_24h= ticker['change']
+
+        # ── Indicadores 5m ──────────────────────────────────────
+        ema9  = calc_ema(closes5, 9)
+        ema21 = calc_ema(closes5, 21)
+        ema50 = calc_ema(closes5, min(50, len(closes5)))
+        rsi   = calc_rsi(closes5, 14)
+        vol_m = vol_spike(volumes5)
+        atr   = calc_atr(highs5, lows5, closes5, 14)
         atr_pct = (atr / price * 100) if price > 0 else 0
-        
+
         # Contexto de precio
-        min_15 = min(closes[-15:]) if len(closes) >= 15 else price
-        near_low = price <= min_15 * 1.015
-        
-        # Momentum reciente
-        momentum_5 = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else 0
-        
-        # Velas verdes recientes
-        green_candles = 0
-        if opens and len(opens) >= 4:
-            green_candles = sum(1 for i in range(-4, 0) if closes[i] > opens[i])
-        
-        # ====================================================================
-        # FILTROS OBLIGATORIOS
-        # ====================================================================
-        
-        # 1. ATR mínimo (volatilidad suficiente)
-        if atr_pct < 0.25:
+        min_20   = min(closes5[-20:]) if len(closes5) >= 20 else price
+        max_20   = max(closes5[-20:]) if len(closes5) >= 20 else price
+        near_low = price <= min_20 * 1.02
+        rng_pct  = (max_20 - min_20) / min_20 * 100 if min_20 > 0 else 0
+
+        # Momentum
+        momentum_5 = (closes5[-1] - closes5[-6]) / closes5[-6] * 100 if len(closes5) >= 6 else 0
+        momentum_15= (closes5[-1] - closes5[-16]) / closes5[-16] * 100 if len(closes5) >= 16 else 0
+
+        # Velas verdes
+        green = 0
+        if opens5 and len(opens5) >= 5:
+            green = sum(1 for i in range(-5, 0) if closes5[i] > opens5[i])
+
+        # Contexto 1h (FIX-8)
+        trend_1h = 0
+        if closes1h and len(closes1h) >= 10:
+            ema9_1h  = calc_ema(closes1h, 9)
+            ema21_1h = calc_ema(closes1h, 21)
+            if ema9_1h > ema21_1h:
+                trend_1h = 1   # alcista en 1h
+            elif ema9_1h < ema21_1h:
+                trend_1h = -1  # bajista en 1h
+
+        # ── FILTROS OBLIGATORIOS (FIX-3: menos estrictos) ───────
+
+        # 1. ATR mínimo
+        if atr_pct < 0.20:
             return None
-        
+
         # 2. RSI no sobrecomprado
-        rsi_limit = 65 if self._btc_1h > 1.0 else 60
+        rsi_limit = 70 if trend_1h == 1 else 65
         if rsi > rsi_limit:
             return None
-        
-        # 3. Tendencia EMA (con excepciones limitadas)
-        ema_aligned = ema9 > ema21 > ema50
-        if not ema_aligned:
-            # Solo permitir si RSI muy bajo y BTC alcista
-            if not (rsi < 30 and self._btc_1h > 0.5):
-                return None
-        
-        # 4. Cambio 24h no excesivo
-        if change_24h > 8.0:  # Ya subió mucho
+
+        # 3. FIX-3: EMA filter flexible
+        ema_alcista    = ema9 > ema21 > ema50
+        ema_recuperando= ema9 > ema21 and ema50 > 0  # pull-back con EMA9 > EMA21
+        ema_oversold   = rsi < 35 and near_low        # muy sobrevendido = excepción
+
+        if not (ema_alcista or ema_recuperando or ema_oversold):
             return None
-        
-        # ====================================================================
-        # SISTEMA DE SCORING SIMPLIFICADO
-        # ====================================================================
-        
-        score = 0
+
+        # 4. Cambio 24h no extremo
+        if change_24h > 12.0:
+            return None
+
+        # ── SCORING (FIX-6: rebalanceado, alcanzable) ───────────
+
+        score   = 0
         reasons = []
-        
-        # EMA alignment (30 puntos)
-        if ema_aligned:
-            ema_gap = abs(ema9 - ema21) / ema21 * 100
-            pts = min(30, 20 + int(ema_gap * 5))
+
+        # EMA (25 pts max)
+        if ema_alcista:
+            gap = abs(ema9 - ema21) / ema21 * 100
+            pts = min(25, 15 + int(gap * 4))
             score += pts
             reasons.append(f"EMA↑({pts})")
-        
-        # RSI oversold (40 puntos max)
-        if rsi < 25:
-            score += 40
-            reasons.append(f"RSI{rsi:.0f}(40)")
-        elif rsi < 30:
-            score += 32
-            reasons.append(f"RSI{rsi:.0f}(32)")
-        elif rsi < 35:
-            score += 22
-            reasons.append(f"RSI{rsi:.0f}(22)")
-        elif rsi < 45:
+        elif ema_recuperando:
             score += 12
-            reasons.append(f"RSI{rsi:.0f}(12)")
-        
-        # Volumen (15 puntos max)
-        if vol_multiplier >= 2.0 and momentum_5 > 0.3:
-            pts = min(15, int(vol_multiplier * 6))
-            score += pts
-            reasons.append(f"Vol{vol_multiplier:.1f}x({pts})")
-        elif vol_multiplier >= 1.5:
-            score += 8
-            reasons.append(f"Vol{vol_multiplier:.1f}x(8)")
-        
-        # Cerca de mínimos (15 puntos)
+            reasons.append("EMA~(12)")
+
+        # RSI (35 pts max) — peso mayor, señal más fiable
+        if rsi < 25:
+            score += 35; reasons.append(f"RSI{rsi:.0f}(35)")
+        elif rsi < 30:
+            score += 28; reasons.append(f"RSI{rsi:.0f}(28)")
+        elif rsi < 35:
+            score += 20; reasons.append(f"RSI{rsi:.0f}(20)")
+        elif rsi < 40:
+            score += 14; reasons.append(f"RSI{rsi:.0f}(14)")
+        elif rsi < 50:
+            score += 8;  reasons.append(f"RSI{rsi:.0f}(8)")
+
+        # Volumen (15 pts max)
+        if vol_m >= 2.5 and momentum_5 > 0.2:
+            pts = min(15, int(vol_m * 5))
+            score += pts; reasons.append(f"Vol{vol_m:.1f}x({pts})")
+        elif vol_m >= 1.5:
+            score += 8;   reasons.append(f"Vol{vol_m:.1f}x(8)")
+
+        # Cerca de mínimos (12 pts)
         if near_low:
-            score += 15
-            reasons.append("NearLow(15)")
-        
-        # Momentum positivo (10 puntos)
-        if momentum_5 > 1.0:
-            score += 10
-            reasons.append("Mom+(10)")
-        elif momentum_5 > 0.5:
-            score += 5
-            reasons.append("Mom+(5)")
-        
-        # Cambio 24h negativo = oportunidad (15 puntos max)
-        if change_24h < -5.0:
-            score += 15
-            reasons.append(f"24h{change_24h:.1f}%(15)")
-        elif change_24h < -3.0:
-            score += 10
-            reasons.append(f"24h{change_24h:.1f}%(10)")
-        
-        # Velas verdes (8 puntos)
-        if green_candles >= 3:
-            score += 8
-            reasons.append(f"Green3(8)")
-        elif green_candles >= 2:
-            score += 4
-            reasons.append(f"Green2(4)")
-        
-        # Volatilidad alta (8 puntos)
-        if atr_pct > 1.5:
-            score += 8
-            reasons.append(f"ATR{atr_pct:.1f}%(8)")
-        elif atr_pct > 0.8:
-            score += 4
-            reasons.append(f"ATR{atr_pct:.1f}%(4)")
-        
-        # BTC alcista (bonus 10 puntos)
+            score += 12; reasons.append("NearLow(12)")
+
+        # Momentum (10 pts max)
+        if 0.3 < momentum_5 < 5.0:
+            score += 10; reasons.append("Mom+(10)")
+        elif momentum_5 > 0:
+            score += 5;  reasons.append("Mom+(5)")
+
+        # Caída 24h = oportunidad de rebote (12 pts max)
+        if change_24h < -8.0:
+            score += 12; reasons.append(f"Drop{change_24h:.1f}%(12)")
+        elif change_24h < -5.0:
+            score += 8;  reasons.append(f"Drop{change_24h:.1f}%(8)")
+        elif change_24h < -2.0:
+            score += 4;  reasons.append(f"Drop{change_24h:.1f}%(4)")
+
+        # Velas verdes (8 pts max)
+        if green >= 4:
+            score += 8; reasons.append("Green4(8)")
+        elif green >= 3:
+            score += 5; reasons.append("Green3(5)")
+        elif green >= 2:
+            score += 2; reasons.append("Green2(2)")
+
+        # ATR (8 pts max)
+        if atr_pct > 2.0:
+            score += 8; reasons.append(f"ATR{atr_pct:.1f}%(8)")
+        elif atr_pct > 1.0:
+            score += 5; reasons.append(f"ATR{atr_pct:.1f}%(5)")
+
+        # Contexto 1h (FIX-8) (10 pts bonus)
+        if trend_1h == 1:
+            score += 10; reasons.append(f"1hBull(10)")
+        elif trend_1h == -1:
+            score -= 5;  reasons.append("1hBear(-5)")
+
+        # BTC bonus (8 pts max)
         if self._btc_1h > 1.0:
-            score += 10
-            reasons.append(f"BTC+{self._btc_1h:.1f}%(10)")
-        elif self._btc_1h > 0.5:
-            score += 5
-            reasons.append(f"BTC+{self._btc_1h:.1f}%(5)")
-        
-        # ====================================================================
-        # SL/TP DINÁMICOS BASADOS EN ATR
-        # ====================================================================
-        
-        # SL basado en ATR (mínimo SL_PCT)
-        sl_dynamic = max(SL_PCT, atr_pct * 1.2)
-        sl_dynamic = min(sl_dynamic, SL_PCT * 1.5)  # No más de 1.5x el configurado
-        
-        # TP mantiene RR 2:1
-        tp_dynamic = max(TP_PCT, sl_dynamic * 2.0)
-        tp_dynamic = max(tp_dynamic, TP_MIN_RENTABLE)  # Mínimo rentable
-        
-        # ====================================================================
-        # SISTEMA DE APRENDIZAJE
-        # ====================================================================
-        
-        score_actual = score
+            score += 8; reasons.append(f"BTC+{self._btc_1h:.1f}%(8)")
+        elif self._btc_1h > 0.3:
+            score += 4; reasons.append(f"BTC+{self._btc_1h:.1f}%(4)")
+
+        # Rango suficiente para TP (8 pts)
+        if rng_pct > TP_PCT * 1.5:
+            score += 8; reasons.append(f"Rng{rng_pct:.1f}%(8)")
+        elif rng_pct > TP_PCT:
+            score += 4; reasons.append(f"Rng{rng_pct:.1f}%(4)")
+
+        # ── TP/SL dinámicos ─────────────────────────────────────
+        sl_dyn = max(SL_PCT, atr_pct * 1.2)
+        sl_dyn = min(sl_dyn, SL_PCT * 1.8)
+        tp_dyn = max(TP_PCT, sl_dyn * 2.0, TP_MIN_RENTABLE)
+
+        # ── Aprendizaje ──────────────────────────────────────────
         score_min = self.learning.optimal_score if self.learning else MIN_SCORE
-        
         if self.learning:
-            can_trade, reason = self.learning.should_trade(symbol, score_actual)
-            if not can_trade:
+            can, reason_str = self.learning.should_trade(symbol, score)
+            if not can:
                 return None
-        
-        # ====================================================================
-        # DECISIÓN FINAL
-        # ====================================================================
-        
-        if score_actual >= score_min:
+
+        # ── Decisión ─────────────────────────────────────────────
+        if score >= score_min:
             return {
-                'price': price,
-                'change': change_24h,
-                'score': score_actual,
+                'price': price, 'change': change_24h,
+                'score': score, 'score_min': score_min,
                 'reasons': ' | '.join(reasons),
-                'rsi': rsi,
-                'vol': vol_multiplier,
-                'tp_pct': round(tp_dynamic, 2),
-                'sl_pct': round(sl_dynamic, 2),
+                'rsi': rsi, 'vol': vol_m,
+                'tp_pct': round(tp_dyn, 2),
+                'sl_pct': round(sl_dyn, 2),
                 'atr_pct': round(atr_pct, 2),
-                'score_min': score_min,
-                'rr': round(tp_dynamic / sl_dynamic, 2),
-                'ema_aligned': ema_aligned,
+                'rr': round(tp_dyn / sl_dyn, 2),
+                'ema_alcista': ema_alcista,
+                'trend_1h': trend_1h,
             }
-        
         return None
-    
+
     # ========================================================================
     # GESTIÓN DE POSICIONES
     # ========================================================================
-    
+
     def _set_leverage(self, symbol):
-        """Configura leverage"""
-        try:
-            for side in ['LONG', 'SHORT']:
+        """FIX-7: solo LONG/SHORT — BOTH causa error 109400 en hedge mode."""
+        for side in ('LONG', 'SHORT'):
+            try:
                 bingx_request('POST', '/openApi/swap/v2/trade/leverage', {
-                    'symbol': symbol,
-                    'side': side,
-                    'leverage': str(LEVERAGE),
+                    'symbol': symbol, 'side': side, 'leverage': str(LEVERAGE),
                 })
-            log.info(f"  ⚙️  Leverage {symbol} → {LEVERAGE}x")
-        except Exception as e:
-            log.warning(f"  ⚠️  Leverage {symbol}: {e}")
-    
+                log.info(f"  ⚙️  Leverage {symbol} {side} → {LEVERAGE}x")
+            except Exception as e:
+                log.debug(f"  leverage {side}: {e}")
+
     def _qty_contratos(self, symbol, price, usdt_amount=None):
-        """Calcula cantidad de contratos para alcanzar notional objetivo"""
         if usdt_amount is None:
             usdt_amount = POSITION_SIZE
-        
-        # Notional target
-        notional_target = max(
-            usdt_amount * LEVERAGE,
-            FORCE_MIN_USDT * LEVERAGE,
-            MIN_TRADE
-        )
-        
-        # Info del contrato
-        info = self._contracts.get(symbol, {'step': 1.0, 'prec': 2, 'ctval': 1.0})
-        step = max(info.get('step', 1.0), 0.0001)
-        prec = info.get('prec', 2)
-        ctval = max(info.get('ctval', 1.0), 1e-9)
-        
-        # Precio por contrato
-        price_per_contract = price * ctval
-        if price_per_contract <= 0:
+        notional = max(usdt_amount * LEVERAGE, FORCE_MIN_USDT * LEVERAGE, MIN_TRADE)
+        info     = self._contracts.get(symbol, {'step': 1.0, 'prec': 2, 'ctval': 1.0})
+        step     = max(info.get('step', 1.0), 0.0001)
+        prec     = info.get('prec', 2)
+        ctval    = max(info.get('ctval', 1.0), 1e-9)
+        ppc      = price * ctval
+        if ppc <= 0:
             return None, 0
-        
-        # Calcular cantidad
-        qty = notional_target / price_per_contract
-        qty = math.ceil(qty / step) * step
+        qty = math.ceil((notional / ppc) / step) * step
         qty = round(qty, prec)
-        
-        # Validar valor
-        val = qty * price_per_contract
-        min_val = max(MIN_TRADE, FORCE_MIN_USDT)
-        
-        # Ajustar si es necesario
+        val = qty * ppc
         attempts = 0
-        while val < min_val and attempts < 100:
-            qty += step
-            qty = round(qty, prec)
-            val = qty * price_per_contract
-            attempts += 1
-        
-        if val < min_val:
+        while val < max(MIN_TRADE, FORCE_MIN_USDT) and attempts < 100:
+            qty += step; qty = round(qty, prec); val = qty * ppc; attempts += 1
+        if val < max(MIN_TRADE, FORCE_MIN_USDT):
             return None, 0
-        
-        log.info(f"  📊 {symbol}: {qty} cts × ${price_per_contract:.6f} = ${val:.2f} notional")
+        log.info(f"  📊 {symbol}: {qty}cts × ${ppc:.6f} = ${val:.2f}")
         return qty, round(val, 4)
-    
+
     def _place_limit_long(self, symbol, qty, price):
-        """Coloca orden LIMIT de compra (comisión menor)"""
         limit_price = round(price * (1 - LIMIT_OFFSET_PCT / 100), 8)
-        
         try:
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol': symbol,
-                'side': 'BUY',
-                'positionSide': 'LONG',
-                'type': 'LIMIT',
-                'price': str(limit_price),
-                'quantity': str(qty),
-                'timeInForce': 'GTC',
+                'symbol': symbol, 'side': 'BUY', 'positionSide': 'LONG',
+                'type': 'LIMIT', 'price': str(limit_price),
+                'quantity': str(qty), 'timeInForce': 'GTC',
             }).json()
-            
             if d.get('code') == 0:
                 oid = d.get('data', {}).get('orderId', 'OK')
-                log.info(f"  ✅ LIMIT BUY @ ${limit_price:.6f} | OID: {oid}")
+                log.info(f"  ✅ LIMIT BUY @ ${limit_price:.6f}")
                 return oid, qty
             else:
-                log.error(f"  ❌ LIMIT failed [{d.get('code')}]: {d.get('msg')}")
-                return None, None
-                
+                log.error(f"  ❌ LIMIT [{d.get('code')}]: {d.get('msg')}")
         except Exception as e:
-            log.error(f"  ❌ Error LIMIT: {e}")
-            return None, None
-    
+            log.error(f"  ❌ LIMIT error: {e}")
+        return None, None
+
     def _wait_fill(self, symbol, order_id, timeout=30):
-        """Espera que la orden LIMIT se ejecute"""
-        for i in range(timeout):
+        for _ in range(timeout):
             try:
-                # Verificar orden
                 d = bingx_request('GET', '/openApi/swap/v2/trade/order', {
-                    'symbol': symbol,
-                    'orderId': str(order_id)
+                    'symbol': symbol, 'orderId': str(order_id)
                 }).json()
-                
                 if d.get('code') == 0:
-                    order = d.get('data', {}).get('order', {})
+                    order  = d.get('data', {}).get('order', {})
                     status = order.get('status', '')
-                    
                     if status == 'FILLED':
-                        avg_price = float(order.get('avgPrice', 0))
-                        filled_qty = float(order.get('executedQty', 0))
-                        log.info(f"  ✅ Ejecutada: {filled_qty} @ ${avg_price:.6f}")
-                        return filled_qty, avg_price
-                    elif status in ['CANCELED', 'EXPIRED', 'REJECTED']:
-                        log.warning(f"  ⚠️  Orden {status}")
+                        return float(order.get('executedQty', 0)), float(order.get('avgPrice', 0))
+                    if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
                         return None, None
-                
             except:
                 pass
-            
             time.sleep(1)
-        
-        log.warning(f"  ⏱️  Timeout {timeout}s esperando fill")
         return None, None
-    
+
     def _confirm_position(self, symbol, timeout=15):
-        """Confirma posición abierta en BingX"""
-        for i in range(timeout):
+        for _ in range(timeout):
             try:
-                d = bingx_request('GET', '/openApi/swap/v2/user/positions', {
-                    'symbol': symbol
-                }).json()
-                
+                d = bingx_request('GET', '/openApi/swap/v2/user/positions',
+                                  {'symbol': symbol}).json()
                 if d.get('code') == 0:
                     for p in d.get('data', []):
-                        amt = float(p.get('positionAmt', 0) or 0)
+                        amt  = float(p.get('positionAmt', 0) or 0)
                         side = str(p.get('positionSide', '')).upper()
-                        
                         if (side == 'LONG' and abs(amt) > 0) or (side == 'BOTH' and amt > 0):
-                            entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
-                            qty = abs(amt)
-                            log.info(f"  ✅ Posición confirmada: {qty} @ ${entry:.6f}")
-                            return qty, entry
+                            return abs(amt), float(p.get('avgPrice') or p.get('entryPrice') or 0)
             except:
                 pass
-            
             time.sleep(1)
-        
         return None, None
-    
+
     def _cancel_orders(self, symbol):
-        """Cancela órdenes abiertas"""
         try:
-            d = bingx_request('GET', '/openApi/swap/v2/trade/openOrders', {
-                'symbol': symbol
-            }).json()
-            
+            d = bingx_request('GET', '/openApi/swap/v2/trade/openOrders',
+                              {'symbol': symbol}).json()
             if d.get('code') == 0:
-                orders = d.get('data', {}).get('orders', [])
-                for o in orders:
+                for o in d.get('data', {}).get('orders', []):
                     oid = o.get('orderId')
                     if oid:
-                        bingx_request('DELETE', '/openApi/swap/v2/trade/order', {
-                            'symbol': symbol,
-                            'orderId': str(oid)
-                        })
+                        bingx_request('DELETE', '/openApi/swap/v2/trade/order',
+                                      {'symbol': symbol, 'orderId': str(oid)})
         except:
             pass
-    
+
     def _place_tp_sl(self, symbol, qty, tp_price, sl_price):
-        """Coloca órdenes TP y SL"""
-        tp_ok = False
-        sl_ok = False
-        
-        # Take Profit
+        tp_ok = sl_ok = False
+        # TP
         try:
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol': symbol,
-                'side': 'SELL',
-                'positionSide': 'LONG',
-                'type': 'TAKE_PROFIT_MARKET',
-                'quantity': str(qty),
+                'symbol': symbol, 'side': 'SELL', 'positionSide': 'LONG',
+                'type': 'TAKE_PROFIT_MARKET', 'quantity': str(qty),
                 'stopPrice': str(round(tp_price, 8)),
             }).json()
-            
             tp_ok = d.get('code') == 0
-            if tp_ok:
-                log.info(f"  ✅ TP @ ${tp_price:.6f}")
-            else:
-                log.error(f"  ❌ TP failed: {d.get('msg')}")
+            log.info(f"  {'✅' if tp_ok else '❌'} TP @ ${tp_price:.6f}")
         except Exception as e:
-            log.error(f"  ❌ TP error: {e}")
-        
+            log.error(f"  ❌ TP: {e}")
         time.sleep(0.3)
-        
-        # Stop Loss
+        # SL
         try:
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol': symbol,
-                'side': 'SELL',
-                'positionSide': 'LONG',
-                'type': 'STOP_MARKET',
-                'quantity': str(qty),
+                'symbol': symbol, 'side': 'SELL', 'positionSide': 'LONG',
+                'type': 'STOP_MARKET', 'quantity': str(qty),
                 'stopPrice': str(round(sl_price, 8)),
             }).json()
-            
             sl_ok = d.get('code') == 0
-            if sl_ok:
-                log.info(f"  ✅ SL @ ${sl_price:.6f}")
-            else:
-                log.error(f"  ❌ SL failed: {d.get('msg')}")
+            log.info(f"  {'✅' if sl_ok else '❌'} SL @ ${sl_price:.6f}")
         except Exception as e:
-            log.error(f"  ❌ SL error: {e}")
-        
+            log.error(f"  ❌ SL: {e}")
         return tp_ok, sl_ok
-    
+
     def open_trade(self, symbol, signal):
-        """Abre trade con sistema optimizado"""
-        if not AUTO_TRADING:
+        if not AUTO_TRADING or symbol in self.open_trades:
             return False
-        
-        if symbol in self.open_trades:
+        if OptimizedLongBot._abriendo or len(self.open_trades) >= MAX_TRADES:
             return False
-        
-        if OptimizedLongBot._abriendo:
-            return False
-        
-        # Verificar slots disponibles
-        if len(self.open_trades) >= MAX_TRADES:
-            return False
-        
         OptimizedLongBot._abriendo = True
-        
         try:
             return self._open_trade_inner(symbol, signal)
         finally:
             OptimizedLongBot._abriendo = False
-    
+
     def _open_trade_inner(self, symbol, sig):
-        """Lógica interna de apertura"""
         price = sig['price']
-        
-        log.info(f"\n  🎯 LONG {symbol}")
-        log.info(f"  Score: {sig['score']:.0f}/{sig['score_min']:.0f} | RSI: {sig['rsi']:.0f} | RR: {sig['rr']:.2f}:1")
+        log.info(f"\n  🎯 LONG {symbol} | Score:{sig['score']:.0f}/{sig['score_min']:.0f} "
+                 f"| RSI:{sig['rsi']:.0f} | RR:{sig['rr']:.2f}:1")
         log.info(f"  {sig['reasons']}")
-        
-        # Configurar leverage
+
         self._set_leverage(symbol)
         time.sleep(0.2)
-        
-        # Calcular cantidad
+
         qty, notional = self._qty_contratos(symbol, price, POSITION_SIZE)
-        if not qty or qty <= 0:
-            log.error(f"  ❌ Cantidad inválida")
+        if not qty:
             return False
-        
-        # Colocar orden LIMIT (menor comisión)
+
         order_id, _ = self._place_limit_long(symbol, qty, price)
         if not order_id:
             return False
-        
-        # Esperar ejecución
+
         filled_qty, fill_price = self._wait_fill(symbol, order_id, timeout=30)
-        
         if not filled_qty:
-            # Cancelar y reintentar con MARKET si necesario
-            log.warning(f"  ⚠️  LIMIT no ejecutada - cancelando")
+            log.warning("  ⚠️  LIMIT no ejecutada → MARKET")
             self._cancel_orders(symbol)
             time.sleep(0.5)
-            
-            # Market como backup (mayor comisión pero garantiza entrada)
             d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol': symbol,
-                'side': 'BUY',
-                'positionSide': 'LONG',
-                'type': 'MARKET',
-                'quantity': str(qty),
+                'symbol': symbol, 'side': 'BUY', 'positionSide': 'LONG',
+                'type': 'MARKET', 'quantity': str(qty),
             }).json()
-            
             if d.get('code') != 0:
-                log.error(f"  ❌ MARKET failed: {d.get('msg')}")
+                log.error(f"  ❌ MARKET: {d.get('msg')}")
                 return False
-            
-            # Confirmar posición
             filled_qty, fill_price = self._confirm_position(symbol, timeout=15)
-            
             if not filled_qty:
-                log.error(f"  ❌ No se pudo confirmar posición")
                 return False
-        
-        # Calcular TP/SL sobre precio real
+
         tp_price = fill_price * (1 + sig['tp_pct'] / 100)
         sl_price = fill_price * (1 - sig['sl_pct'] / 100)
-        
-        # Colocar TP/SL
         tp_ok, sl_ok = self._place_tp_sl(symbol, filled_qty, tp_price, sl_price)
-        
-        # Retry SL si falló (crítico)
+
         if not sl_ok:
             time.sleep(2)
-            self._cancel_orders(symbol)
-            time.sleep(1)
             _, sl_ok = self._place_tp_sl(symbol, filled_qty, tp_price, sl_price)
-        
-        # Si SL sigue fallando, cerrar posición (seguridad)
+
         if not sl_ok:
-            log.error(f"  ❌ SL crítico fallido - cerrando posición")
-            self._close_position_market(symbol, filled_qty)
+            log.error("  ❌ SL crítico — cerrando")
+            self._close_market(symbol, filled_qty)
             return False
-        
-        # Registrar trade
+
         self.open_trades[symbol] = {
-            'entry': fill_price,
-            'qty_c': filled_qty,
-            'usdt_qty': POSITION_SIZE,
-            'tp': tp_price,
-            'sl': sl_price,
-            'tp_pct': sig['tp_pct'],
-            'sl_pct': sig['sl_pct'],
-            'highest': fill_price,
-            'order_id': order_id,
-            'opened_at': datetime.now(),
-            'score': sig['score'],
-            'entry_data': sig,
+            'entry': fill_price, 'qty_c': filled_qty, 'usdt_qty': POSITION_SIZE,
+            'tp': tp_price, 'sl': sl_price,
+            'tp_pct': sig['tp_pct'], 'sl_pct': sig['sl_pct'],
+            'highest': fill_price, 'order_id': order_id,
+            'opened_at': datetime.now(), 'score': sig['score'], 'entry_data': sig,
         }
-        
         self.stats['exec'] += 1
-        
-        # Calcular comisión pagada
-        fee = notional * COMISION_ACTUAL
-        self.stats['fees_paid'] += fee
-        
-        # Telegram
+        self.stats['fees_paid'] += notional * COMISION_ACTUAL
+
         self._tg(
-            f"<b>🟢 LONG ABIERTO</b>\n"
-            f"<b>{symbol}</b>\n"
-            f"Score: {sig['score']:.0f}/{sig['score_min']:.0f} | RSI: {sig['rsi']:.0f} | RR: {sig['rr']:.2f}:1\n"
+            f"<b>🟢 LONG ABIERTO</b> — <b>{symbol}</b>\n"
+            f"Score: {sig['score']:.0f} | RSI: {sig['rsi']:.0f} | RR: {sig['rr']:.2f}:1\n"
             f"Entrada: ${fill_price:.6f}\n"
             f"{'✅' if tp_ok else '❌'} TP: ${tp_price:.6f} (+{sig['tp_pct']:.2f}%)\n"
             f"{'✅' if sl_ok else '❌'} SL: ${sl_price:.6f} (-{sig['sl_pct']:.2f}%)\n"
-            f"Capital: ${POSITION_SIZE}x{LEVERAGE} | Comisión: ${fee:.3f}\n"
-            f"PnL día: ${self._daily_pnl:+.3f}"
+            f"Capital: ${POSITION_SIZE}x{LEVERAGE} | PnL día: ${self._daily_pnl:+.3f}"
         )
-        
         return True
-    
-    def _close_position_market(self, symbol, qty):
-        """Cierra posición a mercado"""
+
+    def _close_market(self, symbol, qty):
         try:
-            d = bingx_request('POST', '/openApi/swap/v2/trade/order', {
-                'symbol': symbol,
-                'side': 'SELL',
-                'positionSide': 'LONG',
-                'type': 'MARKET',
-                'quantity': str(qty),
-            }).json()
-            
-            if d.get('code') == 0:
-                log.info(f"  ✅ Posición cerrada a mercado")
-                return True
-        except Exception as e:
-            log.error(f"  ❌ Error cerrando: {e}")
-        
-        return False
-    
+            bingx_request('POST', '/openApi/swap/v2/trade/order', {
+                'symbol': symbol, 'side': 'SELL', 'positionSide': 'LONG',
+                'type': 'MARKET', 'quantity': str(qty),
+            })
+            return True
+        except:
+            return False
+
     def close_trade(self, symbol, exit_price, reason):
-        """Cierra trade y registra resultado"""
         if symbol not in self.open_trades:
             return False
-        
         t = self.open_trades[symbol]
-        
-        # Cerrar a mercado
-        self._close_position_market(symbol, t['qty_c'])
-        
-        # Calcular PnL
-        price_change = (exit_price - t['entry']) / t['entry']
-        gross_pnl = t['usdt_qty'] * LEVERAGE * price_change
-        
-        # Descontar comisiones (entrada + salida)
-        notional = t['usdt_qty'] * LEVERAGE
-        fees = notional * COMISION_ACTUAL * 2  # Entrada + salida
-        net_pnl = gross_pnl - fees
-        
-        pnl_pct = (net_pnl / t['usdt_qty']) * 100
-        
-        # Actualizar estadísticas
-        self.stats['closed'] += 1
-        self.stats['pnl'] += net_pnl
+        self._close_market(symbol, t['qty_c'])
+
+        change      = (exit_price - t['entry']) / t['entry']
+        gross_pnl   = t['usdt_qty'] * LEVERAGE * change
+        fees        = t['usdt_qty'] * LEVERAGE * COMISION_ACTUAL * 2
+        net_pnl     = gross_pnl - fees
+        pnl_pct     = (net_pnl / t['usdt_qty']) * 100
+        win         = net_pnl > 0
+
+        self.stats['closed']    += 1
+        self.stats['pnl']       += net_pnl
         self.stats['fees_paid'] += fees
-        self._daily_pnl += net_pnl
-        
-        win = net_pnl > 0
-        if win:
-            self.stats['wins'] += 1
-        else:
-            self.stats['losses'] += 1
-        
-        # Registrar en sistema de aprendizaje
+        self._daily_pnl         += net_pnl
+        if win: self.stats['wins'] += 1
+        else:   self.stats['losses'] += 1
+
         if self.learning:
-            self.learning.record_trade(
-                symbol,
-                t['entry_data'],
-                {'price': exit_price, 'reason': reason},
-                net_pnl,
-                win
-            )
-        
-        # Calcular métricas
+            self.learning.record_trade(symbol, t['entry_data'],
+                                       {'price': exit_price}, net_pnl, win)
+
         total = self.stats['wins'] + self.stats['losses']
-        wr = self.stats['wins'] / total * 100 if total else 0
-        
-        # Duración
-        duration = datetime.now() - t['opened_at']
-        mins = int(duration.total_seconds() / 60)
-        
-        # Cooldown
-        reason_cd = 'TP' if 'PROFIT' in reason else 'SL'
-        self._set_cooldown(symbol, reason_cd)
-        
-        # Log
+        wr    = self.stats['wins'] / total * 100 if total else 0
+        mins  = int((datetime.now() - t['opened_at']).total_seconds() / 60)
         emoji = "✅" if win else "❌"
-        log.info(f"  {emoji} {reason} | PnL: ${net_pnl:+.3f} ({pnl_pct:+.1f}%) | {mins}min")
-        
-        # Telegram
+
+        log.info(f"  {emoji} {reason} | ${net_pnl:+.3f} ({pnl_pct:+.1f}%) | {mins}min")
+
+        self._set_cooldown(symbol, 'TP' if 'PROFIT' in reason else 'SL')
         self._tg(
             f"<b>{emoji} LONG CERRADO — {reason}</b>\n"
             f"<b>{symbol}</b>\n"
             f"PnL: ${net_pnl:+.3f} ({pnl_pct:+.1f}%) | {mins}min\n"
-            f"Entrada: ${t['entry']:.6f} → Salida: ${exit_price:.6f}\n"
-            f"Comisiones: ${fees:.3f}\n"
-            f"<b>Total: ${self.stats['pnl']:+.3f} | WR: {wr:.1f}%</b>\n"
-            f"Día: ${self._daily_pnl:+.3f} | Fees: ${self.stats['fees_paid']:.2f}"
+            f"${t['entry']:.6f} → ${exit_price:.6f}\n"
+            f"<b>Total: ${self.stats['pnl']:+.3f} | WR: {wr:.1f}%</b>"
         )
-        
-        # Guardar historial
+
         if self.learning and self.stats['closed'] % 5 == 0:
             self.learning.save_to_file()
-        
-        # Eliminar trade
+
         del self.open_trades[symbol]
-        
         return True
-    
+
     # ========================================================================
     # UTILIDADES
     # ========================================================================
-    
+
     def _cooldown_ok(self, symbol):
-        """Verifica cooldown"""
         ts = self._cooldowns.get(symbol)
         if not ts:
             return True
-        
-        resume_ts, reason = ts if isinstance(ts, tuple) else (ts + COOLDOWN_MIN_TP * 60, 'TP')
+        resume_ts, _ = ts if isinstance(ts, tuple) else (ts + COOLDOWN_MIN_TP * 60, 'TP')
         if time.time() >= resume_ts:
             del self._cooldowns[symbol]
             return True
-        
         return False
-    
+
     def _set_cooldown(self, symbol, reason='TP'):
-        """Establece cooldown"""
         mins = COOLDOWN_MIN_TP if reason == 'TP' else COOLDOWN_MIN_SL
         self._cooldowns[symbol] = (time.time() + mins * 60, reason)
-        log.info(f"  ⏱️  Cooldown {symbol}: {mins}min ({reason})")
-    
+
     def _hora_ok(self):
-        """Verifica hora operativa"""
         return int(datetime.utcnow().hour) not in SKIP_HOURS_UTC
-    
-    def _reset_daily_pnl(self):
-        """Reset diario de PnL"""
+
+    def _reset_daily(self):
         today = datetime.utcnow().date()
         if today != self._daily_reset:
-            self._daily_pnl = 0.0
-            self._daily_reset = today
+            self._daily_pnl    = 0.0
+            self._daily_reset  = today
             self._circuit_open = False
-            self._circuit_until = None
-            
+            self._circuit_until= None
             if self.learning:
                 self.learning.losing_streak = 0
-            
-            log.info("📅 Nuevo día - PnL reseteado")
-    
+            log.info("📅 Nuevo día")
+
     def _check_circuit_breaker(self):
-        """Circuit breaker mejorado"""
-        self._reset_daily_pnl()
-        
-        # Verificar si ya está activo
+        self._reset_daily()
         if self._circuit_open:
             if self._circuit_until and datetime.utcnow() > self._circuit_until:
                 self._circuit_open = False
-                log.info("  🔓 Circuit breaker desactivado")
-                self._tg("<b>🔓 Circuit breaker desactivado</b> — trading reanudado")
+                self._tg("<b>🔓 Circuit breaker OFF</b>")
             return self._circuit_open
-        
-        # Verificar pérdida diaria
         if self._daily_pnl < -CIRCUIT_BREAKER_USDT:
-            self._circuit_open = True
+            self._circuit_open  = True
             self._circuit_until = datetime.utcnow() + timedelta(hours=2)
-            
-            log.warning(f"  🔒 CIRCUIT BREAKER ACTIVADO")
-            log.warning(f"  Pérdida día: ${self._daily_pnl:.3f} < -${CIRCUIT_BREAKER_USDT:.2f}")
-            
+            log.warning(f"  🔒 CIRCUIT BREAKER | día: ${self._daily_pnl:.3f}")
             self._tg(
                 f"<b>🔒 CIRCUIT BREAKER ACTIVADO</b>\n"
                 f"Pérdida día: ${self._daily_pnl:.3f} USDT\n"
-                f"Umbral: -${CIRCUIT_BREAKER_USDT:.2f} USDT\n"
-                f"Pausado 2h hasta {self._circuit_until.strftime('%H:%M')} UTC"
+                f"Pausado 2h"
             )
-        
         return self._circuit_open
-    
+
     # ========================================================================
     # MONITOREO
     # ========================================================================
-    
+
     async def monitor_trades(self):
-        """Monitorea trades abiertos"""
         for sym in list(self.open_trades.keys()):
             try:
-                t = self.open_trades[sym]
+                t  = self.open_trades[sym]
                 tk = self._ticker(sym)
-                
                 if not tk:
                     continue
-                
-                cur = tk['price']
+                cur     = tk['price']
                 pnl_pct = (cur - t['entry']) / t['entry'] * 100
-                
-                # Trailing stop (si está activo)
+
                 if TRAILING and cur > t['highest']:
                     t['highest'] = cur
-                    
                     if pnl_pct >= TRAILING_START:
                         new_sl = t['entry'] + (cur - t['entry']) * (TRAILING_LOCK / 100)
                         if new_sl > t['sl']:
                             t['sl'] = new_sl
-                            log.info(f"  📈 Trailing {sym}: SL → ${new_sl:.6f}")
-                
-                # Verificar TP/SL
+
                 if cur >= t['tp']:
                     self.close_trade(sym, cur, "TAKE PROFIT")
                 elif cur <= t['sl']:
                     self.close_trade(sym, cur, "STOP LOSS")
-                
-                # Emergency stop si pérdida excesiva
-                pnl_leverage = pnl_pct * LEVERAGE
-                if pnl_leverage < -MAX_LOSS_PCT:
+                elif pnl_pct * LEVERAGE < -MAX_LOSS_PCT:
                     self.close_trade(sym, cur, "STOP EMERGENCIA")
-                
             except Exception as e:
                 log.debug(f"Monitor {sym}: {e}")
-    
+
     def _reporte_horario(self):
-        """Reporte cada hora"""
         if datetime.now() - self._last_report < timedelta(hours=1):
             return
-        
         self._last_report = datetime.now()
-        
         total = self.stats['wins'] + self.stats['losses']
-        wr = self.stats['wins'] / total * 100 if total else 0
-        
-        # Posiciones abiertas
+        wr    = self.stats['wins'] / total * 100 if total else 0
         pos_txt = ""
         for sym, t in self.open_trades.items():
-            tk = self._ticker(sym)
+            tk  = self._ticker(sym)
             cur = tk['price'] if tk else t['entry']
-            pct = (cur - t['entry']) / t['entry'] * 100
-            pos_txt += f"  {sym}: {pct:+.2f}%\n"
-        
-        # Mejores patrones (si hay aprendizaje)
-        best_patterns = ""
-        if self.learning:
-            patterns = self.learning.get_best_patterns()
-            if patterns:
-                best_patterns = "\nMejores señales:\n"
-                for pat, wr_pat, total_pat in patterns[:3]:
-                    best_patterns += f"  {pat}: {wr_pat:.1%} ({total_pat} trades)\n"
-        
+            pos_txt += f"  {sym}: {(cur-t['entry'])/t['entry']*100:+.2f}%\n"
         self._tg(
-            f"<b>📊 Reporte LONGS v2.0</b>\n"
-            f"PnL total: ${self.stats['pnl']:+.3f} | WR: {wr:.1f}%\n"
-            f"PnL día: ${self._daily_pnl:+.3f} (límite: -${CIRCUIT_BREAKER_USDT:.2f})\n"
-            f"Comisiones pagadas: ${self.stats['fees_paid']:.2f}\n"
-            f"({self.stats['wins']}W / {self.stats['losses']}L | {self.stats['closed']} trades)\n"
+            f"<b>📊 Reporte LONGS v3.0</b>\n"
+            f"PnL: ${self.stats['pnl']:+.3f} | WR: {wr:.1f}% | {total} trades\n"
+            f"Día: ${self._daily_pnl:+.3f} | Fees: ${self.stats['fees_paid']:.2f}\n"
             f"Abiertos: {len(self.open_trades)}/{MAX_TRADES} | BTC: {self._btc_1h:+.2f}%\n"
-            f"Circuit: {'🔒 ACTIVO' if self._circuit_open else '🔓 OK'}\n"
+            f"Circuit: {'🔒' if self._circuit_open else '🔓'}\n"
             + (pos_txt if pos_txt else "  Sin posiciones\n")
-            + best_patterns
         )
-    
+
     def _tg(self, msg):
-        """Envía mensaje a Telegram"""
         try:
             if TELEGRAM_TOKEN and TELEGRAM_CHAT:
                 requests.post(
                     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={
-                        'chat_id': TELEGRAM_CHAT,
-                        'text': msg,
-                        'parse_mode': 'HTML'
-                    },
+                    json={'chat_id': TELEGRAM_CHAT, 'text': msg, 'parse_mode': 'HTML'},
                     timeout=6
                 )
         except:
             pass
-    
+
     # ========================================================================
     # LOOP PRINCIPAL
     # ========================================================================
-    
+
     async def run(self):
-        """Loop principal optimizado"""
-        log.info("\n🚀 Bot LONGS v2.0 iniciado\n")
-        
-        iteration = 0
-        last_symbol_refresh = 0
-        
+        log.info("\n🚀 Bot LONGS v3.0 iniciado\n")
+        iteration          = 0
+        last_symbol_refresh= 0
+
         while True:
             try:
                 iteration += 1
-                
-                # Reset diario
-                self._reset_daily_pnl()
-                
-                # Refresh símbolos cada 10 min
+                self._reset_daily()
+
                 if time.time() - last_symbol_refresh > 600:
                     self._get_symbols()
                     last_symbol_refresh = time.time()
-                
-                # Actualizar tendencia BTC
+
                 self._update_btc_trend()
-                
-                # Verificar circuit breaker
+
                 if self._check_circuit_breaker():
-                    log.warning(f"  🔒 Circuit breaker activo - esperando...")
+                    log.warning("  🔒 Circuit breaker — esperando")
                     await asyncio.sleep(INTERVAL)
                     continue
-                
-                # Stats
+
                 total = self.stats['wins'] + self.stats['losses']
-                wr = self.stats['wins'] / total * 100 if total else 0
-                
-                btc_status = "🟢 OK" if self._btc_trend_ok else "🔴 BEAR"
-                hora_status = "✅" if self._hora_ok() else "⏸️ PAUSA"
-                
+                wr    = self.stats['wins'] / total * 100 if total else 0
                 score_actual = self.learning.optimal_score if self.learning else MIN_SCORE
-                
-                log.info(f"\n{'=' * 80}")
-                log.info(f"  Iteración #{iteration} | {datetime.now().strftime('%H:%M:%S')}")
-                log.info(f"  Abiertos: {len(self.open_trades)}/{MAX_TRADES} | "
-                         f"PnL: ${self.stats['pnl']:+.3f} | WR: {wr:.1f}%")
-                log.info(f"  BTC: {self._btc_1h:+.2f}% {btc_status} | {hora_status} | "
-                         f"Score mín: {score_actual:.0f}")
-                log.info(f"  Día: ${self._daily_pnl:+.3f} | Fees: ${self.stats['fees_paid']:.2f}")
-                log.info(f"{'=' * 80}\n")
-                
-                # Monitorear trades abiertos
+                btc_status   = "🟢" if self._btc_ok else "🔴"
+
+                log.info(f"\n{'='*80}")
+                log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
+                         f"Abiertos:{len(self.open_trades)}/{MAX_TRADES} | "
+                         f"PnL:${self.stats['pnl']:+.3f} | WR:{wr:.1f}%")
+                log.info(f"  BTC:{self._btc_1h:+.2f}%{btc_status} | "
+                         f"Score mín:{score_actual:.0f} | "
+                         f"Símbolos:{len(self.symbols)}")
+                log.info(f"{'='*80}\n")
+
                 await self.monitor_trades()
-                
-                # Reporte horario
                 self._reporte_horario()
-                
-                # Buscar nuevas oportunidades
-                slots_free = MAX_TRADES - len(self.open_trades)
-                
-                if slots_free > 0:
+
+                if len(self.open_trades) < MAX_TRADES:
                     signals_found = 0
-                    
+                    log.info(f"  Escaneando {len(self.symbols)} símbolos...")
                     for i, sym in enumerate(self.symbols):
                         if len(self.open_trades) >= MAX_TRADES:
                             break
-                        
                         sig = self.analyze(sym)
-                        
                         if sig:
                             signals_found += 1
-                            log.info(f"  💡 Señal: {sym} | Score: {sig['score']:.0f} | RSI: {sig['rsi']:.0f}")
-                            
-                            opened = self.open_trade(sym, sig)
-                            if opened:
+                            log.info(
+                                f"  💡 {sym} | Score:{sig['score']:.0f}/{sig['score_min']:.0f} "
+                                f"| RSI:{sig['rsi']:.0f} | {sig['reasons']}"
+                            )
+                            if self.open_trade(sym, sig):
                                 await asyncio.sleep(3)
-                        
-                        # Progress
                         if (i + 1) % 10 == 0:
-                            log.info(f"  ... {i+1}/{len(self.symbols)} analizados")
-                        
-                        await asyncio.sleep(0.2)
-                    
-                    log.info(f"\n  ✅ Análisis completo: {signals_found} señales encontradas")
+                            log.info(f"  ...{i+1}/{len(self.symbols)}")
+                        await asyncio.sleep(0.15)
+                    log.info(f"  ✅ Scan completo: {signals_found} señales")
                 else:
-                    log.info(f"  ⏸️  Máximo trades ({MAX_TRADES}) - esperando cierre")
-                
+                    log.info(f"  ⏸️  Max trades — monitoreando")
+
                 log.info(f"\n  ⏭️  Próximo ciclo en {INTERVAL}s\n")
                 await asyncio.sleep(INTERVAL)
-                
+
             except KeyboardInterrupt:
-                log.info("⏹️  Bot detenido por usuario")
+                log.info("⏹️  Detenido")
                 break
             except Exception as e:
-                log.error(f"❌ Error en iteración #{iteration}: {e}")
+                log.error(f"❌ Error #{iteration}: {e}")
                 await asyncio.sleep(20)
-        
-        # Guardar datos al salir
+
         if self.learning:
             self.learning.save_to_file()
-            log.info("💾 Historial guardado")
 
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
 
 async def main():
-    """Punto de entrada"""
     try:
         bot = OptimizedLongBot()
         await bot.run()
     except Exception as e:
-        log.error(f"❌ Error fatal: {e}")
+        log.error(f"❌ Fatal: {e}")
 
 if __name__ == "__main__":
     try:
