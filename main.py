@@ -1,25 +1,10 @@
 #!/usr/bin/env python3
 """
-BOT LONGS v5.0 — Estrategia VWAP Breakout + Retest + EMA25
-Basado en la estrategia de Whale Analytics:
-  - VWAP institucional como nivel clave
-  - Setup: Ruptura del VWAP + Retesteo = entrada de alta probabilidad
-  - EMA25 para gestionar salidas
-  - 1H para confirmar tendencia antes de entrar en 5M
-  - No operar si VWAP está plano (mercado lateral)
-  - Regla del 1% en gestión de riesgo
-
-MEJORAS vs v4.0:
-  NEW-1  Estrategia VWAP Breakout + Retest (señal principal)
-  NEW-2  EMA25 como salida dinámica (cierra cuando precio cruza EMA25 a la baja)
-  NEW-3  Detección VWAP plano: no operar en rangos
-  NEW-4  Confirmación 1H alcista antes de entrar en 5M
-  NEW-5  Score system simplificado y centrado en el setup VWAP
-  NEW-6  Modo agresivo/conservador según volatilidad del mercado
-  FIX-01 Circuit breaker: reset correcto sin bucle infinito
-  FIX-02 LTV protection automática
-  FIX-03 set_leverage sin BOTH (error 109400)
-  FIX-04 Detección automática hedge/oneway
+BOT LONGS v5.1 — VWAP Breakout + Retest + EMA25
+FIX-HEDGE-01: Previene abrir LONG si ya existe SHORT en el mismo símbolo
+FIX-HEDGE-02: _recover() cierra SHORTs huérfanos automáticamente
+FIX-HEDGE-03: Verificación en exchange antes de abrir cualquier posición
+FIX-HEDGE-04: _order() SELL/reduce nunca abre SHORT accidentalmente
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
@@ -49,7 +34,7 @@ TG_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
 # ── Capital ────────────────────────────────────────────────────────────────
 AUTO       = clean('AUTO_TRADING_ENABLED', 'true', 'bool')
-POS_SIZE   = clean('MAX_POSITION_SIZE',    '10',   'float')  # USDT por trade
+POS_SIZE   = clean('MAX_POSITION_SIZE',    '10',   'float')
 MIN_TRADE  = clean('MIN_TRADE_USDT',       '10',   'float')
 _lev       = clean('LEVERAGE',             '2',    'int')
 LEVERAGE   = min(_lev, 3)
@@ -60,7 +45,7 @@ TP_MIN     = clean('TAKE_PROFIT_PCT',      '4.0',  'float')
 SL_MAX     = clean('STOP_LOSS_PCT',        '2.0',  'float')
 ATR_TP_M   = clean('ATR_TP_MULT',          '2.5',  'float')
 ATR_SL_M   = clean('ATR_SL_MULT',          '1.1',  'float')
-USE_EMA25_EXIT = clean('EMA25_EXIT',       'true', 'bool')  # NEW-2
+USE_EMA25_EXIT = clean('EMA25_EXIT',       'true', 'bool')
 
 # ── Filtros ────────────────────────────────────────────────────────────────
 MIN_VOL    = clean('MIN_VOLUME_24H',       '500000','float')
@@ -68,11 +53,11 @@ MAX_SYMS   = clean('MAX_SYMBOLS',          '60',   'int')
 MIN_SCORE  = clean('MIN_SCORE',            '55',   'float')
 BTC_BLOCK  = clean('BTC_BEAR_BLOCK_PCT',   '2.0',  'float')
 
-# ── VWAP params (NEW) ──────────────────────────────────────────────────────
-VWAP_FLAT_PCT    = clean('VWAP_FLAT_PCT',     '0.15', 'float') # VWAP plano si rango < 0.15%
-VWAP_BREAK_PCT   = clean('VWAP_BREAK_PCT',    '0.10', 'float') # ruptura > 0.10% sobre VWAP
-VWAP_RETEST_PCT  = clean('VWAP_RETEST_PCT',   '0.25', 'float') # retest: vuelve a <0.25% del VWAP
-VWAP_CANDLES     = clean('VWAP_CANDLES',      '50',   'int')   # velas para calcular VWAP
+# ── VWAP params ────────────────────────────────────────────────────────────
+VWAP_FLAT_PCT    = clean('VWAP_FLAT_PCT',     '0.15', 'float')
+VWAP_BREAK_PCT   = clean('VWAP_BREAK_PCT',    '0.10', 'float')
+VWAP_RETEST_PCT  = clean('VWAP_RETEST_PCT',   '0.25', 'float')
+VWAP_CANDLES     = clean('VWAP_CANDLES',      '50',   'int')
 
 # ── Circuit breaker ────────────────────────────────────────────────────────
 CB_USDT    = clean('CIRCUIT_BREAKER_USDT', '3.0',  'float')
@@ -164,7 +149,6 @@ def atr_calc(h, l, c, n=14):
     return sum(trs) / len(trs) if trs else 0
 
 def calc_vwap(closes, highs, lows, volumes, n=None):
-    """VWAP = Σ(típico × volumen) / Σvolumen"""
     n = n or len(closes)
     c = closes[-n:]; h = highs[-n:]; l = lows[-n:]; v = volumes[-n:]
     typical = [(h[i] + l[i] + c[i]) / 3 for i in range(len(c))]
@@ -173,7 +157,6 @@ def calc_vwap(closes, highs, lows, volumes, n=None):
     return tp_vol / vol_sum if vol_sum > 0 else c[-1]
 
 def vwap_slope(closes, highs, lows, volumes, n=20):
-    """Pendiente del VWAP en las últimas n velas — detecta si está plano."""
     if len(closes) < n * 2:
         return 0.0
     vwap_now  = calc_vwap(closes, highs, lows, volumes, n)
@@ -181,38 +164,22 @@ def vwap_slope(closes, highs, lows, volumes, n=20):
     return (vwap_now - vwap_prev) / vwap_prev * 100 if vwap_prev > 0 else 0.0
 
 def detect_vwap_setup(closes, highs, lows, volumes, opens):
-    """
-    NEW-1: Detecta el setup VWAP Breakout + Retest
-    
-    Condiciones:
-    1. VWAP NO está plano (hay tendencia)
-    2. Hace N velas hubo una ruptura alcista del VWAP
-    3. El precio retestó el VWAP (bajó a tocarlo o casi)
-    4. Ahora el precio está rebotando por encima del VWAP
-    
-    Retorna: (setup_detected, vwap_value, setup_quality 0-100)
-    """
     if len(closes) < VWAP_CANDLES + 10:
         return False, 0, 0
 
     vwap_val = calc_vwap(closes, highs, lows, volumes, VWAP_CANDLES)
     price    = closes[-1]
 
-    # 1. Verificar que el VWAP NO está plano (NEW-3)
     slope = vwap_slope(closes, highs, lows, volumes, 20)
     if abs(slope) < VWAP_FLAT_PCT:
-        return False, vwap_val, 0  # VWAP plano = no operar
-
-    # El VWAP debe tener pendiente alcista para longs
+        return False, vwap_val, 0
     if slope < 0:
         return False, vwap_val, 0
 
-    # 2. Precio actual por encima del VWAP (confirmación alcista)
     pct_above = (price - vwap_val) / vwap_val * 100
     if pct_above < 0:
         return False, vwap_val, 0
 
-    # 3. Buscar patrón: ruptura + retest en las últimas 15 velas
     window = min(15, len(closes) - 5)
     broke_above  = False
     retested     = False
@@ -221,23 +188,19 @@ def detect_vwap_setup(closes, highs, lows, volumes, opens):
     for i in range(-window, -1):
         c_i = closes[i]
         l_i = lows[i]
-        h_i = highs[i]
         o_i = opens[i] if opens else c_i
 
-        # Ruptura: vela que cerró claramente por encima del VWAP
         if not broke_above:
             if c_i > vwap_val * (1 + VWAP_BREAK_PCT / 100):
                 broke_above = True
             continue
 
-        # Retest: después de romper, volvió cerca del VWAP
         if broke_above and not retested:
             touch_pct = abs(l_i - vwap_val) / vwap_val * 100
             if touch_pct < VWAP_RETEST_PCT:
                 retested = True
             continue
 
-        # Rebote: tras retest, vela verde cerrando por encima
         if broke_above and retested:
             if c_i > o_i and c_i > vwap_val:
                 now_bouncing = True
@@ -246,11 +209,10 @@ def detect_vwap_setup(closes, highs, lows, volumes, opens):
     if not (broke_above and retested and now_bouncing):
         return False, vwap_val, 0
 
-    # Calidad del setup (0-100)
     quality = 60
-    if slope > 0.3:    quality += 15   # VWAP con buena pendiente
-    if pct_above < 0.5: quality += 15  # Recién rebotó (no se fue lejos)
-    if slope > 0.6:    quality += 10   # Tendencia fuerte
+    if slope > 0.3:    quality += 15
+    if pct_above < 0.5: quality += 15
+    if slope > 0.6:    quality += 10
 
     return True, vwap_val, min(quality, 100)
 
@@ -320,7 +282,7 @@ class Learning:
         except: pass
 
 # ============================================================================
-# BOT PRINCIPAL v5.0
+# BOT PRINCIPAL v5.1
 # ============================================================================
 
 class LongBot:
@@ -328,16 +290,16 @@ class LongBot:
 
     def __init__(self):
         log.info("=" * 72)
-        log.info("  BOT LONGS v5.0 — VWAP Breakout + Retest + EMA25")
+        log.info("  BOT LONGS v5.1 — VWAP Breakout + Retest + EMA25")
         log.info(f"  Capital: ${POS_SIZE}x{LEVERAGE} | TP≥{TP_MIN}% SL≤{SL_MAX}%")
         log.info(f"  Score mín: {MIN_SCORE} | Símbolos: {MAX_SYMS} | Max: {MAX_TRADES} trades")
         log.info(f"  VWAP flat threshold: {VWAP_FLAT_PCT}% | Break: {VWAP_BREAK_PCT}%")
         log.info(f"  EMA25 exit: {'ON' if USE_EMA25_EXIT else 'OFF'}")
-        log.info(f"  Circuit breaker: -${CB_USDT}/día")
+        log.info(f"  FIX-HEDGE: Prevención doble dirección ON ✅")
         log.info("=" * 72)
 
         self.symbols       = []
-        self.trades        = {}
+        self.trades        = {}          # sym → trade_dict (solo LONGs)
         self._contracts    = {}
         self._cooldowns    = {}
         self._last_report  = datetime.now() - timedelta(hours=3)
@@ -359,14 +321,14 @@ class LongBot:
         self._detect_mode()
         self._load_contracts()
         self._refresh_symbols()
-        self._recover()
+        self._recover()                  # FIX-HEDGE-02 integrado aquí
 
         self._tg(
-            f"<b>🤖 Bot LONGS v5.0 — VWAP Strategy</b>\n"
+            f"<b>🤖 Bot LONGS v5.1 — VWAP Strategy</b>\n"
             f"Capital: ${POS_SIZE}x{LEVERAGE} | TP≥{TP_MIN}% SL≤{SL_MAX}%\n"
             f"Símbolos: {len(self.symbols)} | Max: {MAX_TRADES} trades\n"
             f"Setup: VWAP Breakout + Retest + EMA25\n"
-            f"Circuit breaker: -${CB_USDT}/día\n"
+            f"✅ Fix: sin doble dirección por símbolo\n"
             f"Posiciones recuperadas: {len(self.trades)}"
         )
 
@@ -437,33 +399,118 @@ class LongBot:
         self.symbols = [x['sym'] for x in items[:MAX_SYMS]]
         log.info(f"  Símbolos: {len(self.symbols)} (vol>${MIN_VOL/1e6:.1f}M)")
 
-    def _recover(self):
-        if not AUTO: return
-        d = api('GET', '/openApi/swap/v2/user/positions', {})
-        n = 0
+    # ════════════════════════════════════════════════════════════════
+    # FIX-HEDGE-01: Consulta posiciones reales en el exchange
+    # ════════════════════════════════════════════════════════════════
+
+    def _get_exchange_positions(self, symbol=None):
+        """
+        Devuelve dict: { sym: {'long': qty, 'short': qty} }
+        Si symbol es None, consulta todas las posiciones abiertas.
+        """
+        params = {}
+        if symbol:
+            params['symbol'] = symbol
+        d = api('GET', '/openApi/swap/v2/user/positions', params)
+        result = defaultdict(lambda: {'long': 0.0, 'short': 0.0})
         for p in (d.get('data') or []):
             try:
                 amt  = float(p.get('positionAmt', 0) or 0)
+                sym  = p.get('symbol', '')
                 side = str(p.get('positionSide', '')).upper()
-                is_long = (side == 'LONG' and abs(amt) > 0) or (side == 'BOTH' and amt > 0)
-                if not is_long: continue
-                sym = p.get('symbol', '')
-                if not sym or sym in self.trades: continue
-                entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
-                if entry <= 0: continue
+                if not sym or abs(amt) == 0:
+                    continue
+                if side == 'LONG' or (side == 'BOTH' and amt > 0):
+                    result[sym]['long'] = abs(amt)
+                elif side == 'SHORT' or (side == 'BOTH' and amt < 0):
+                    result[sym]['short'] = abs(amt)
+            except:
+                continue
+        return result
+
+    def _has_open_position(self, symbol, direction='long') -> bool:
+        """
+        FIX-HEDGE-01: Verifica en tiempo real si hay posición abierta
+        en la dirección indicada para este símbolo.
+        """
+        positions = self._get_exchange_positions(symbol)
+        qty = positions[symbol].get(direction, 0.0)
+        return qty > 0
+
+    def _has_any_position(self, symbol) -> bool:
+        """Retorna True si hay CUALQUIER posición abierta (long o short) en el símbolo."""
+        positions = self._get_exchange_positions(symbol)
+        return positions[symbol]['long'] > 0 or positions[symbol]['short'] > 0
+
+    # ════════════════════════════════════════════════════════════════
+    # FIX-HEDGE-02: _recover() cierra SHORTs huérfanos
+    # ════════════════════════════════════════════════════════════════
+
+    def _recover(self):
+        if not AUTO: return
+        all_positions = self._get_exchange_positions()
+        n_recovered = 0
+        n_closed_short = 0
+
+        for sym, sides in all_positions.items():
+            long_qty  = sides['long']
+            short_qty = sides['short']
+
+            # ── Cerrar SHORTs huérfanos (el bot solo opera longs) ──
+            if short_qty > 0:
+                log.warning(f"  ⚠️  SHORT huérfano detectado: {sym} qty={short_qty:.4f} → cerrando")
+                d = self._order_close_short(sym, short_qty)
+                if d.get('code') == 0:
+                    log.info(f"  ✅ SHORT cerrado: {sym}")
+                    n_closed_short += 1
+                    self._tg(f"<b>🔧 SHORT huérfano cerrado</b>\n{sym} | qty: {short_qty:.4f}\n(El bot solo opera LONGs)")
+                else:
+                    log.error(f"  ❌ No se pudo cerrar SHORT {sym}: {d.get('msg')}")
+                time.sleep(0.5)
+
+            # ── Recuperar LONGs abiertos ───────────────────────────
+            if long_qty > 0 and sym not in self.trades:
+                # Obtener precio de entrada
+                d = api('GET', '/openApi/swap/v2/user/positions', {'symbol': sym})
+                entry = 0.0
+                for p in (d.get('data') or []):
+                    side = str(p.get('positionSide', '')).upper()
+                    amt  = float(p.get('positionAmt', 0) or 0)
+                    if (side == 'LONG' and abs(amt) > 0) or (side == 'BOTH' and amt > 0):
+                        entry = float(p.get('avgPrice') or p.get('entryPrice') or 0)
+                        break
+
+                if entry <= 0:
+                    continue
+
                 self.trades[sym] = {
-                    'entry': entry, 'qty': abs(amt), 'usdt': POS_SIZE,
+                    'entry': entry, 'qty': long_qty, 'usdt': POS_SIZE,
                     'tp': entry * (1 + TP_MIN/100),
                     'sl': entry * (1 - SL_MAX/100),
                     'tp_pct': TP_MIN, 'sl_pct': SL_MAX,
                     'highest': entry, 'opened': datetime.now(),
-                    'score': 0, 'pos_side': side,
+                    'score': 0, 'pos_side': 'LONG',
                     'ema25': entry,
+                    'vwap': entry,
                 }
-                n += 1
-                log.info(f"  ♻️  {sym} @ ${entry:.6f}")
-            except: continue
-        log.info(f"  Recuperadas: {n} posiciones")
+                n_recovered += 1
+                log.info(f"  ♻️  LONG recuperado: {sym} @ ${entry:.6f}")
+
+        log.info(f"  Recuperadas: {n_recovered} posiciones LONG | SHORTs cerrados: {n_closed_short}")
+
+    def _order_close_short(self, sym, qty):
+        """Cierra una posición SHORT (compra de cobertura)."""
+        params = {
+            'symbol':   sym,
+            'side':     'BUY',
+            'type':     'MARKET',
+            'quantity': str(qty),
+        }
+        if self._mode == 'hedge':
+            params['positionSide'] = 'SHORT'
+        else:
+            params['reduceOnly'] = 'true'
+        return api('POST', '/openApi/swap/v2/trade/order', params)
 
     # ════════════════════════════════════════════════════════════════
     # MERCADO
@@ -516,7 +563,7 @@ class LongBot:
         except: pass
 
     # ════════════════════════════════════════════════════════════════
-    # ANÁLISIS v5.0 — VWAP STRATEGY
+    # ANÁLISIS v5.1
     # ════════════════════════════════════════════════════════════════
 
     def analyze(self, symbol):
@@ -526,11 +573,9 @@ class LongBot:
         if not self._btc_ok: return None
         if self._cb_active: return None
 
-        # ── Datos 5M (señal) ────────────────────────────────────
         c5, h5, l5, v5, o5 = self._klines(symbol, '5m', 120)
         if not c5 or len(c5) < 60: return None
 
-        # ── Datos 1H (contexto NEW-4) ────────────────────────────
         c1h, h1h, l1h, v1h, o1h = self._klines(symbol, '1h', 50)
 
         tk = self._ticker(symbol)
@@ -539,11 +584,9 @@ class LongBot:
         price     = tk['price']
         change_24 = tk['change']
 
-        # ── VWAP Setup (NEW-1) ───────────────────────────────────
         vwap_setup, vwap_val, vwap_quality = detect_vwap_setup(c5, h5, l5, v5, o5)
 
-        # ── Indicadores complementarios ──────────────────────────
-        e25   = ema(c5, 25)   # EMA25 — salida profesional
+        e25   = ema(c5, 25)
         e9    = ema(c5, 9)
         e21   = ema(c5, 21)
         rsi_v = rsi(c5, 14)
@@ -553,7 +596,6 @@ class LongBot:
         vol_avg = sum(v5[-6:-1]) / 5 if len(v5) >= 6 else 1
         vol_ratio = v5[-1] / vol_avg if vol_avg > 0 else 1
 
-        # Contexto 1H (NEW-4)
         trend_1h = 0
         rsi_1h   = 50.0
         vwap_1h  = 0.0
@@ -567,61 +609,38 @@ class LongBot:
             elif e9_1h < e21_1h:
                 trend_1h = -1
 
-        # ── FILTROS OBLIGATORIOS ─────────────────────────────────
-
-        # 1. Tendencia 1H NO bajista fuerte (NEW-4)
-        if trend_1h == -1 and rsi_v > 50:
-            return None
-
-        # 2. Volatilidad mínima
-        if atr_pct < 0.15:
-            return None
-
-        # 3. RSI no sobrecomprado
+        if trend_1h == -1 and rsi_v > 50: return None
+        if atr_pct < 0.15: return None
         rsi_limit = 72 if trend_1h == 1 else 65
-        if rsi_v > rsi_limit:
-            return None
+        if rsi_v > rsi_limit: return None
+        if change_24 > 15.0: return None
+        if price < e25 * 0.995: return None
 
-        # 4. Sin pumps extremos
-        if change_24 > 15.0:
-            return None
-
-        # 5. Precio sobre EMA25 (tendencia intacta)
-        if price < e25 * 0.995:
-            return None
-
-        # ── SCORING v5 ────────────────────────────────────────────
         score   = 0
         reasons = []
 
-        # VWAP Setup (0-50) — señal principal NEW-1
         if vwap_setup:
-            score += vwap_quality // 2  # 0-50 puntos
+            score += vwap_quality // 2
             reasons.append(f"VWAP_Setup({vwap_quality:.0f}%)")
         else:
-            # Sin setup VWAP, requerir más confirmaciones
             score -= 20
             reasons.append("NoVWAP(-20)")
 
-        # Precio sobre VWAP y EMA25 (0-15)
         if price > vwap_val and price > e25:
             score += 15; reasons.append("PriceOK(15)")
         elif price > vwap_val:
             score += 8;  reasons.append("OverVWAP(8)")
 
-        # Contexto 1H NEW-4 (0-20)
         if trend_1h == 1:
             score += 20; reasons.append("1H↑(20)")
         elif trend_1h == -1:
             score -= 10; reasons.append("1H↓(-10)")
 
-        # EMA alineación 5M (0-15)
         if e9 > e21 > e25:
             score += 15; reasons.append("EMA↑(15)")
         elif e9 > e21:
             score += 8;  reasons.append("EMA~(8)")
 
-        # RSI (0-20)
         if rsi_v < 30:
             score += 20; reasons.append(f"RSI{rsi_v:.0f}(20)")
         elif rsi_v < 40:
@@ -629,40 +648,33 @@ class LongBot:
         elif rsi_v < 50:
             score += 7;  reasons.append(f"RSI{rsi_v:.0f}(7)")
 
-        # Volumen en la ruptura (0-12)
         if vol_ratio >= 2.0:
             score += 12; reasons.append(f"Vol{vol_ratio:.1f}x(12)")
         elif vol_ratio >= 1.4:
             score += 7;  reasons.append(f"Vol{vol_ratio:.1f}x(7)")
 
-        # BTC alcista (0-8)
         if self._btc_1h > 1.0:
             score += 8; reasons.append(f"BTC+{self._btc_1h:.1f}%(8)")
         elif self._btc_1h > 0.3:
             score += 4; reasons.append(f"BTC+{self._btc_1h:.1f}%(4)")
 
-        # Caída 24h = oportunidad rebote (0-10)
         if change_24 < -5:
             score += 10; reasons.append(f"Drop{change_24:.0f}%(10)")
         elif change_24 < -2:
             score += 5;  reasons.append(f"Drop{change_24:.0f}%(5)")
 
-        # RSI 1H sobrevendido = doble oportunidad (10)
         if rsi_1h < 40:
             score += 10; reasons.append(f"RSI1H{rsi_1h:.0f}(10)")
 
-        # ATR suficiente (0-8)
         if atr_pct > 1.5:
             score += 8; reasons.append(f"ATR{atr_pct:.1f}%(8)")
         elif atr_pct > 0.6:
             score += 4; reasons.append(f"ATR{atr_pct:.1f}%(4)")
 
-        # ── TP/SL dinámicos basados en ATR ──────────────────────
         sl_dyn = max(SL_MAX, atr_pct * ATR_SL_M)
         sl_dyn = min(sl_dyn, SL_MAX * 2.0)
         tp_dyn = max(TP_MIN, sl_dyn * 2.2, TP_MIN_FEE, atr_pct * ATR_TP_M)
 
-        # ── Aprendizaje ──────────────────────────────────────────
         ok, reason = self.learn.ok(symbol, score)
         if not ok: return None
 
@@ -687,7 +699,6 @@ class LongBot:
     # ════════════════════════════════════════════════════════════════
 
     def _set_lev(self, symbol):
-        """FIX-03: solo LONG/SHORT."""
         for side in ('LONG', 'SHORT'):
             try:
                 api('POST', '/openApi/swap/v2/trade/leverage',
@@ -714,16 +725,24 @@ class LongBot:
 
     def _order(self, sym, side, qty, otype='MARKET',
                price=None, stop_price=None, reduce=False):
+        """
+        FIX-HEDGE-04: Las órdenes SELL de cierre SIEMPRE usan positionSide=LONG
+        en modo hedge, nunca SHORT. Esto previene abrir posiciones inversas
+        accidentalmente con una orden de cierre.
+        """
         params = {'symbol': sym, 'side': side.upper(),
                   'type': otype, 'quantity': str(qty)}
         if self._mode == 'hedge':
-            params['positionSide'] = 'LONG' if side.upper()=='BUY' else 'SHORT'
+            # BUY abre LONG, SELL cierra LONG — nunca tocar positionSide=SHORT desde aquí
+            params['positionSide'] = 'LONG'
+        else:
+            # One-way: reduceOnly para no abrir posición inversa
+            if reduce or side.upper() == 'SELL':
+                params['reduceOnly'] = 'true'
         if price:
             params['price'] = str(round(price, 8)); params['timeInForce'] = 'GTC'
         if stop_price:
             params['stopPrice'] = str(round(stop_price, 8))
-        if reduce and self._mode != 'hedge':
-            params['reduceOnly'] = 'true'
         return api('POST', '/openApi/swap/v2/trade/order', params)
 
     def _wait_fill(self, sym, oid, timeout=35):
@@ -761,17 +780,14 @@ class LongBot:
 
     def _place_tp_sl(self, sym, qty, tp, sl):
         tp_ok = sl_ok = False
-        d = self._order(sym, 'SELL', qty, 'TAKE_PROFIT_MARKET',
-                        stop_price=tp, reduce=True)
+        d = self._order(sym, 'SELL', qty, 'TAKE_PROFIT_MARKET', stop_price=tp)
         tp_ok = d.get('code') == 0
         log.info(f"  {'✅' if tp_ok else '❌'} TP @ ${tp:.6f}")
         time.sleep(0.3)
-        d = self._order(sym, 'SELL', qty, 'STOP_MARKET',
-                        stop_price=sl, reduce=True)
+        d = self._order(sym, 'SELL', qty, 'STOP_MARKET', stop_price=sl)
         sl_ok = d.get('code') == 0
         if not sl_ok:
-            d = self._order(sym, 'SELL', qty, 'STOP',
-                            price=sl*0.999, stop_price=sl, reduce=True)
+            d = self._order(sym, 'SELL', qty, 'STOP', price=sl*0.999, stop_price=sl)
             sl_ok = d.get('code') == 0
         log.info(f"  {'✅' if sl_ok else '❌'} SL @ ${sl:.6f}")
         return tp_ok, sl_ok
@@ -779,6 +795,12 @@ class LongBot:
     def open_trade(self, sym, sig):
         if not AUTO or sym in self.trades: return False
         if LongBot._opening or len(self.trades) >= MAX_TRADES: return False
+
+        # ── FIX-HEDGE-01: Verificar en el exchange antes de abrir ──
+        if self._has_any_position(sym):
+            log.warning(f"  ⛔ {sym} ya tiene posición en el exchange (long o short) — omitiendo")
+            return False
+
         LongBot._opening = True
         try:
             return self._open(sym, sig)
@@ -825,7 +847,7 @@ class LongBot:
             time.sleep(2); _, sl_ok = self._place_tp_sl(sym, filled_qty, tp, sl)
         if not sl_ok:
             log.error("  ❌ SL crítico — cerrando")
-            self._order(sym, 'SELL', filled_qty, 'MARKET', reduce=True)
+            self._order(sym, 'SELL', filled_qty, 'MARKET')
             return False
 
         self.trades[sym] = {
@@ -856,7 +878,7 @@ class LongBot:
     def close_trade(self, sym, exit_price, reason):
         if sym not in self.trades: return False
         t = self.trades[sym]
-        self._order(sym, 'SELL', t['qty'], 'MARKET', reduce=True)
+        self._order(sym, 'SELL', t['qty'], 'MARKET')
 
         chg   = (exit_price - t['entry']) / t['entry']
         gross = t['usdt'] * LEVERAGE * chg
@@ -905,18 +927,15 @@ class LongBot:
                 cur = tk['price']
                 pct = (cur - t['entry']) / t['entry'] * 100
 
-                # Actualizar EMA25 dinámicamente
                 c5, h5, l5, v5, o5 = self._klines(sym, '5m', 30)
                 if c5:
                     t['ema25'] = ema(c5, 25)
 
-                # NEW-2: Salida por EMA25
                 if USE_EMA25_EXIT and pct > 0.5:
                     if cur < t['ema25'] and c5 and c5[-1] < t['ema25']:
                         self.close_trade(sym, cur, "EMA25 CRUCE")
                         continue
 
-                # Trailing stop
                 if cur > t['highest']:
                     t['highest'] = cur
                     if pct >= 2.5:
@@ -954,18 +973,17 @@ class LongBot:
         if today != self._daily_date:
             self._daily_pnl  = 0.0
             self._daily_date = today
-            self._cb_active  = False   # FIX-01: reset al nuevo día
+            self._cb_active  = False
             self._cb_until   = None
             self.learn.streak= 0
             log.info("📅 Nuevo día")
 
     def _circuit_check(self) -> bool:
-        """FIX-01: no se reactiva en bucle."""
         self._daily_reset()
         if self._cb_active:
             if self._cb_until and datetime.utcnow() > self._cb_until:
                 self._cb_active = False
-                self._daily_pnl = 0.0   # ← reset para no re-activar
+                self._daily_pnl = 0.0
                 log.info("  🔓 Circuit breaker OFF")
                 self._tg("<b>🔓 Circuit breaker OFF</b> — trading reanudado")
             return self._cb_active
@@ -992,7 +1010,7 @@ class LongBot:
             pct = (cur - t['entry']) / t['entry'] * 100
             pos += f"  📌 {sym}: {pct:+.2f}% | EMA25:${t['ema25']:.4f}\n"
         self._tg(
-            f"<b>📊 Reporte LONGS v5.0</b>\n"
+            f"<b>📊 Reporte LONGS v5.1</b>\n"
             f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% | {total} trades\n"
             f"Día: ${self._daily_pnl:+.4f} (límite -${CB_USDT})\n"
             f"Fees: ${self.stats['fees']:.4f}\n"
@@ -1016,10 +1034,12 @@ class LongBot:
     # ════════════════════════════════════════════════════════════════
 
     async def run(self):
-        log.info("\n🚀 Bot LONGS v5.0 — VWAP Strategy arrancado\n")
+        log.info("\n🚀 Bot LONGS v5.1 — VWAP Strategy arrancado\n")
         iteration       = 0
         last_sym_refr   = 0
         last_ltv_check  = 0
+        # Scan de shorts huérfanos cada 10 minutos
+        last_hedge_scan = 0
 
         while True:
             try:
@@ -1033,6 +1053,11 @@ class LongBot:
                 if time.time() - last_ltv_check > 300:
                     self._check_ltv()
                     last_ltv_check = time.time()
+
+                # ── FIX-HEDGE-02: Scan periódico de SHORTs huérfanos ──
+                if time.time() - last_hedge_scan > 600:
+                    self._scan_orphan_shorts()
+                    last_hedge_scan = time.time()
 
                 self._update_btc()
 
@@ -1091,6 +1116,24 @@ class LongBot:
                 await asyncio.sleep(20)
 
         self.learn.save()
+
+    def _scan_orphan_shorts(self):
+        """
+        FIX-HEDGE-02 (periódico): Detecta y cierra SHORTs que no debería
+        tener el bot (solo opera LONGs).
+        """
+        if not AUTO: return
+        all_positions = self._get_exchange_positions()
+        for sym, sides in all_positions.items():
+            if sides['short'] > 0:
+                log.warning(f"  ⚠️  SHORT huérfano: {sym} qty={sides['short']:.4f} → cerrando")
+                d = self._order_close_short(sym, sides['short'])
+                if d.get('code') == 0:
+                    log.info(f"  ✅ SHORT huérfano cerrado: {sym}")
+                    self._tg(f"<b>🔧 SHORT huérfano cerrado (scan)</b>\n{sym}")
+                else:
+                    log.error(f"  ❌ Error cerrando SHORT {sym}: {d.get('msg')}")
+                time.sleep(0.3)
 
 # ============================================================================
 # ENTRY POINT
