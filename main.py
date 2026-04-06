@@ -312,28 +312,7 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     Evalúa los 3 puntos de confirmación para LONG y calcula
     el SL óptimo basado en vulneraciones históricas de la EMA55.
 
-    Retorna dict:
-    {
-      'puntos':       0-3,
-      'señal':        'LONG_3/3'|'LONG_2/3'|'ESPERAR'|'NO',
-      'p1':           bool,   ← Tendencial EMA55
-      'p2':           bool,   ← WaveTrend cruce alcista
-      'p3':           bool,   ← ADX + DI+>DI-
-      'ema55':        float,
-      'zona_inf':     float,  ← Límite inferior zona de entrada
-      'zona_sup':     float,  ← Límite superior zona de entrada
-      'wt_now':       float,
-      'wt_prev':      float,
-      'adx_now':      float,
-      'dip':          float,
-      'din':          float,
-      'sl_price':     float,  ← SL basado en vulneraciones
-      'sl_pct':       float,
-      'debilidad':    bool,   ← ⚠️ Señal de agotamiento
-      'cambio_tend':  bool,   ← Cambio de tendencia (cerrar)
-      'descripcion':  str,
-      'vol_ratio':    float,
-    }
+    Retorna dict con puntos, señal, niveles SL/TP, debilidad, etc.
     """
     result = {
         'puntos': 0, 'señal': 'NO', 'p1': False, 'p2': False, 'p3': False,
@@ -353,23 +332,22 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     result['ema55'] = ema55
 
     # ── DETECCIÓN CAMBIO DE TENDENCIA ─────────────────────────────────────
-    # La línea tendencial cambia de posición → señal de cerrar operación
     ema55_prev = ema(closes[:-1], AUROLO_EMA_LEN)
-    tendencia_ahora    = price > ema55        # True = alcista
+    tendencia_ahora    = price > ema55
     tendencia_anterior = closes[-2] > ema55_prev if len(closes) >= 2 else tendencia_ahora
     result['cambio_tend'] = (tendencia_ahora != tendencia_anterior)
 
     # Solo buscamos LONG: EMA55 debe estar bajo el precio
     if not tendencia_ahora:
         result['señal']       = 'NO'
-        desc_msg = f'Tendencia bajista (precio={price:.4f} < EMA55={ema55:.4f})'
+        desc_msg = 'Tendencia bajista (precio=' + str(round(price, 4)) + ' < EMA55=' + str(round(ema55, 4)) + ')'
         result['descripcion'] = desc_msg
         return result
 
     # ── ZONA DE ENTRADA DINÁMICA ──────────────────────────────────────────
     if AUROLO_ZONA_AUTO and atr_v and atr_v > 0:
-        zona_pct = (atr_v / price * 100) * 0.8   # 80% del ATR como zona
-        zona_pct = max(min(zona_pct, 1.5), 0.2)  # Entre 0.2% y 1.5%
+        zona_pct = (atr_v / price * 100) * 0.8
+        zona_pct = max(min(zona_pct, 1.5), 0.2)
     else:
         zona_pct = AUROLO_ZONA_PCT
     zona_inf = ema55 * (1 - zona_pct / 100)
@@ -378,9 +356,6 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     result['zona_sup'] = zona_sup
 
     # ── PUNTO 1: TENDENCIAL EMA55 ─────────────────────────────────────────
-    # El precio toca la zona alrededor de la EMA55 (soporte dinámico)
-    # Modo 'touch': basta que el mínimo de las últimas velas toque la zona
-    # Modo 'close': el precio de cierre debe estar en la zona
     toco_zona = False
     for i in range(-4, 0):
         c_i = closes[i]; l_i = lows[i]
@@ -391,7 +366,6 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
             if l_i <= zona_sup and c_i >= zona_inf * 0.995:
                 toco_zona = True; break
 
-    # Además: la vela actual debe rebotar (cerrar sobre la EMA55)
     rebota = closes[-1] > ema55 and (opens[-1] if opens else closes[-2]) < closes[-1]
     result['p1'] = toco_zona and rebota
 
@@ -402,9 +376,8 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     wt_prev2 = wt1[-3] if len(wt1) >= 3 else wt_prev
     result['wt_now'] = wt_now; result['wt_prev'] = wt_prev
 
-    # Cruce alcista: WT cruzó hacia arriba desde zona de sobreventa
     cruce_alc = (wt_now > wt_prev) and (wt_prev <= WT_OS2 or wt_prev2 <= WT_OS1)
-    en_os     = wt_now <= WT_OS2   # Aún en sobreventa pero subiendo
+    en_os     = wt_now <= WT_OS2
     result['p2'] = cruce_alc or (en_os and wt_now > wt_prev)
 
     # ── PUNTO 3: ADX + DIRECCIONALIDAD ───────────────────────────────────
@@ -415,7 +388,7 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
 
     adx_fuerte  = adx_now >= ADX_KEY
     di_alcista  = dip_now > din_now
-    adx_cayendo = adx_now < adx_prev  # El movimiento contrario pierde fuerza
+    adx_cayendo = adx_now < adx_prev
     result['p3'] = adx_fuerte and di_alcista
 
     # ── PUNTOS TOTALES ────────────────────────────────────────────────────
@@ -423,25 +396,18 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     result['puntos'] = pts
 
     # ── SL INTELIGENTE — Basado en vulneraciones históricas ───────────────
-    # Busca el último mínimo significativo antes de la señal (vulneración típica)
-    # y coloca el SL por debajo con margen ATR × multiplicador
     atr_actual = atr_v or atr_calc(highs, lows, closes, 14)
     min_reciente = min(lows[-8:-1]) if len(lows) >= 8 else lows[-1]
-    sl_vulner    = min_reciente - atr_actual * SL_ATR_M   # Bajo el mínimo + margen
-
-    # El SL nunca puede estar por encima de la EMA55 (nivel institucional)
-    sl_bajo_ema  = ema55 * (1 - 0.1/100)   # 0.1% bajo EMA55
+    sl_vulner    = min_reciente - atr_actual * SL_ATR_M
+    sl_bajo_ema  = ema55 * (1 - 0.1/100)
     sl_price     = min(sl_vulner, sl_bajo_ema)
-
-    # Limitar el SL a un máximo razonable
     sl_max       = price * (1 - SL_MAX_PCT / 100)
-    sl_price     = max(sl_price, sl_max)    # No más lejos que SL_MAX_PCT%
+    sl_price     = max(sl_price, sl_max)
     sl_pct       = (price - sl_price) / price * 100
     result['sl_price'] = round(sl_price, 8)
     result['sl_pct']   = round(sl_pct, 3)
 
     # ── SEÑAL DE DEBILIDAD ⚠️ ────────────────────────────────────────────
-    # ADX cayendo + WT sobrecomprado con giro bajista + DI- acercándose
     wt_ob_baj = wt_now < wt_prev and wt_prev >= WT_OB2
     di_gira   = din_now > dip_now * 0.80
     result['debilidad'] = bool(adx_cayendo and (wt_ob_baj or wt_now >= WT_OB1) and di_gira)
@@ -455,11 +421,11 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     p1_icon = '✅' if result['p1'] else '❌'
     p2_icon = '✅' if result['p2'] else '❌'
     p3_icon = '✅' if result['p3'] else '❌'
-    
-    ema_label = f"EMA{AUROLO_EMA_LEN}"
-    detalles.append(f"P1({p1_icon}){ema_label}")
-    detalles.append(f"P2({p2_icon})WT={wt_now:.1f}")
-    detalles.append(f"P3({p3_icon})ADX={adx_now:.1f} DI+={dip_now:.1f}")
+
+    ema_label = 'EMA' + str(AUROLO_EMA_LEN)
+    detalles.append('P1(' + p1_icon + ')' + ema_label)
+    detalles.append('P2(' + p2_icon + ')WT=' + str(round(wt_now, 1)))
+    detalles.append('P3(' + p3_icon + ')ADX=' + str(round(adx_now, 1)) + ' DI+=' + str(round(dip_now, 1)))
 
     if pts >= 3:
         result['señal'] = 'LONG_3/3'
@@ -587,6 +553,7 @@ class Learning:
         return sum(self.score_boost.get(f, 0) for f in factors)
 
     def _reporte(self):
+        # FIX: sin backslash dentro de f-strings (Python < 3.12)
         n = len(self.history)
         wr  = sum(1 for t in self.history if t['win'])/n*100 if n else 0
         pnl = sum(t['pnl'] for t in self.history)
@@ -596,27 +563,27 @@ class Learning:
             if tot > 0:
                 wr_pts = int(d['w']/tot*100)
                 pnl_pts = d['pnl']
-                pts_txt += f"  {p}/3 pts: WR={wr_pts}% PnL=${pnl_pts:.2f} ({tot}t)\n"
+                pts_txt += f"  {p}/3 pts: WR={wr_pts}% PnL=${pnl_pts:.2f} ({tot}t)" + "\n"
         reas_txt = ""
         sorted_reasons = sorted(self.by_reason.items(), key=lambda x: x[1]['pnl'], reverse=True)
         for r, d in sorted_reasons:
             pnl_r = d['pnl']
             n_r = d['n']
-            reas_txt += f"  {r}: ${pnl_r:+.2f} ({n_r}×)\n"
-        
+            reas_txt += f"  {r}: ${pnl_r:+.2f} ({n_r}x)" + "\n"
+
         wr_int = int(wr)
         pnl_str = f"{pnl:+.4f}"
         score_int = int(self.opt_score)
         bl_len = len(self.blacklist)
-        
+
         msg = (
-            f"<b>🧠 APRENDIZAJE — {n} trades</b>\n"
-            f"WR: {wr_int}% | PnL: ${pnl_str} | Score mín: {score_int}\n"
-            f"Blacklist: {bl_len} símbolos\n\n"
-            f"<b>📊 Por puntos Aurolo:</b>\n{pts_txt or '  Sin datos\n'}"
-            f"<b>🚪 Cierres:</b>\n{reas_txt or '  Sin datos\n'}"
+            "<b>🧠 APRENDIZAJE — " + str(n) + " trades</b>\n"
+            "WR: " + str(wr_int) + "% | PnL: $" + pnl_str + " | Score mín: " + str(score_int) + "\n"
+            "Blacklist: " + str(bl_len) + " símbolos\n\n"
+            "<b>📊 Por puntos Aurolo:</b>\n" + (pts_txt or "  Sin datos\n")
+            + "<b>🚪 Cierres:</b>\n" + (reas_txt or "  Sin datos\n")
         )
-        
+
         msg_clean = msg.replace('<b>', '').replace('</b>', '')
         report_num = n // 10
         log.info(f"[LEARN] #{report_num}: {msg_clean}")
@@ -683,22 +650,22 @@ class LongBot:
         risk_str = f"{RISK_PCT}%"
         lev_str = f"{LEVERAGE}x"
         log.info(f"  Capital: {pos_size_str} | Riesgo: {risk_str}/trade | {lev_str}")
-        
+
         ema_len = AUROLO_EMA_LEN
         wt_ch = WT_CH_LEN
         wt_avg = WT_AVG_LEN
         adx_key = int(ADX_KEY)
         log.info(f"  Motor: EMA{ema_len} + WaveTrend(ch={wt_ch},avg={wt_avg}) + ADX>{adx_key}")
-        
+
         min_pts = AUROLO_MIN_PTS
         zona_txt = 'auto(ATR)' if AUROLO_ZONA_AUTO else f'{AUROLO_ZONA_PCT}%'
         log.info(f"  Mín {min_pts}/3 pts | Zona: {zona_txt}")
-        
+
         tp1_pct = int(TP1_PCT)
         tp2_pct = int(TP2_PCT)
         runner_pct = int(100 - TP1_PCT - TP2_PCT)
         log.info(f"  TPs: {tp1_pct}%@1×SL | {tp2_pct}%@2×SL | {runner_pct}%→EMA25")
-        
+
         vwap_status = 'ON' if VWAP_AS_FILTER else 'OFF'
         log.info(f"  VWAP contexto: {vwap_status} | ⚠️ Debilidad activa")
         log.info(f"  FIX-HEDGE: sin doble dirección ✅ | 🧠 Aprendizaje profundo ✅")
@@ -732,7 +699,7 @@ class LongBot:
         tp2_msg = int(TP2_PCT)
         runner_msg = int(100 - TP1_PCT - TP2_PCT)
         trades_len = len(self.trades)
-        
+
         self._tg(
             f"<b>🤖 Bot LONGS v5.5 — MLP Tactical Bridge</b>\n"
             f"Motor: EMA{ema_len_msg}+WaveTrend+ADX | Mín {min_pts_msg}/3\n"
@@ -970,61 +937,57 @@ class LongBot:
         if not tk or tk['price'] <= 0: return None
         price = tk['price']; change_24 = tk['change']
 
-        # ── FILTRO 1H: tendencia confirmada en temporalidad superior ──
-        # "Alineación de Temporalidades" del sistema Aurolo
+        # ── FILTRO 1H ─────────────────────────────────────────────────
         trend_1h = 0; rsi_1h = 50.0
         if c1h and len(c1h) >= 25:
             e9_1h = ema(c1h, 9); e21_1h = ema(c1h, 21)
             rsi_1h = rsi(c1h, 14)
             aurolo_1h = aurolo_signal(c1h, h1h, l1h, v1h, c1h)
-            # 1H alcista si EMA9>EMA21 Y la tendencial 1H es alcista
             if e9_1h > e21_1h and aurolo_1h['ema55'] < c1h[-1]:
                 trend_1h = 1
             elif e9_1h < e21_1h and aurolo_1h['ema55'] > c1h[-1]:
                 trend_1h = -1
-        if trend_1h == -1: return None  # 1H bajista = no operar
+        if trend_1h == -1: return None
 
         # ── FILTROS BÁSICOS ───────────────────────────────────────────
         atr_v   = atr_calc(h5, l5, c5, 14)
         atr_pct = atr_v / price * 100 if price > 0 else 0
-        if atr_pct < 0.12:      return None   # Volatilidad mínima
-        if change_24 > 20.0:    return None   # Pump extremo
-        if change_24 < -15.0:   return None   # Dump extremo
+        if atr_pct < 0.12:      return None
+        if change_24 > 20.0:    return None
+        if change_24 < -15.0:   return None
 
         # ── MOTOR PRINCIPAL: AUROLO MLP TACTICAL BRIDGE ───────────────
         sig_aurolo = aurolo_signal(c5, h5, l5, v5, o5, atr_v)
 
-        # Filtro duro: mínimo AUROLO_MIN_PTS puntos
         if sig_aurolo['puntos'] < AUROLO_MIN_PTS:
             return None
 
-        # No operar si el indicador detecta cambio de tendencia
         if sig_aurolo['cambio_tend']:
             log.debug(f"  🔄 {symbol} cambio de tendencia detectado — esperar")
             return None
 
-        # ── FILTRO VWAP (contexto institucional) ─────────────────────
+        # ── FILTRO VWAP ───────────────────────────────────────────────
         vwap_val, precio_sobre_vwap = vwap_contexto(c5, h5, l5, v5, VWAP_CANDLES)
         if VWAP_AS_FILTER and not precio_sobre_vwap:
-            return None   # Precio bajo el VWAP = no favorable
+            return None
 
-        # ── SL desde la señal Aurolo (basado en vulneraciones) ────────
+        # ── SL ────────────────────────────────────────────────────────
         sl_price = sig_aurolo['sl_price']
         sl_pct   = sig_aurolo['sl_pct']
 
         if sl_pct <= 0 or sl_pct > SL_MAX_PCT * 1.1:
-            return None   # SL inválido o demasiado amplio
+            return None
 
-        # ── TPs escalonados (1×SL y 2×SL) ────────────────────────────
+        # ── TPs escalonados ───────────────────────────────────────────
         tp1_price = price * (1 + sl_pct * TP1_RATIO / 100)
         tp2_price = price * (1 + sl_pct * TP2_RATIO / 100)
         tp_ref    = sl_pct * MIN_RR
         tp_ref    = max(tp_ref, TP_MIN, TP_MIN_FEE, atr_pct * ATR_TP_M)
         rr        = tp_ref / sl_pct if sl_pct > 0 else 0
 
-        if rr < MIN_RR * 0.75: return None   # RR insuficiente
+        if rr < MIN_RR * 0.75: return None
 
-        # ── EMA25 como referencia de salida ───────────────────────────
+        # ── EMA25/55 ──────────────────────────────────────────────────
         e25  = ema(c5, 25)
         e55  = sig_aurolo['ema55']
 
@@ -1032,13 +995,11 @@ class LongBot:
         score = 0; reasons = []; factors = []
         pts   = sig_aurolo['puntos']
 
-        # Puntos Aurolo (señal principal) — base del score
         if pts == 3:
             score += 50; reasons.append("Aurolo3/3(50)"); factors.append("aurolo_3")
         elif pts == 2:
             score += 30; reasons.append("Aurolo2/3(30)"); factors.append("aurolo_2")
 
-        # Detalles de cada punto
         if sig_aurolo['p1']:
             score += 10; reasons.append("P1_Tend(10)"); factors.append("p1_tend")
         if sig_aurolo['p2']:
@@ -1046,7 +1007,6 @@ class LongBot:
         if sig_aurolo['p3']:
             score += 10; reasons.append("P3_ADX(10)"); factors.append("p3_adx")
 
-        # WT en sobreventa profunda (punto extra de calidad)
         wt_val = sig_aurolo['wt_now']
         if wt_val <= WT_OS1:
             wt_int = int(wt_val)
@@ -1054,12 +1014,10 @@ class LongBot:
             reasons.append(f"WT_deep({wt_int})(8)")
             factors.append("wt_deep")
 
-        # ADX fuerte
         adx_val = sig_aurolo['adx_now']
         if adx_val > ADX_KEY * 1.4:
             score += 6; reasons.append("ADX_strong(6)"); factors.append("adx_strong")
 
-        # Volumen en la vela de señal
         vr = sig_aurolo['vol_ratio']
         if vr >= 2.0:
             vr_str = f"{vr:.1f}"
@@ -1072,22 +1030,18 @@ class LongBot:
             reasons.append(f"Vol{vr_str}x(5)")
             factors.append("vol_medio")
 
-        # VWAP: precio sobre él suma contexto alcista
         if precio_sobre_vwap:
             score += 8; reasons.append("VWAP↑(8)"); factors.append("vwap_arriba")
 
-        # 1H confirmado
         if trend_1h == 1:
             score += 12; reasons.append("1H↑(12)"); factors.append("trend_1h_up")
 
-        # BTC favorable
         btc_val = self._btc_1h
         if btc_val > 1.0:
             score += 8; reasons.append("BTC↑(8)"); factors.append("btc_up")
         elif btc_val > 0.3:
             score += 4; reasons.append("BTC~(4)"); factors.append("btc_ok")
 
-        # RSI 1H en zona de oportunidad
         rsi_int = int(rsi_1h)
         if rsi_1h < 40:
             score += 8
@@ -1098,20 +1052,17 @@ class LongBot:
             reasons.append(f"RSI1H{rsi_int}(4)")
             factors.append("rsi_1h_ok")
 
-        # Bonus aprendido por nº de puntos Aurolo
         bonus_p = self.learn.bonus_pts(pts)
         if bonus_p != 0:
             score += bonus_p
             reasons.append(f"LearnPts({bonus_p:+d})")
             factors.append(f"learn_pts_{pts}")
 
-        # Ajuste por factores aprendidos
         adj = self.learn.adj(factors)
         if adj != 0:
             score += adj
             reasons.append(f"FactAdj({adj:+d})")
 
-        # Aprendizaje
         ok, reason = self.learn.ok(symbol, score)
         if not ok: return None
 
@@ -1250,7 +1201,7 @@ class LongBot:
         rr_str = f"{sig['rr']:.2f}"
         log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{score_int} | RR:{rr_str}:1")
         log.info(f"  {sig['aurolo_desc']}")
-        
+
         zona_inf_str = f"${sig['zona_inf']:.4f}"
         zona_sup_str = f"${sig['zona_sup']:.4f}"
         ema_len_str = AUROLO_EMA_LEN
@@ -1261,7 +1212,6 @@ class LongBot:
         qty, notional = self._calc_qty(sym, price, sl_price)
         if not qty: return False
 
-        # Entrada limit levemente bajo precio actual
         limit_p = round(price * (1-0.05/100), 8)
         d = self._order(sym, 'BUY', qty, 'LIMIT', price=limit_p)
         if d.get('code') != 0:
@@ -1283,12 +1233,10 @@ class LongBot:
             filled_qty, fill_price = self._confirm_pos(sym, 12)
             if not filled_qty: return False
 
-        # Recalcular niveles desde precio real de fill
         sl_pct_real = (fill_price - sl_price) / fill_price * 100
         tp1_price   = fill_price * (1 + sl_pct_real * TP1_RATIO / 100)
         tp2_price   = fill_price * (1 + sl_pct_real * TP2_RATIO / 100)
 
-        # Colocar SL en el exchange
         sl_ok = self._place_sl(sym, filled_qty, sl_price)
         if not sl_ok:
             time.sleep(2); sl_ok = self._place_sl(sym, filled_qty, sl_price)
@@ -1324,41 +1272,40 @@ class LongBot:
         self.stats['exec']  += 1
         self.stats['fees']  += notional * FEE
 
-        # Confirmaciones para Telegram
         p1 = "✅" if sig['aurolo_p1'] else "❌"
         p2 = "✅" if sig['aurolo_p2'] else "❌"
         p3 = "✅" if sig['aurolo_p3'] else "❌"
-        
+
         score_tg = int(sig['score'])
         rr_tg = f"{sig['rr']:.2f}"
         pts_tg = pts
-        
+
         ema_len_tg = AUROLO_EMA_LEN
         ema55_tg = f"${sig['ema55']:.4f}"
-        
+
         wt_val_tg = f"{sig['aurolo_wt']:.1f}"
         wt_check = '(sobreventa✅)' if sig['aurolo_wt'] <= WT_OS2 else ''
-        
+
         adx_tg = f"{sig['aurolo_adx']:.1f}"
         dip_tg = f"{sig['aurolo_dip']:.1f}"
         din_tg = f"{sig['aurolo_din']:.1f}"
-        
+
         fill_tg = f"${fill_price:.6f}"
         vwap_tg = f"${sig['vwap']:.6f}"
-        
+
         tp1_tg = f"${tp1_price:.6f}"
         tp1_pct_tg = f"{sl_pct_real*TP1_RATIO:.2f}"
         tp1_pct_int = int(TP1_PCT)
-        
+
         tp2_tg = f"${tp2_price:.6f}"
         tp2_pct_tg = f"{sl_pct_real*TP2_RATIO:.2f}"
         tp2_pct_int = int(TP2_PCT)
-        
+
         runner_pct = int(100 - TP1_PCT - TP2_PCT)
-        
+
         sl_tg = f"${sl_price:.6f}"
         sl_pct_tg = f"{sl_pct_real:.2f}"
-        
+
         trend_icon = '🟢' if sig['trend_1h'] == 1 else '⚪'
         btc_pct_tg = f"{self._btc_1h:+.2f}"
 
@@ -1397,11 +1344,11 @@ class LongBot:
         t['pnl_parcial']  += net; t['qty_runner'] -= qty
         self.stats['fees'] += POS_SIZE*LEVERAGE*FEE*2*frac
         self._daily_pnl   += net; self.stats['pnl'] += net
-        
+
         net_str = f"${net:+.4f}"
         qty_str = f"{t['qty_runner']:.4f}"
         log.info(f"  💰 {label} {sym}: {net_str} | Resta:{qty_str}")
-        
+
         exit_str = f"${exit_price:.6f}"
         self._tg(f"<b>💰 {label}</b> — {sym}\n{exit_str}\nPnL: {net_str}")
         return net
@@ -1433,7 +1380,7 @@ class LongBot:
         pct_str = f"{pct:+.1f}"
         wr_str = f"{wr:.0f}"
         log.info(f"  {emoji} {reason} | {net_str} ({pct_str}%) | {mins}min | WR:{wr_str}%")
-        
+
         self.learn.record(
             symbol=sym, score=t['score'], pnl=net_total, win=win,
             hora_utc=t.get('hora_utc',datetime.utcnow().hour),
@@ -1442,13 +1389,13 @@ class LongBot:
             reason=reason, factors=t.get('factors',[]),
         )
         self._set_cd(sym, 'TP' if any(k in reason for k in ['TP','EMA','PROFIT']) else 'SL')
-        
+
         entry_str = f"${t['entry']:.6f}"
         exit_str = f"${exit_price:.6f}"
         parcial_str = f"${t['pnl_parcial']:+.4f}"
         runner_str = f"${net_r:+.4f}"
         label = t.get('entrada_label', '?')
-        
+
         self._tg(
             f"<b>{emoji} CERRADO — {reason}</b>\n"
             f"<b>{sym}</b> | {label} | {mins}min\n"
@@ -1461,7 +1408,7 @@ class LongBot:
         return True
 
     # ════════════════════════════════════════════════════════════════
-    # MONITOR — TPs escalonados + EMA25 trailing + debilidad Aurolo
+    # MONITOR
     # ════════════════════════════════════════════════════════════════
 
     async def monitor(self):
@@ -1473,7 +1420,6 @@ class LongBot:
                 cur = tk['price']
                 pct = (cur - t['entry']) / t['entry'] * 100
 
-                # Actualizar EMA25 y EMA55
                 c5, h5, l5, v5, _ = self._klines(sym, '5m', 80)
                 if c5:
                     t['ema25'] = ema(c5, 25)
@@ -1489,7 +1435,7 @@ class LongBot:
                         adx_live = f"{sig_live['adx_now']:.0f}"
                         pct_str = f"{pct:+.2f}"
                         log.warning(f"  ⚠️ DEBILIDAD {sym}: WT={wt_live} ADX={adx_live} | {pct_str}%")
-                        
+
                         wt_live_tg = f"{sig_live['wt_now']:.1f}"
                         adx_live_tg = f"{sig_live['adx_now']:.1f}"
                         self._tg(
@@ -1498,15 +1444,13 @@ class LongBot:
                             f"WT={wt_live_tg} | ADX={adx_live_tg} cayendo\n"
                             f"Considera salida manual"
                         )
-                    # CAMBIO DE TENDENCIA = cerrar inmediatamente (EMA55 cruzó)
                     if sig_live['cambio_tend'] and pct > 0:
                         self._close_all(sym, cur, "CAMBIO TENDENCIA")
                         continue
 
-                # Actualizar máximo
                 if cur > t['highest']: t['highest'] = cur
 
-                # ── TP1: 40% al 1×SL ─────────────────────────────────
+                # ── TP1 ───────────────────────────────────────────────
                 if not t['tp1_hit'] and cur >= t['tp1_price']:
                     tp1_pct_str = f"{TP1_PCT:.0f}"
                     self._close_partial(sym, t['qty_tp1'], cur, f"TP1({tp1_pct_str}%)")
@@ -1518,7 +1462,7 @@ class LongBot:
                         log.info(f"  🔒 {sym} SL → break-even {be_str}")
                     continue
 
-                # ── TP2: 35% al 2×SL ─────────────────────────────────
+                # ── TP2 ───────────────────────────────────────────────
                 if t['tp1_hit'] and not t['tp2_hit'] and cur >= t['tp2_price']:
                     tp2_pct_str = f"{TP2_PCT:.0f}"
                     self._close_partial(sym, t['qty_tp2'], cur, f"TP2({tp2_pct_str}%)")
@@ -1530,18 +1474,16 @@ class LongBot:
                         log.info(f"  🔒 {sym} SL → {locked_str}")
                     continue
 
-                # ── RUNNER (25%): EMA25 trailing ─────────────────────
+                # ── RUNNER: EMA25 trailing ────────────────────────────
                 if t['tp2_hit']:
                     if t['ema25'] > t['sl']: t['sl'] = t['ema25']
                     if cur < t['ema25'] and c5 and c5[-1] < t['ema25'] and c5[-2] < t['ema25']:
                         self._close_all(sym, cur, "EMA25 RUNNER"); continue
 
-                # ── Pre-TP2: EMA25 emergencia ─────────────────────────
                 elif t['tp1_hit']:
                     if cur < t['ema25'] and c5 and c5[-1] < t['ema25'] and c5[-2] < t['ema25']:
                         self._close_all(sym, cur, "EMA25 PRE-TP2"); continue
 
-                # ── Sin TPs: EMA25 solo si hay ganancia ──────────────
                 elif pct > 0.3 and cur < t['ema25']:
                     if c5 and c5[-1] < t['ema25'] and c5[-2] < t['ema25']:
                         self._close_all(sym, cur, "EMA25 EARLY"); continue
@@ -1603,14 +1545,14 @@ class LongBot:
             pts_t = t['aurolo_pts']
             pct_str = f"{pct:+.2f}"
             pos += f"  📌 {sym}[{pts_t}/3]: {pct_str}% {tp_st}\n"
-        
+
         pnl_str = f"${self.stats['pnl']:+.4f}"
         wr_str = f"{wr:.0f}"
         daily_str = f"${self._daily_pnl:+.4f}"
         eq_str = f"${ACCOUNT_EQUITY:.2f}"
         score_str = f"{self.learn.opt_score:.0f}"
         btc_str = f"{self._btc_1h:+.2f}"
-        
+
         self._tg(
             f"<b>📊 Reporte v5.5</b>\n"
             f"PnL: {pnl_str} | WR: {wr_str}% | {total}t\n"
@@ -1652,7 +1594,7 @@ class LongBot:
 
                 total=self.stats['wins']+self.stats['losses']
                 wr=self.stats['wins']/total*100 if total else 0
-                
+
                 now_time = datetime.now().strftime('%H:%M:%S')
                 trades_count = len(self.trades)
                 pnl_str = f"${self.stats['pnl']:+.4f}"
@@ -1660,7 +1602,7 @@ class LongBot:
                 btc_str = f"{self._btc_1h:+.2f}"
                 eq_str = f"${ACCOUNT_EQUITY:.2f}"
                 score_str = f"{self.learn.opt_score:.0f}"
-                
+
                 log.info(f"\n{'='*72}")
                 log.info(f"  #{iteration} {now_time} | "
                          f"Abiertos:{trades_count}/{MAX_TRADES} | "
