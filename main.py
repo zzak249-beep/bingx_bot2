@@ -214,6 +214,21 @@ def pub(path, params=None):
     except:
         return {}
 
+def _safe_float(val, default=0.0):
+    """Extrae float de forma segura aunque val sea dict, None o string."""
+    if val is None:
+        return default
+    if isinstance(val, dict):
+        # BingX a veces devuelve {'equity': '123.45'} anidado
+        for k in ('equity', 'balance', 'availableMargin', 'amount'):
+            if k in val:
+                return _safe_float(val[k], default)
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
 # ============================================================================
 # INDICADORES BASE
 # ============================================================================
@@ -719,7 +734,7 @@ class LongBot:
             log.error("❌ API keys no configuradas"); AUTO = False; return False
         d = api('GET', '/openApi/swap/v2/user/balance')
         if d.get('code') == 0:
-            b = d.get('data',{}); eq = float(b.get('equity', b.get('balance',0)) or 0)
+            b = d.get('data',{}); eq = _safe_float(b.get('equity', b.get('balance', 0)))
             if eq > 0: ACCOUNT_EQUITY = eq
             eq_str = f"${ACCOUNT_EQUITY:.2f}"
             log.info(f"✅ BingX conectado | {eq_str} USDT")
@@ -895,7 +910,7 @@ class LongBot:
         global ACCOUNT_EQUITY
         d=api('GET','/openApi/swap/v2/user/balance')
         if d.get('code')==0:
-            b=d.get('data',{}); eq=float(b.get('equity',0) or b.get('balance',0))
+            b=d.get('data',{}); eq=_safe_float(b.get('equity', b.get('balance', 0)))
             if eq>0: ACCOUNT_EQUITY=eq
 
     def _check_ltv(self):
@@ -903,8 +918,8 @@ class LongBot:
         d=api('GET','/openApi/swap/v2/user/balance')
         if d.get('code')!=0: return
         try:
-            b=d.get('data',{}); eq=float(b.get('equity',0) or 0)
-            mg=float(b.get('usedMargin',b.get('initialMargin',0)) or 0)
+            b=d.get('data',{}); eq=_safe_float(b.get('equity', b.get('balance', 0)))
+            mg=_safe_float(b.get('usedMargin', b.get('initialMargin', 0)))
             ltv_pct = mg / eq * 100 if eq > 0 else 0
             if eq>0 and ltv_pct >= LTV_WARN:
                 self._tg("<b>⚠️ LTV ALTO</b>")
