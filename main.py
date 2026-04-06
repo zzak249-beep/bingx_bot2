@@ -6,7 +6,7 @@ El sistema de Triple Confirmación de Aurolo es la SEÑAL PRINCIPAL.
 El VWAP pasa a ser un filtro de contexto (tendencia institucional).
 
 ARQUITECTURA DE SEÑAL:
-  ┌─────────────────────────────────────────────────────────┐
+  ┌─────────────────────────────────────────────────────────────┐
   │  MOTOR PRINCIPAL: MLP Tactical Bridge (Aurolo)          │
   │                                                         │
   │  Punto 1 — TENDENCIAL (EMA55)                           │
@@ -58,7 +58,13 @@ from collections import defaultdict
 # ============================================================================
 
 def clean(key, default, typ='str'):
-    v = os.getenv(key, str(default)).strip().strip('"').strip("'")
+    v = os.getenv(key, str(default)).strip()
+    # Eliminar comillas de forma segura
+    if v.startswith('"') and v.endswith('"'):
+        v = v[1:-1]
+    elif v.startswith("'") and v.endswith("'"):
+        v = v[1:-1]
+    
     if typ in ('int', 'float'):
         v = v.replace(',', '.')
         m = re.match(r'^-?\d+\.?\d*', v)
@@ -68,8 +74,25 @@ def clean(key, default, typ='str'):
     if typ == 'bool':  return v.lower() == 'true'
     return v
 
-API_KEY    = os.getenv('BINGX_API_KEY',    '').strip().strip('"').strip("'")
-API_SECRET = os.getenv('BINGX_API_SECRET', '').strip().strip('"').strip("'")
+# Limpiar API keys
+api_key_raw = os.getenv('BINGX_API_KEY', '').strip()
+api_secret_raw = os.getenv('BINGX_API_SECRET', '').strip()
+
+# Remover comillas de forma segura
+if api_key_raw.startswith('"') and api_key_raw.endswith('"'):
+    API_KEY = api_key_raw[1:-1]
+elif api_key_raw.startswith("'") and api_key_raw.endswith("'"):
+    API_KEY = api_key_raw[1:-1]
+else:
+    API_KEY = api_key_raw
+
+if api_secret_raw.startswith('"') and api_secret_raw.endswith('"'):
+    API_SECRET = api_secret_raw[1:-1]
+elif api_secret_raw.startswith("'") and api_secret_raw.endswith("'"):
+    API_SECRET = api_secret_raw[1:-1]
+else:
+    API_SECRET = api_secret_raw
+
 TG_TOKEN   = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TG_CHAT    = os.getenv('TELEGRAM_CHAT_ID',   '')
 
@@ -339,7 +362,8 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     # Solo buscamos LONG: EMA55 debe estar bajo el precio
     if not tendencia_ahora:
         result['señal']       = 'NO'
-        result['descripcion'] = f'Tendencia bajista (precio={price:.4f} < EMA55={ema55:.4f})'
+        desc_msg = f'Tendencia bajista (precio={price:.4f} < EMA55={ema55:.4f})'
+        result['descripcion'] = desc_msg
         return result
 
     # ── ZONA DE ENTRADA DINÁMICA ──────────────────────────────────────────
@@ -428,9 +452,14 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
 
     # ── CLASIFICAR SEÑAL ──────────────────────────────────────────────────
     detalles = []
-    detalles.append(f"P1({'✅' if result['p1'] else '❌'})EMA{AUROLO_EMA_LEN}")
-    detalles.append(f"P2({'✅' if result['p2'] else '❌'})WT={wt_now:.1f}")
-    detalles.append(f"P3({'✅' if result['p3'] else '❌'})ADX={adx_now:.1f} DI+={dip_now:.1f}")
+    p1_icon = '✅' if result['p1'] else '❌'
+    p2_icon = '✅' if result['p2'] else '❌'
+    p3_icon = '✅' if result['p3'] else '❌'
+    
+    ema_label = f"EMA{AUROLO_EMA_LEN}"
+    detalles.append(f"P1({p1_icon}){ema_label}")
+    detalles.append(f"P2({p2_icon})WT={wt_now:.1f}")
+    detalles.append(f"P3({p3_icon})ADX={adx_now:.1f} DI+={dip_now:.1f}")
 
     if pts >= 3:
         result['señal'] = 'LONG_3/3'
@@ -526,7 +555,10 @@ class Learning:
         if not d: return True, "ok"
         tot = d['w']+d['l']
         if tot < 5: return True, "ok"
-        if d['w']/tot < 0.25: return False, f"hora {h}h WR={d['w']/tot:.0%}"
+        wr_hora = d['w'] / tot
+        if wr_hora < 0.25:
+            msg = f"hora {h}h WR={int(wr_hora*100)}%"
+            return False, msg
         return True, "ok"
 
     def bonus_pts(self, pts) -> int:
@@ -540,9 +572,15 @@ class Learning:
         return 0
 
     def ok(self, sym, score):
-        if sym in self.blacklist:     return False, "blacklist"
-        if score < self.opt_score:    return False, f"score {score:.0f}<{self.opt_score:.0f}"
-        if self.streak >= MAX_STREAK: return False, f"streak -{self.streak}"
+        if sym in self.blacklist:
+            return False, "blacklist"
+        score_min = int(self.opt_score)
+        if score < self.opt_score:
+            msg = f"score {int(score)}<{score_min}"
+            return False, msg
+        if self.streak >= MAX_STREAK:
+            msg = f"streak -{self.streak}"
+            return False, msg
         return True, "ok"
 
     def adj(self, factors):
@@ -556,23 +594,41 @@ class Learning:
         for p in sorted(self.by_pts):
             d = self.by_pts[p]; tot = d['w']+d['l']
             if tot > 0:
-                pts_txt += f"  {p}/3 pts: WR={d['w']/tot:.0%} PnL=${d['pnl']:.2f} ({tot}t)\n"
-        reas_txt = "".join(
-            f"  {r}: ${d['pnl']:+.2f} ({d['n']}×)\n"
-            for r,d in sorted(self.by_reason.items(), key=lambda x: x[1]['pnl'], reverse=True))
+                wr_pts = int(d['w']/tot*100)
+                pnl_pts = d['pnl']
+                pts_txt += f"  {p}/3 pts: WR={wr_pts}% PnL=${pnl_pts:.2f} ({tot}t)\n"
+        reas_txt = ""
+        sorted_reasons = sorted(self.by_reason.items(), key=lambda x: x[1]['pnl'], reverse=True)
+        for r, d in sorted_reasons:
+            pnl_r = d['pnl']
+            n_r = d['n']
+            reas_txt += f"  {r}: ${pnl_r:+.2f} ({n_r}×)\n"
+        
+        wr_int = int(wr)
+        pnl_str = f"{pnl:+.4f}"
+        score_int = int(self.opt_score)
+        bl_len = len(self.blacklist)
+        
         msg = (
             f"<b>🧠 APRENDIZAJE — {n} trades</b>\n"
-            f"WR: {wr:.0f}% | PnL: ${pnl:+.4f} | Score mín: {self.opt_score:.0f}\n"
-            f"Blacklist: {len(self.blacklist)} símbolos\n\n"
+            f"WR: {wr_int}% | PnL: ${pnl_str} | Score mín: {score_int}\n"
+            f"Blacklist: {bl_len} símbolos\n\n"
             f"<b>📊 Por puntos Aurolo:</b>\n{pts_txt or '  Sin datos\n'}"
             f"<b>🚪 Cierres:</b>\n{reas_txt or '  Sin datos\n'}"
         )
-        log.info(f"[LEARN] #{n//10}: {msg.replace('<b>','').replace('</b>','')}")
+        
+        msg_clean = msg.replace('<b>', '').replace('</b>', '')
+        report_num = n // 10
+        log.info(f"[LEARN] #{report_num}: {msg_clean}")
         try:
             if TG_TOKEN and TG_CHAT:
-                requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                              json={'chat_id':TG_CHAT,'text':msg,'parse_mode':'HTML'},timeout=6)
-        except: pass
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={'chat_id': TG_CHAT, 'text': msg, 'parse_mode': 'HTML'},
+                    timeout=6
+                )
+        except:
+            pass
 
     def save(self, fp='/tmp/bot_learn_v55.json'):
         try:
@@ -585,7 +641,8 @@ class Learning:
                 'factor_losses': dict(self.factor_losses),
                 'score_boost': self.score_boost,
             }, open(fp,'w'), indent=2)
-        except: pass
+        except:
+            pass
 
     def load(self, fp='/tmp/bot_learn_v55.json'):
         for path in [fp, '/tmp/bot_learn_v53.json', '/tmp/bot_learn.json']:
@@ -603,9 +660,13 @@ class Learning:
                 self.factor_wins   = defaultdict(int, d.get('factor_wins',{}))
                 self.factor_losses = defaultdict(int, d.get('factor_losses',{}))
                 self.score_boost   = d.get('score_boost',{})
-                log.info(f"  [LEARN] {len(self.history)} trades | Score: {self.opt_score:.0f} | BL: {len(self.blacklist)}")
+                hist_len = len(self.history)
+                score_val = int(self.opt_score)
+                bl_len = len(self.blacklist)
+                log.info(f"  [LEARN] {hist_len} trades | Score: {score_val} | BL: {bl_len}")
                 return
-            except: continue
+            except:
+                continue
 
 
 # ============================================================================
@@ -618,11 +679,28 @@ class LongBot:
     def __init__(self):
         log.info("=" * 72)
         log.info("  BOT LONGS v5.5 — MLP Tactical Bridge (Aurolo) + TPs Escalonados")
-        log.info(f"  Capital: ${POS_SIZE} | Riesgo: {RISK_PCT}%/trade | {LEVERAGE}x")
-        log.info(f"  Motor: EMA{AUROLO_EMA_LEN} + WaveTrend(ch={WT_CH_LEN},avg={WT_AVG_LEN}) + ADX>{ADX_KEY}")
-        log.info(f"  Mín {AUROLO_MIN_PTS}/3 pts | Zona: {'auto(ATR)' if AUROLO_ZONA_AUTO else f'{AUROLO_ZONA_PCT}%'}")
-        log.info(f"  TPs: {TP1_PCT:.0f}%@1×SL | {TP2_PCT:.0f}%@2×SL | {100-TP1_PCT-TP2_PCT:.0f}%→EMA25")
-        log.info(f"  VWAP contexto: {'ON' if VWAP_AS_FILTER else 'OFF'} | ⚠️ Debilidad activa")
+        pos_size_str = f"${POS_SIZE}"
+        risk_str = f"{RISK_PCT}%"
+        lev_str = f"{LEVERAGE}x"
+        log.info(f"  Capital: {pos_size_str} | Riesgo: {risk_str}/trade | {lev_str}")
+        
+        ema_len = AUROLO_EMA_LEN
+        wt_ch = WT_CH_LEN
+        wt_avg = WT_AVG_LEN
+        adx_key = int(ADX_KEY)
+        log.info(f"  Motor: EMA{ema_len} + WaveTrend(ch={wt_ch},avg={wt_avg}) + ADX>{adx_key}")
+        
+        min_pts = AUROLO_MIN_PTS
+        zona_txt = 'auto(ATR)' if AUROLO_ZONA_AUTO else f'{AUROLO_ZONA_PCT}%'
+        log.info(f"  Mín {min_pts}/3 pts | Zona: {zona_txt}")
+        
+        tp1_pct = int(TP1_PCT)
+        tp2_pct = int(TP2_PCT)
+        runner_pct = int(100 - TP1_PCT - TP2_PCT)
+        log.info(f"  TPs: {tp1_pct}%@1×SL | {tp2_pct}%@2×SL | {runner_pct}%→EMA25")
+        
+        vwap_status = 'ON' if VWAP_AS_FILTER else 'OFF'
+        log.info(f"  VWAP contexto: {vwap_status} | ⚠️ Debilidad activa")
         log.info(f"  FIX-HEDGE: sin doble dirección ✅ | 🧠 Aprendizaje profundo ✅")
         log.info("=" * 72)
 
@@ -648,12 +726,19 @@ class LongBot:
         self._refresh_symbols()
         self._recover()
 
+        ema_len_msg = AUROLO_EMA_LEN
+        min_pts_msg = AUROLO_MIN_PTS
+        tp1_msg = int(TP1_PCT)
+        tp2_msg = int(TP2_PCT)
+        runner_msg = int(100 - TP1_PCT - TP2_PCT)
+        trades_len = len(self.trades)
+        
         self._tg(
             f"<b>🤖 Bot LONGS v5.5 — MLP Tactical Bridge</b>\n"
-            f"Motor: EMA{AUROLO_EMA_LEN}+WaveTrend+ADX | Mín {AUROLO_MIN_PTS}/3\n"
-            f"TPs: {TP1_PCT:.0f}%→TP1 | {TP2_PCT:.0f}%→TP2 | {100-TP1_PCT-TP2_PCT:.0f}%→EMA25\n"
+            f"Motor: EMA{ema_len_msg}+WaveTrend+ADX | Mín {min_pts_msg}/3\n"
+            f"TPs: {tp1_msg}%→TP1 | {tp2_msg}%→TP2 | {runner_msg}%→EMA25\n"
             f"⚠️ Señal debilidad | 🧠 Aprendizaje profundo\n"
-            f"Posiciones recuperadas: {len(self.trades)}"
+            f"Posiciones recuperadas: {trades_len}"
         )
 
     # ════════════════════════════════════════════════════════════════
@@ -669,8 +754,14 @@ class LongBot:
         if d.get('code') == 0:
             b = d.get('data',{}); eq = float(b.get('equity', b.get('balance',0)) or 0)
             if eq > 0: ACCOUNT_EQUITY = eq
-            log.info(f"✅ BingX conectado | ${ACCOUNT_EQUITY:.2f} USDT"); return True
-        log.error(f"❌ [{d.get('code')}]: {d.get('msg')}"); AUTO = False; return False
+            eq_str = f"${ACCOUNT_EQUITY:.2f}"
+            log.info(f"✅ BingX conectado | {eq_str} USDT")
+            return True
+        code = d.get('code')
+        msg = d.get('msg')
+        log.error(f"❌ [{code}]: {msg}")
+        AUTO = False
+        return False
 
     def _detect_mode(self):
         try:
@@ -692,7 +783,8 @@ class LongBot:
                     'prec': int(c.get('quantityPrecision',2)),
                     'ctval': float(c.get('contractSize',1)),
                 }
-            log.info(f"  Contratos: {len(self._contracts)}")
+            contracts_len = len(self._contracts)
+            log.info(f"  Contratos: {contracts_len}")
 
     def _refresh_symbols(self):
         d = pub('/openApi/swap/v2/quote/ticker')
@@ -710,7 +802,8 @@ class LongBot:
             except: continue
         items.sort(key=lambda x: x['vol'], reverse=True)
         self.symbols = [x['sym'] for x in items[:MAX_SYMS]]
-        log.info(f"  Símbolos: {len(self.symbols)}")
+        syms_len = len(self.symbols)
+        log.info(f"  Símbolos: {syms_len}")
 
     # ════════════════════════════════════════════════════════════════
     # FIX-HEDGE (v5.1 heredado)
@@ -759,13 +852,17 @@ class LongBot:
                         entry=float(p.get('avgPrice') or p.get('entryPrice') or 0); break
                 if entry<=0: continue
                 qty = sides['long']
-                sl_rec = entry*(1-(SL_MAX_PCT+0.5)/100)
+                sl_pct_tmp = SL_MAX_PCT + 0.5
+                sl_rec = entry * (1 - sl_pct_tmp / 100)
+                tp_ratio1 = TP1_RATIO * SL_MAX_PCT / 100
+                tp_ratio2 = TP2_RATIO * SL_MAX_PCT / 100
                 self.trades[sym] = self._mk_trade(
                     entry, qty, sl_rec,
-                    entry*(1+TP1_RATIO*SL_MAX_PCT/100),
-                    entry*(1+TP2_RATIO*SL_MAX_PCT/100),
+                    entry * (1 + tp_ratio1),
+                    entry * (1 + tp_ratio2),
                     SL_MAX_PCT, 0, '?', entry, entry, 0)
-                n_rec+=1; log.info(f"  ♻️ LONG recuperado: {sym} @ ${entry:.6f}")
+                n_rec+=1
+                log.info(f"  ♻️ LONG recuperado: {sym} @ ${entry:.6f}")
         log.info(f"  Recuperadas: {n_rec} | SHORTs cerrados: {n_sh}")
 
     def _scan_orphan_shorts(self):
@@ -841,7 +938,8 @@ class LongBot:
         try:
             b=d.get('data',{}); eq=float(b.get('equity',0) or 0)
             mg=float(b.get('usedMargin',b.get('initialMargin',0)) or 0)
-            if eq>0 and mg/eq*100>=LTV_WARN:
+            ltv_pct = mg / eq * 100 if eq > 0 else 0
+            if eq>0 and ltv_pct >= LTV_WARN:
                 self._tg("<b>⚠️ LTV ALTO</b>")
                 for sym in list(self.trades):
                     tk=self._ticker(sym)
@@ -949,17 +1047,30 @@ class LongBot:
             score += 10; reasons.append("P3_ADX(10)"); factors.append("p3_adx")
 
         # WT en sobreventa profunda (punto extra de calidad)
-        if sig_aurolo['wt_now'] <= WT_OS1:
-            score += 8; reasons.append(f"WT_deep({sig_aurolo['wt_now']:.0f})(8)"); factors.append("wt_deep")
+        wt_val = sig_aurolo['wt_now']
+        if wt_val <= WT_OS1:
+            wt_int = int(wt_val)
+            score += 8
+            reasons.append(f"WT_deep({wt_int})(8)")
+            factors.append("wt_deep")
 
         # ADX fuerte
-        if sig_aurolo['adx_now'] > ADX_KEY * 1.4:
-            score += 6; reasons.append(f"ADX_strong(6)"); factors.append("adx_strong")
+        adx_val = sig_aurolo['adx_now']
+        if adx_val > ADX_KEY * 1.4:
+            score += 6; reasons.append("ADX_strong(6)"); factors.append("adx_strong")
 
         # Volumen en la vela de señal
         vr = sig_aurolo['vol_ratio']
-        if vr >= 2.0:   score += 10; reasons.append(f"Vol{vr:.1f}x(10)"); factors.append("vol_fuerte")
-        elif vr >= 1.4: score += 5;  reasons.append(f"Vol{vr:.1f}x(5)");  factors.append("vol_medio")
+        if vr >= 2.0:
+            vr_str = f"{vr:.1f}"
+            score += 10
+            reasons.append(f"Vol{vr_str}x(10)")
+            factors.append("vol_fuerte")
+        elif vr >= 1.4:
+            vr_str = f"{vr:.1f}"
+            score += 5
+            reasons.append(f"Vol{vr_str}x(5)")
+            factors.append("vol_medio")
 
         # VWAP: precio sobre él suma contexto alcista
         if precio_sobre_vwap:
@@ -970,22 +1081,35 @@ class LongBot:
             score += 12; reasons.append("1H↑(12)"); factors.append("trend_1h_up")
 
         # BTC favorable
-        if self._btc_1h > 1.0:   score += 8; reasons.append(f"BTC↑(8)"); factors.append("btc_up")
-        elif self._btc_1h > 0.3: score += 4; reasons.append(f"BTC~(4)"); factors.append("btc_ok")
+        btc_val = self._btc_1h
+        if btc_val > 1.0:
+            score += 8; reasons.append("BTC↑(8)"); factors.append("btc_up")
+        elif btc_val > 0.3:
+            score += 4; reasons.append("BTC~(4)"); factors.append("btc_ok")
 
         # RSI 1H en zona de oportunidad
-        if rsi_1h < 40:   score += 8; reasons.append(f"RSI1H{rsi_1h:.0f}(8)"); factors.append("rsi_1h_os")
-        elif rsi_1h < 55: score += 4; reasons.append(f"RSI1H{rsi_1h:.0f}(4)"); factors.append("rsi_1h_ok")
+        rsi_int = int(rsi_1h)
+        if rsi_1h < 40:
+            score += 8
+            reasons.append(f"RSI1H{rsi_int}(8)")
+            factors.append("rsi_1h_os")
+        elif rsi_1h < 55:
+            score += 4
+            reasons.append(f"RSI1H{rsi_int}(4)")
+            factors.append("rsi_1h_ok")
 
         # Bonus aprendido por nº de puntos Aurolo
         bonus_p = self.learn.bonus_pts(pts)
         if bonus_p != 0:
-            score += bonus_p; reasons.append(f"LearnPts({bonus_p:+d})"); factors.append(f"learn_pts_{pts}")
+            score += bonus_p
+            reasons.append(f"LearnPts({bonus_p:+d})")
+            factors.append(f"learn_pts_{pts}")
 
         # Ajuste por factores aprendidos
         adj = self.learn.adj(factors)
         if adj != 0:
-            score += adj; reasons.append(f"FactAdj({adj:+d})")
+            score += adj
+            reasons.append(f"FactAdj({adj:+d})")
 
         # Aprendizaje
         ok, reason = self.learn.ok(symbol, score)
@@ -1099,9 +1223,12 @@ class LongBot:
         d=self._order(sym,'SELL',qty,'STOP_MARKET',stop_price=sl_price)
         ok=d.get('code')==0
         if not ok:
-            d=self._order(sym,'SELL',qty,'STOP',price=sl_price*0.999,stop_price=sl_price)
+            sl_limit = sl_price * 0.999
+            d=self._order(sym,'SELL',qty,'STOP',price=sl_limit,stop_price=sl_price)
             ok=d.get('code')==0
-        log.info(f"  {'✅' if ok else '❌'} SL @ ${sl_price:.6f}")
+        sl_str = f"${sl_price:.6f}"
+        icon = '✅' if ok else '❌'
+        log.info(f"  {icon} SL @ {sl_str}")
         return ok
 
     def open_trade(self, sym, sig):
@@ -1119,9 +1246,15 @@ class LongBot:
         pts      = sig['aurolo_pts']
         label    = sig['aurolo_señal']
 
-        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{sig['score']:.0f} | RR:{sig['rr']:.2f}:1")
+        score_int = int(sig['score'])
+        rr_str = f"{sig['rr']:.2f}"
+        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{score_int} | RR:{rr_str}:1")
         log.info(f"  {sig['aurolo_desc']}")
-        log.info(f"  Zona EMA{AUROLO_EMA_LEN}: ${sig['zona_inf']:.4f}–${sig['zona_sup']:.4f}")
+        
+        zona_inf_str = f"${sig['zona_inf']:.4f}"
+        zona_sup_str = f"${sig['zona_sup']:.4f}"
+        ema_len_str = AUROLO_EMA_LEN
+        log.info(f"  Zona EMA{ema_len_str}: {zona_inf_str}–{zona_sup_str}")
 
         self._set_lev(sym); time.sleep(0.2)
 
@@ -1132,7 +1265,9 @@ class LongBot:
         limit_p = round(price * (1-0.05/100), 8)
         d = self._order(sym, 'BUY', qty, 'LIMIT', price=limit_p)
         if d.get('code') != 0:
-            log.error(f"  ❌ LIMIT: {d.get('msg')}"); return False
+            msg = d.get('msg')
+            log.error(f"  ❌ LIMIT: {msg}")
+            return False
 
         oid = d.get('data',{}).get('orderId')
         filled_qty, fill_price = self._wait_fill(sym, oid, 30)
@@ -1141,7 +1276,10 @@ class LongBot:
             log.warning("  ⚠️ LIMIT sin fill → MARKET")
             self._cancel_open(sym); time.sleep(0.5)
             d = self._order(sym, 'BUY', qty, 'MARKET')
-            if d.get('code')!=0: log.error(f"  ❌ MARKET: {d.get('msg')}"); return False
+            if d.get('code')!=0:
+                msg = d.get('msg')
+                log.error(f"  ❌ MARKET: {msg}")
+                return False
             filled_qty, fill_price = self._confirm_pos(sym, 12)
             if not filled_qty: return False
 
@@ -1178,7 +1316,7 @@ class LongBot:
             'vwap':        sig['vwap'],
             'usdt':        POS_SIZE,   'pnl_parcial': 0.0,
             'factors':     sig['factors'],
-            'hora_utc':    sig['hora_utc'],
+            'hora_utc':     sig['hora_utc'],
             'btc_dir':     sig['btc_dir'],
             'debilidad_alertada': False,
         }
@@ -1190,21 +1328,54 @@ class LongBot:
         p1 = "✅" if sig['aurolo_p1'] else "❌"
         p2 = "✅" if sig['aurolo_p2'] else "❌"
         p3 = "✅" if sig['aurolo_p3'] else "❌"
+        
+        score_tg = int(sig['score'])
+        rr_tg = f"{sig['rr']:.2f}"
+        pts_tg = pts
+        
+        ema_len_tg = AUROLO_EMA_LEN
+        ema55_tg = f"${sig['ema55']:.4f}"
+        
+        wt_val_tg = f"{sig['aurolo_wt']:.1f}"
+        wt_check = '(sobreventa✅)' if sig['aurolo_wt'] <= WT_OS2 else ''
+        
+        adx_tg = f"{sig['aurolo_adx']:.1f}"
+        dip_tg = f"{sig['aurolo_dip']:.1f}"
+        din_tg = f"{sig['aurolo_din']:.1f}"
+        
+        fill_tg = f"${fill_price:.6f}"
+        vwap_tg = f"${sig['vwap']:.6f}"
+        
+        tp1_tg = f"${tp1_price:.6f}"
+        tp1_pct_tg = f"{sl_pct_real*TP1_RATIO:.2f}"
+        tp1_pct_int = int(TP1_PCT)
+        
+        tp2_tg = f"${tp2_price:.6f}"
+        tp2_pct_tg = f"{sl_pct_real*TP2_RATIO:.2f}"
+        tp2_pct_int = int(TP2_PCT)
+        
+        runner_pct = int(100 - TP1_PCT - TP2_PCT)
+        
+        sl_tg = f"${sl_price:.6f}"
+        sl_pct_tg = f"{sl_pct_real:.2f}"
+        
+        trend_icon = '🟢' if sig['trend_1h'] == 1 else '⚪'
+        btc_pct_tg = f"{self._btc_1h:+.2f}"
 
         self._tg(
             f"<b>🟢 LONG [{label}]</b> — <b>{sym}</b>\n"
-            f"Score: {sig['score']:.0f} | RR: {sig['rr']:.2f}:1\n\n"
-            f"<b>🔍 Confirmaciones Aurolo {pts}/3:</b>\n"
-            f"{p1} P1 Tendencial EMA{AUROLO_EMA_LEN}: ${sig['ema55']:.4f}\n"
-            f"{p2} P2 WaveTrend: {sig['aurolo_wt']:.1f} {'(sobreventa✅)' if sig['aurolo_wt']<=WT_OS2 else ''}\n"
-            f"{p3} P3 ADX: {sig['aurolo_adx']:.1f} | DI+:{sig['aurolo_dip']:.1f} DI-:{sig['aurolo_din']:.1f}\n\n"
-            f"📍 Entrada:  ${fill_price:.6f}\n"
-            f"📊 VWAP:     ${sig['vwap']:.6f}\n"
-            f"🎯 TP1 ({TP1_PCT:.0f}%): ${tp1_price:.6f} (+{sl_pct_real*TP1_RATIO:.2f}%)\n"
-            f"🎯 TP2 ({TP2_PCT:.0f}%): ${tp2_price:.6f} (+{sl_pct_real*TP2_RATIO:.2f}%)\n"
-            f"🏃 Runner ({100-TP1_PCT-TP2_PCT:.0f}%): EMA25 trailing\n"
-            f"🛑 SL: ${sl_price:.6f} (-{sl_pct_real:.2f}%)\n"
-            f"1H: {'🟢' if sig['trend_1h']==1 else '⚪'} | BTC: {self._btc_1h:+.2f}%"
+            f"Score: {score_tg} | RR: {rr_tg}:1\n\n"
+            f"<b>🔍 Confirmaciones Aurolo {pts_tg}/3:</b>\n"
+            f"{p1} P1 Tendencial EMA{ema_len_tg}: {ema55_tg}\n"
+            f"{p2} P2 WaveTrend: {wt_val_tg} {wt_check}\n"
+            f"{p3} P3 ADX: {adx_tg} | DI+:{dip_tg} DI-:{din_tg}\n\n"
+            f"📍 Entrada:  {fill_tg}\n"
+            f"📊 VWAP:     {vwap_tg}\n"
+            f"🎯 TP1 ({tp1_pct_int}%): {tp1_tg} (+{tp1_pct_tg}%)\n"
+            f"🎯 TP2 ({tp2_pct_int}%): {tp2_tg} (+{tp2_pct_tg}%)\n"
+            f"🏃 Runner ({runner_pct}%): EMA25 trailing\n"
+            f"🛑 SL: {sl_tg} (-{sl_pct_tg}%)\n"
+            f"1H: {trend_icon} | BTC: {btc_pct_tg}%"
         )
         return True
 
@@ -1216,7 +1387,9 @@ class LongBot:
         if qty <= 0: return 0
         d = self._order(sym, 'SELL', qty, 'MARKET')
         if d.get('code') != 0:
-            log.error(f"  ❌ Parcial {label} {sym}: {d.get('msg')}"); return 0
+            msg = d.get('msg')
+            log.error(f"  ❌ Parcial {label} {sym}: {msg}")
+            return 0
         t = self.trades[sym]
         chg  = (exit_price - t['entry']) / t['entry']
         frac = qty / t['qty_total']
@@ -1224,8 +1397,13 @@ class LongBot:
         t['pnl_parcial']  += net; t['qty_runner'] -= qty
         self.stats['fees'] += POS_SIZE*LEVERAGE*FEE*2*frac
         self._daily_pnl   += net; self.stats['pnl'] += net
-        log.info(f"  💰 {label} {sym}: ${net:+.4f} | Resta:{t['qty_runner']:.4f}")
-        self._tg(f"<b>💰 {label}</b> — {sym}\n${exit_price:.6f}\nPnL: ${net:+.4f}")
+        
+        net_str = f"${net:+.4f}"
+        qty_str = f"{t['qty_runner']:.4f}"
+        log.info(f"  💰 {label} {sym}: {net_str} | Resta:{qty_str}")
+        
+        exit_str = f"${exit_price:.6f}"
+        self._tg(f"<b>💰 {label}</b> — {sym}\n{exit_str}\nPnL: {net_str}")
         return net
 
     def _close_all(self, sym, exit_price, reason):
@@ -1251,7 +1429,11 @@ class LongBot:
         emoji = "✅" if win else "❌"
         pct   = net_total/POS_SIZE*100
 
-        log.info(f"  {emoji} {reason} | ${net_total:+.4f} ({pct:+.1f}%) | {mins}min | WR:{wr:.0f}%")
+        net_str = f"${net_total:+.4f}"
+        pct_str = f"{pct:+.1f}"
+        wr_str = f"{wr:.0f}"
+        log.info(f"  {emoji} {reason} | {net_str} ({pct_str}%) | {mins}min | WR:{wr_str}%")
+        
         self.learn.record(
             symbol=sym, score=t['score'], pnl=net_total, win=win,
             hora_utc=t.get('hora_utc',datetime.utcnow().hour),
@@ -1260,12 +1442,19 @@ class LongBot:
             reason=reason, factors=t.get('factors',[]),
         )
         self._set_cd(sym, 'TP' if any(k in reason for k in ['TP','EMA','PROFIT']) else 'SL')
+        
+        entry_str = f"${t['entry']:.6f}"
+        exit_str = f"${exit_price:.6f}"
+        parcial_str = f"${t['pnl_parcial']:+.4f}"
+        runner_str = f"${net_r:+.4f}"
+        label = t.get('entrada_label', '?')
+        
         self._tg(
             f"<b>{emoji} CERRADO — {reason}</b>\n"
-            f"<b>{sym}</b> | {t.get('entrada_label','?')} | {mins}min\n"
-            f"${t['entry']:.6f} → ${exit_price:.6f}\n"
-            f"Parcial: ${t['pnl_parcial']:+.4f} | Runner: ${net_r:+.4f}\n"
-            f"<b>PnL: ${net_total:+.4f} ({pct:+.1f}%) | WR: {wr:.0f}%</b>"
+            f"<b>{sym}</b> | {label} | {mins}min\n"
+            f"{entry_str} → {exit_str}\n"
+            f"Parcial: {parcial_str} | Runner: {runner_str}\n"
+            f"<b>PnL: {net_str} ({pct_str}%) | WR: {wr_str}%</b>"
         )
         if self.stats['closed'] % 3 == 0: self.learn.save()
         del self.trades[sym]
@@ -1296,11 +1485,17 @@ class LongBot:
                     sig_live = aurolo_signal(c5, h5, l5, v5 or [1]*len(c5), c5, atr_live)
                     if sig_live['debilidad']:
                         t['debilidad_alertada'] = True
-                        log.warning(f"  ⚠️ DEBILIDAD {sym}: WT={sig_live['wt_now']:.0f} ADX={sig_live['adx_now']:.0f} | {pct:+.2f}%")
+                        wt_live = f"{sig_live['wt_now']:.0f}"
+                        adx_live = f"{sig_live['adx_now']:.0f}"
+                        pct_str = f"{pct:+.2f}"
+                        log.warning(f"  ⚠️ DEBILIDAD {sym}: WT={wt_live} ADX={adx_live} | {pct_str}%")
+                        
+                        wt_live_tg = f"{sig_live['wt_now']:.1f}"
+                        adx_live_tg = f"{sig_live['adx_now']:.1f}"
                         self._tg(
                             f"<b>⚠️ SEÑAL DEBILIDAD — {sym}</b>\n"
-                            f"Momentum agotándose | {pct:+.2f}% desde entrada\n"
-                            f"WT={sig_live['wt_now']:.1f} | ADX={sig_live['adx_now']:.1f} cayendo\n"
+                            f"Momentum agotándose | {pct_str}% desde entrada\n"
+                            f"WT={wt_live_tg} | ADX={adx_live_tg} cayendo\n"
                             f"Considera salida manual"
                         )
                     # CAMBIO DE TENDENCIA = cerrar inmediatamente (EMA55 cruzó)
@@ -1313,22 +1508,26 @@ class LongBot:
 
                 # ── TP1: 40% al 1×SL ─────────────────────────────────
                 if not t['tp1_hit'] and cur >= t['tp1_price']:
-                    self._close_partial(sym, t['qty_tp1'], cur, f"TP1({TP1_PCT:.0f}%)")
+                    tp1_pct_str = f"{TP1_PCT:.0f}"
+                    self._close_partial(sym, t['qty_tp1'], cur, f"TP1({tp1_pct_str}%)")
                     t['tp1_hit'] = True
                     be = t['entry'] * 1.001
                     if be > t['sl']:
                         t['sl'] = be
-                        log.info(f"  🔒 {sym} SL → break-even ${be:.6f}")
+                        be_str = f"${be:.6f}"
+                        log.info(f"  🔒 {sym} SL → break-even {be_str}")
                     continue
 
                 # ── TP2: 35% al 2×SL ─────────────────────────────────
                 if t['tp1_hit'] and not t['tp2_hit'] and cur >= t['tp2_price']:
-                    self._close_partial(sym, t['qty_tp2'], cur, f"TP2({TP2_PCT:.0f}%)")
+                    tp2_pct_str = f"{TP2_PCT:.0f}"
+                    self._close_partial(sym, t['qty_tp2'], cur, f"TP2({tp2_pct_str}%)")
                     t['tp2_hit'] = True
                     locked = t['entry'] + (cur - t['entry']) * 0.5
                     if locked > t['sl']:
                         t['sl'] = locked
-                        log.info(f"  🔒 {sym} SL → ${locked:.6f}")
+                        locked_str = f"${locked:.6f}"
+                        log.info(f"  🔒 {sym} SL → {locked_str}")
                     continue
 
                 # ── RUNNER (25%): EMA25 trailing ─────────────────────
@@ -1386,8 +1585,9 @@ class LongBot:
             return self._cb_active
         if self._daily_pnl < -CB_USDT:
             self._cb_active=True; self._cb_until=datetime.utcnow()+timedelta(hours=CB_HOURS)
-            log.warning(f"  🔒 CIRCUIT BREAKER | ${self._daily_pnl:.3f}")
-            self._tg(f"<b>🔒 CIRCUIT BREAKER</b>\nPérdida: ${self._daily_pnl:.3f} | Pausa {CB_HOURS}h")
+            pnl_str = f"${self._daily_pnl:.3f}"
+            log.warning(f"  🔒 CIRCUIT BREAKER | {pnl_str}")
+            self._tg(f"<b>🔒 CIRCUIT BREAKER</b>\nPérdida: {pnl_str} | Pausa {CB_HOURS}h")
         return self._cb_active
 
     def _report(self):
@@ -1400,21 +1600,35 @@ class LongBot:
             tk=self._ticker(sym); cur=tk['price'] if tk else t['entry']
             pct=(cur-t['entry'])/t['entry']*100
             tp_st = "TP1✅TP2✅" if t['tp2_hit'] else "TP1✅" if t['tp1_hit'] else "→TP1"
-            pos += f"  📌 {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}% {tp_st}\n"
+            pts_t = t['aurolo_pts']
+            pct_str = f"{pct:+.2f}"
+            pos += f"  📌 {sym}[{pts_t}/3]: {pct_str}% {tp_st}\n"
+        
+        pnl_str = f"${self.stats['pnl']:+.4f}"
+        wr_str = f"{wr:.0f}"
+        daily_str = f"${self._daily_pnl:+.4f}"
+        eq_str = f"${ACCOUNT_EQUITY:.2f}"
+        score_str = f"{self.learn.opt_score:.0f}"
+        btc_str = f"{self._btc_1h:+.2f}"
+        
         self._tg(
             f"<b>📊 Reporte v5.5</b>\n"
-            f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% | {total}t\n"
-            f"Día: ${self._daily_pnl:+.4f} | Equity: ${ACCOUNT_EQUITY:.2f}\n"
-            f"Score mín: {self.learn.opt_score:.0f} | BTC: {self._btc_1h:+.2f}%\n"
+            f"PnL: {pnl_str} | WR: {wr_str}% | {total}t\n"
+            f"Día: {daily_str} | Equity: {eq_str}\n"
+            f"Score mín: {score_str} | BTC: {btc_str}%\n"
             + (pos if pos else "  Sin posiciones\n")
         )
 
     def _tg(self, msg):
         try:
             if TG_TOKEN and TG_CHAT:
-                requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                              json={'chat_id':TG_CHAT,'text':msg,'parse_mode':'HTML'},timeout=6)
-        except: pass
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={'chat_id': TG_CHAT, 'text': msg, 'parse_mode': 'HTML'},
+                    timeout=6
+                )
+        except:
+            pass
 
     # ════════════════════════════════════════════════════════════════
     # LOOP PRINCIPAL
@@ -1438,34 +1652,48 @@ class LongBot:
 
                 total=self.stats['wins']+self.stats['losses']
                 wr=self.stats['wins']/total*100 if total else 0
+                
+                now_time = datetime.now().strftime('%H:%M:%S')
+                trades_count = len(self.trades)
+                pnl_str = f"${self.stats['pnl']:+.4f}"
+                wr_str = f"{wr:.0f}"
+                btc_str = f"{self._btc_1h:+.2f}"
+                eq_str = f"${ACCOUNT_EQUITY:.2f}"
+                score_str = f"{self.learn.opt_score:.0f}"
+                
                 log.info(f"\n{'='*72}")
-                log.info(f"  #{iteration} {datetime.now().strftime('%H:%M:%S')} | "
-                         f"Abiertos:{len(self.trades)}/{MAX_TRADES} | "
-                         f"PnL:${self.stats['pnl']:+.4f} | WR:{wr:.0f}%")
-                log.info(f"  BTC:{self._btc_1h:+.2f}% | Equity:${ACCOUNT_EQUITY:.2f} | "
-                         f"Score mín:{self.learn.opt_score:.0f}")
+                log.info(f"  #{iteration} {now_time} | "
+                         f"Abiertos:{trades_count}/{MAX_TRADES} | "
+                         f"PnL:{pnl_str} | WR:{wr_str}%")
+                log.info(f"  BTC:{btc_str}% | Equity:{eq_str} | "
+                         f"Score mín:{score_str}")
                 log.info(f"{'='*72}\n")
 
                 await self.monitor()
                 self._report()
 
                 if len(self.trades) < MAX_TRADES:
-                    log.info(f"  Escaneando {len(self.symbols)} símbolos...")
+                    syms_len = len(self.symbols)
+                    log.info(f"  Escaneando {syms_len} símbolos...")
                     found = 0
                     for i, sym in enumerate(self.symbols):
                         if len(self.trades) >= MAX_TRADES: break
                         sig = self.analyze(sym)
                         if sig:
                             found += 1
+                            score_s = f"{sig['score']:.0f}"
+                            rr_s = f"{sig['rr']:.2f}"
+                            wt_s = f"{sig['aurolo_wt']:.0f}"
+                            adx_s = f"{sig['aurolo_adx']:.0f}"
                             log.info(
                                 f"  💡 {sym} [{sig['aurolo_señal']}] | "
-                                f"Score:{sig['score']:.0f} | RR:{sig['rr']:.2f}:1 | "
-                                f"WT={sig['aurolo_wt']:.0f} ADX={sig['aurolo_adx']:.0f}"
+                                f"Score:{score_s} | RR:{rr_s}:1 | "
+                                f"WT={wt_s} ADX={adx_s}"
                             )
                             if self.open_trade(sym, sig):
                                 await asyncio.sleep(3)
                         if (i+1) % 15 == 0:
-                            log.info(f"  ...{i+1}/{len(self.symbols)}")
+                            log.info(f"  ...{i+1}/{syms_len}")
                         await asyncio.sleep(0.12)
                     log.info(f"  ✅ Scan: {found} señales")
                 else:
