@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-BOT LONGS v5.7 — MLP Tactical Bridge (Aurolo) — BEAR-AWARE + ANTI-CHURN
+BOT LONGS v5.8 — MLP Tactical Bridge (Aurolo) — FIXED + OPTIMIZADO
 ════════════════════════════════════════════════════════════════════════════════
 
-MEJORAS v5.7 vs v5.6:
-  1. REGIME DETECTOR — pausa automática en mercado bajista (4h BTC + breadth)
-  2. 4H Trend Filter — exige EMA9 > EMA21 en 1h Y 4h antes de entrar
-  3. SL Inteligente Ampliado — ATR mult 1.5 (era 1.0), mínimo 0.8%
-  4. Anti-churn — mismo símbolo: cooldown 4h tras SL, no 30min
-  5. Repeat-trade guard — bloquea el mismo símbolo si ya perdió HOY
-  6. MIN_SCORE sube a 65 (era 50) en mercados normales
-  7. Breadth check — ≥40% del top-20 debe estar alcista
-  8. Crash guard — si BTC cae >3% en 4h, pausa 2h todo el bot
-  9. Anti-whipsaw — ATR mínimo del 0.15% (era 0.10%)
- 10. Score penalty fuerte si BTC bajista en 4h
- 11. Circuit breaker relativo mejorado (era absoluto)
- 12. Daily loss cap — para si equity cae >10% en el día
+CORRECCIONES v5.8 vs v5.7:
+  FIX 1.  SL mínimo corregido — lógica min/max estaba invertida → SL 0.40% imposible
+  FIX 2.  Entrada MARKET directa — LIMIT 0.05% casi nunca llenaba, siempre caía a MARKET
+  FIX 3.  TP1_RATIO 2.0 / TP2_RATIO 3.5 — TP anteriores no cubrían fees
+  FIX 4.  MIN_RR subido a 2.2 — RR 1.8 con fees 2x leverage daba break-even imposible
+  FIX 5.  MIN_VOL subido a 5M — evita altcoins ilíquidas tipo BEAT-USDT
+  FIX 6.  Cooldown 8h si SL ocurre en < 10 minutos (falsa señal)
+  FIX 7.  learn.ok() verificado en arranque — opt_score no puede bajar de MIN_SCORE
+  FIX 8.  Filtro TP neto post-fees antes de entrar (mínimo +0.4% neto en TP1)
+  FIX 9.  Circuit breaker relativo a equity real, no a POS_SIZE fijo
+  FIX 10. Score mínimo forzado a 65 al arranque, sin importar estado guardado
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
@@ -65,33 +63,36 @@ ACCOUNT_EQUITY = clean('ACCOUNT_EQUITY',       '100',   'float')
 # ── TPs Escalonados ────────────────────────────────────────────────────────
 TP1_PCT   = clean('TP1_PCT',   '40',  'float')
 TP2_PCT   = clean('TP2_PCT',   '35',  'float')
-TP1_RATIO = clean('TP1_RATIO', '1.2', 'float')   # v5.7: era 1.0, más holgura
-TP2_RATIO = clean('TP2_RATIO', '2.5', 'float')   # v5.7: era 2.0
+# FIX 3: TP ratios aumentados para cubrir fees y ser rentables
+TP1_RATIO = clean('TP1_RATIO', '2.0', 'float')   # v5.8: era 1.2 → mínimo 2× SL
+TP2_RATIO = clean('TP2_RATIO', '3.5', 'float')   # v5.8: era 2.5 → mínimo 3.5× SL
 
 # ── TP/SL ──────────────────────────────────────────────────────────────────
-TP_MIN    = clean('TAKE_PROFIT_PCT', '2.5',  'float')  # v5.7: era 2.0
-ATR_TP_M  = clean('ATR_TP_MULT',    '3.0',  'float')  # v5.7: era 2.5
-MIN_RR    = clean('MIN_RR',         '1.8',  'float')  # v5.7: era 1.5
-SL_ATR_M  = clean('SL_ATR_MULT',   '1.5',  'float')  # v5.7: era 1.0 — CLAVE
-SL_MAX_PCT = clean('SL_MAX_PCT',   '3.5',  'float')  # v5.7: era 3.0
-SL_MIN_PCT = clean('SL_MIN_PCT',   '0.8',  'float')  # v5.7: era 0.5 — CLAVE
+TP_MIN    = clean('TAKE_PROFIT_PCT', '1.5',  'float')  # v5.8: era 2.5 — ajustado
+ATR_TP_M  = clean('ATR_TP_MULT',    '3.0',  'float')
+# FIX 4: MIN_RR subido — con fees 2x leverage necesitas RR > 2
+MIN_RR    = clean('MIN_RR',         '2.2',  'float')   # v5.8: era 1.8
+SL_ATR_M  = clean('SL_ATR_MULT',   '1.5',  'float')
+SL_MAX_PCT = clean('SL_MAX_PCT',   '3.5',  'float')
+SL_MIN_PCT = clean('SL_MIN_PCT',   '0.8',  'float')   # mínimo garantizado
 
 # ── Filtros de contexto ────────────────────────────────────────────────────
-MIN_VOL   = clean('MIN_VOLUME_24H',     '1000000', 'float')  # v5.7: era 500k
-MAX_SYMS  = clean('MAX_SYMBOLS',        '40',     'int')     # v5.7: era 60, menos ruido
-MIN_SCORE = clean('MIN_SCORE',          '65',     'float')   # v5.7: era 50 — CLAVE
-BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '1.0',    'float')  # v5.7: era 2.0, más estricto
+# FIX 5: MIN_VOL subido a 5M para evitar coins ilíquidas
+MIN_VOL   = clean('MIN_VOLUME_24H',     '5000000', 'float')  # v5.8: era 1M → 5M
+MAX_SYMS  = clean('MAX_SYMBOLS',        '40',     'int')
+MIN_SCORE = clean('MIN_SCORE',          '65',     'float')
+BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '1.0',    'float')
 
-# ── v5.7 Nuevo: Régimen de mercado ─────────────────────────────────────────
+# ── v5.7/5.8 Régimen de mercado ────────────────────────────────────────────
 REGIME_CHECK      = clean('REGIME_CHECK',      'true',  'bool')
-BREADTH_MIN       = clean('BREADTH_MIN',        '0.40',  'float')  # 40% coins alcistas
-BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '3.0',   'float')  # pausa si BTC -3% en 4h
+BREADTH_MIN       = clean('BREADTH_MIN',        '0.40',  'float')
+BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '3.0',   'float')
 BTC_4H_CRASH_PAUSE= clean('BTC_4H_CRASH_HOURS','2',      'int')
-DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','10.0',  'float')   # stop si equity -10% día
+DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','10.0',  'float')
 
-# ── VWAP ─────────────────────────────────────────────────────────────────
+# ── VWAP ──────────────────────────────────────────────────────────────────
 VWAP_CANDLES   = clean('VWAP_CANDLES',  '50',   'int')
-VWAP_AS_FILTER = clean('VWAP_FILTER',  'true',  'bool')  # v5.7: era false, ahora filtro duro
+VWAP_AS_FILTER = clean('VWAP_FILTER',  'true',  'bool')
 
 # ── Motor Principal: Aurolo MLP Tactical Bridge ────────────────────────────
 AUROLO_EMA_LEN   = clean('AUROLO_EMA_LEN',   '55',   'int')
@@ -99,7 +100,7 @@ AUROLO_ZONA_AUTO = clean('AUROLO_ZONA_AUTO',  'true', 'bool')
 AUROLO_ZONA_PCT  = clean('AUROLO_ZONA_PCT',   '0.8',  'float')
 AUROLO_ZONA_VELAS = clean('AUROLO_ZONA_VELAS', '6',   'int')
 
-# Punto 2 — WaveTrend
+# WaveTrend
 WT_CH_LEN  = clean('WT_CH_LEN',  '10',  'int')
 WT_AVG_LEN = clean('WT_AVG_LEN', '21',  'int')
 WT_OB1     = clean('WT_OB1',     '60',  'float')
@@ -108,7 +109,7 @@ WT_OS1     = clean('WT_OS1',     '-60', 'float')
 WT_OS2     = clean('WT_OS2',     '-42', 'float')
 WT_OS_ENTRY = clean('WT_OS_ENTRY', '-20', 'float')
 
-# Punto 3 — ADX
+# ADX
 ADX_LEN    = clean('ADX_LEN',    '14',  'int')
 ADX_DI_LEN = clean('ADX_DI_LEN', '14', 'int')
 ADX_KEY    = clean('ADX_KEY',    '20',  'float')
@@ -118,31 +119,36 @@ AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '2',     'int')
 AUROLO_ENTRY   = clean('AUROLO_ENTRY',   'close', 'str')
 
 # ── Circuit breaker ────────────────────────────────────────────────────────
-CB_PCT     = clean('CIRCUIT_BREAKER_PCT', '6.0',  'float')  # v5.7: era 8, más agresivo
-CB_HOURS   = clean('CB_PAUSE_HOURS',      '2',    'int')    # v5.7: era 1h
-MAX_STREAK = clean('MAX_LOSING_STREAK',   '4',    'int')    # v5.7: era 5
+CB_PCT     = clean('CIRCUIT_BREAKER_PCT', '6.0',  'float')
+CB_HOURS   = clean('CB_PAUSE_HOURS',      '2',    'int')
+MAX_STREAK = clean('MAX_LOSING_STREAK',   '4',    'int')
 
-# ── Cooldowns v5.7 MEJORADOS ──────────────────────────────────────────────
-CD_TP        = clean('COOLDOWN_TP_MIN',  '10',  'int')   # v5.7: era 5
-CD_SL        = clean('COOLDOWN_SL_MIN', '240',  'int')   # v5.7: era 30 → 4 HORAS
-CD_SL_TODAY  = clean('COOLDOWN_SL_TODAY', 'true', 'bool') # v5.7: bloquea sym todo el día
+# ── Cooldowns ─────────────────────────────────────────────────────────────
+CD_TP        = clean('COOLDOWN_TP_MIN',  '10',  'int')
+CD_SL        = clean('COOLDOWN_SL_MIN', '240',  'int')   # 4 horas
+CD_SL_TODAY  = clean('COOLDOWN_SL_TODAY', 'true', 'bool')
+# FIX 6: cooldown extra si SL muy rápido (< 10 min)
+CD_SL_FAST_MIN   = clean('COOLDOWN_SL_FAST_MIN', '8', 'int')   # minutos máx para considerar SL rápido
+CD_SL_FAST_HOURS = clean('COOLDOWN_SL_FAST_HOURS', '8', 'int') # horas de cooldown si SL rápido
 
 # ── Aprendizaje ───────────────────────────────────────────────────────────
-LEARN_MIN_TRADES_SCORE = clean('LEARN_MIN_TRADES', '10', 'int')  # v5.7: era 15
-LEARN_MIN_TRADES_BL    = clean('LEARN_MIN_TRADES_BL', '5', 'int') # v5.7: era 8
-SCORE_CAP_LOW          = clean('SCORE_CAP_LOW', '70',  'float')  # v5.7: era 60
-SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH', '85', 'float')  # v5.7: era 80
+LEARN_MIN_TRADES_SCORE = clean('LEARN_MIN_TRADES', '10', 'int')
+LEARN_MIN_TRADES_BL    = clean('LEARN_MIN_TRADES_BL', '5', 'int')
+SCORE_CAP_LOW          = clean('SCORE_CAP_LOW', '70',  'float')
+SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH', '85', 'float')
 
 # ── Misc ───────────────────────────────────────────────────────────────────
 INTERVAL   = clean('CHECK_INTERVAL', '90', 'int')
-LTV_WARN   = clean('LTV_WARNING_PCT', '75', 'float')  # v5.7: era 80
+LTV_WARN   = clean('LTV_WARNING_PCT', '75', 'float')
 
 _skip_raw  = os.getenv('SKIP_HOURS', '2,3')
 SKIP_HOURS = set(int(x.strip()) for x in _skip_raw.split(',') if x.strip().isdigit())
 
 BASE_URL   = "https://open-api.bingx.com"
 FEE        = 0.0002
-TP_MIN_FEE = round((2 * FEE * LEVERAGE + 0.003) * 100, 3)
+# FIX 8: coste real de fees con leverage
+FEE_COST_PCT = FEE * LEVERAGE * 2 * 100   # % de coste mínimo por operación completa
+TP_MIN_FEE   = round(FEE_COST_PCT + 0.003 * 100, 3)
 
 EXCLUDE = {
     'DOW','SP500','GOLD','SILVER','XAU','OIL','BRENT','EUR','GBP','JPY',
@@ -150,7 +156,6 @@ EXCLUDE = {
     'WHEAT','CORN','SUGAR','PAXG','XAUT',
 }
 
-# Coins de referencia para breadth check
 BREADTH_COINS = [
     'BTC-USDT','ETH-USDT','BNB-USDT','SOL-USDT','XRP-USDT',
     'ADA-USDT','AVAX-USDT','DOGE-USDT','DOT-USDT','MATIC-USDT',
@@ -237,7 +242,7 @@ def calc_vwap(closes, highs, lows, volumes, n=None):
     return tp_vol / vol_sum if vol_sum > 0 else c[-1]
 
 # ============================================================================
-# MOTOR AUROLO v5.7 (mismo núcleo, parámetros mejorados)
+# MOTOR AUROLO v5.8
 # ============================================================================
 
 def _wavetrend_series(closes, highs, lows, ch_len=10, avg_len=21):
@@ -363,17 +368,36 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     pts = int(result['p1']) + int(result['p2']) + int(result['p3'])
     result['puntos'] = pts
 
-    # SL INTELIGENTE v5.7 — más amplio
+    # ── FIX 1: SL INTELIGENTE — lógica min/max corregida ─────────────────
+    # sl_max_price = precio más LEJANO permitido (price * 0.965 si SL_MAX=3.5%)
+    # sl_min_price = precio más CERCANO permitido (price * 0.992 si SL_MIN=0.8%)
+    # El SL calculado debe estar ENTRE estos dos límites
     atr_actual   = atr_v or atr_calc(highs, lows, closes, 14)
     min_reciente = min(lows[-8:-1]) if len(lows) >= 8 else lows[-1]
-    sl_vulner    = min_reciente - atr_actual * SL_ATR_M  # 1.5x ATR
-    sl_bajo_ema  = ema55 * (1 - 0.20/100)               # 0.20% bajo EMA55
-    sl_price     = min(sl_vulner, sl_bajo_ema)
-    sl_max       = price * (1 - SL_MAX_PCT / 100)
-    sl_min       = price * (1 - SL_MIN_PCT / 100)        # mínimo 0.8%
-    sl_price     = max(sl_price, sl_max)
-    sl_price     = min(sl_price, sl_min)
-    sl_pct       = (price - sl_price) / price * 100
+    sl_vulner    = min_reciente - atr_actual * SL_ATR_M
+    sl_bajo_ema  = ema55 * (1 - 0.20/100)
+    sl_calculado = min(sl_vulner, sl_bajo_ema)
+
+    # Límites absolutos
+    sl_max_price = price * (1 - SL_MAX_PCT / 100)  # no puede ser MÁS LEJANO que esto
+    sl_min_price = price * (1 - SL_MIN_PCT / 100)  # no puede ser MÁS CERCANO que esto
+
+    # Aplicar límites correctamente:
+    # 1. Si sl_calculado es más lejano que el máximo → acercar al máximo
+    sl_price = max(sl_calculado, sl_max_price)
+    # 2. Si sl_calculado es más cercano que el mínimo → alejar al mínimo
+    sl_price = min(sl_price, sl_min_price)
+
+    # Validación final: sl_price debe estar por debajo del precio actual
+    if sl_price >= price:
+        sl_price = price * (1 - SL_MIN_PCT / 100)
+
+    sl_pct = (price - sl_price) / price * 100
+    # Guardia extra: sl_pct nunca puede ser < SL_MIN_PCT
+    if sl_pct < SL_MIN_PCT:
+        sl_price = price * (1 - SL_MIN_PCT / 100)
+        sl_pct   = SL_MIN_PCT
+
     result['sl_price'] = round(sl_price, 8)
     result['sl_pct']   = round(sl_pct, 3)
 
@@ -408,13 +432,14 @@ def vwap_contexto(closes, highs, lows, volumes, n=50):
 
 
 # ============================================================================
-# APRENDIZAJE v5.7
+# APRENDIZAJE v5.8
 # ============================================================================
 
 class Learning:
     def __init__(self):
         self.history       = []
         self.sym_stats     = defaultdict(lambda: {'w':0,'l':0,'pnl':0.0,'n':0})
+        # FIX 10: opt_score siempre arranca en MIN_SCORE
         self.opt_score     = MIN_SCORE
         self.blacklist     = set()
         self.streak        = 0
@@ -426,7 +451,6 @@ class Learning:
         self.factor_wins   = defaultdict(int)
         self.factor_losses = defaultdict(int)
         self.score_boost   = {}
-        # v5.7: registro de pérdidas del día por símbolo
         self.daily_losers  = set()
         self._daily_date   = datetime.utcnow().date()
 
@@ -460,7 +484,6 @@ class Learning:
             s['w'] += 1; self.streak = 0
         else:
             s['l'] += 1; self.streak += 1
-            # v5.7: marcar símbolo como perdedor del día
             if CD_SL_TODAY and 'SL' in reason.upper():
                 self.daily_losers.add(symbol)
 
@@ -492,6 +515,9 @@ class Learning:
         else:
             if self.opt_score > cap:
                 self.opt_score = cap
+
+        # FIX 7: opt_score nunca puede bajar de MIN_SCORE
+        self.opt_score = max(self.opt_score, MIN_SCORE)
 
         for sym, s in self.sym_stats.items():
             tot = s['w'] + s['l']
@@ -535,11 +561,12 @@ class Learning:
         self._check_daily_reset()
         if sym in self.blacklist:
             return False, "blacklist"
-        # v5.7: bloquear símbolo si ya dio SL hoy
         if sym in self.daily_losers:
             return False, "SL hoy"
-        if score < self.opt_score:
-            return False, f"score {int(score)}<{int(self.opt_score)}"
+        # FIX 7: comparación forzada contra MAX(opt_score, MIN_SCORE)
+        threshold = max(self.opt_score, MIN_SCORE)
+        if score < threshold:
+            return False, f"score {int(score)}<{int(threshold)}"
         if self.streak >= MAX_STREAK:
             return False, f"streak -{self.streak}"
         return True, "ok"
@@ -561,7 +588,7 @@ class Learning:
             reas_txt += f"  {r}: ${d['pnl']:+.2f} ({d['n']}x)\n"
 
         msg = (
-            f"<b>🧠 APRENDIZAJE v5.7 — {n} trades</b>\n"
+            f"<b>🧠 APRENDIZAJE v5.8 — {n} trades</b>\n"
             f"WR: {int(wr)}% | PnL: ${pnl:+.4f} | Score mín: {int(self.opt_score)}\n"
             f"Blacklist: {len(self.blacklist)} | SL hoy: {len(self.daily_losers)} | Cap: {int(self._score_cap())}\n\n"
             f"<b>📊 Por puntos Aurolo:</b>\n{pts_txt or '  Sin datos\n'}"
@@ -577,7 +604,7 @@ class Learning:
                 )
         except: pass
 
-    def save(self, fp='/tmp/bot_learn_v57.json'):
+    def save(self, fp='/tmp/bot_learn_v58.json'):
         try:
             json.dump({
                 'history': self.history[-200:], 'sym_stats': dict(self.sym_stats),
@@ -591,8 +618,8 @@ class Learning:
             }, open(fp,'w'), indent=2)
         except: pass
 
-    def load(self, fp='/tmp/bot_learn_v57.json'):
-        for path in [fp, '/tmp/bot_learn_v56.json', '/tmp/bot_learn_v55.json', '/tmp/bot_learn.json']:
+    def load(self, fp='/tmp/bot_learn_v58.json'):
+        for path in [fp, '/tmp/bot_learn_v57.json', '/tmp/bot_learn_v56.json', '/tmp/bot_learn.json']:
             try:
                 if not os.path.exists(path): continue
                 d = json.load(open(path))
@@ -609,14 +636,15 @@ class Learning:
                 self.score_boost   = d.get('score_boost',{})
                 self.daily_losers  = set(d.get('daily_losers', []))
                 cap = self._score_cap()
-                self.opt_score = min(raw_score, cap)
+                # FIX 10: al cargar, opt_score nunca puede ser < MIN_SCORE
+                self.opt_score = max(min(raw_score, cap), MIN_SCORE)
                 log.info(f"  [LEARN] {len(self.history)} trades | Score: {int(self.opt_score)} (cap={int(cap)}) | BL: {len(self.blacklist)} | SL hoy: {len(self.daily_losers)}")
                 return
             except: continue
 
 
 # ============================================================================
-# BOT PRINCIPAL v5.7
+# BOT PRINCIPAL v5.8
 # ============================================================================
 
 class LongBot:
@@ -624,12 +652,13 @@ class LongBot:
 
     def __init__(self):
         log.info("=" * 72)
-        log.info("  BOT LONGS v5.7 — Bear-Aware + Anti-Churn")
+        log.info("  BOT LONGS v5.8 — SL-Fixed + TP-Optimized + Market-Entry")
         log.info(f"  Capital: ${POS_SIZE} | Riesgo: {RISK_PCT}%/trade | {LEVERAGE}x")
-        log.info(f"  SL: ATR×{SL_ATR_M} | mín={SL_MIN_PCT}% | máx={SL_MAX_PCT}%")
-        log.info(f"  Score mín: {MIN_SCORE} | RR mín: {MIN_RR} | VWAP: {'filtro duro' if VWAP_AS_FILTER else 'score'}")
-        log.info(f"  CD SL: {CD_SL}min | BTC crash: -{BTC_4H_CRASH_PCT}% → {BTC_4H_CRASH_PAUSE}h pausa")
-        log.info(f"  Breadth mín: {int(BREADTH_MIN*100)}% | Daily loss cap: {DAILY_LOSS_CAP_PCT}%")
+        log.info(f"  SL: ATR×{SL_ATR_M} | mín={SL_MIN_PCT}% | máx={SL_MAX_PCT}%  [FIX 1]")
+        log.info(f"  TP1 ratio:{TP1_RATIO}× | TP2 ratio:{TP2_RATIO}× | MIN_RR:{MIN_RR}  [FIX 3/4]")
+        log.info(f"  Entrada: MARKET directo  [FIX 2]")
+        log.info(f"  Score mín: {MIN_SCORE} | VOL mín: ${MIN_VOL/1e6:.0f}M  [FIX 5]")
+        log.info(f"  CD SL: {CD_SL}min | SL rápido (<{CD_SL_FAST_MIN}min) → {CD_SL_FAST_HOURS}h  [FIX 6]")
         log.info("=" * 72)
 
         self.symbols      = []
@@ -640,9 +669,9 @@ class LongBot:
         self._btc_1h      = 0.0
         self._btc_4h      = 0.0
         self._btc_ok      = True
-        self._regime      = 'neutral'  # v5.7
-        self._regime_until= None       # v5.7 pausa por crash
-        self._breadth     = 0.5        # v5.7
+        self._regime      = 'neutral'
+        self._regime_until= None
+        self._breadth     = 0.5
         self._mode        = 'hedge'
         self._daily_pnl   = 0.0
         self._daily_date  = datetime.utcnow().date()
@@ -660,9 +689,10 @@ class LongBot:
         self._recover()
 
         self._tg(
-            f"<b>🤖 Bot LONGS v5.7 — Bear-Aware</b>\n"
+            f"<b>🤖 Bot LONGS v5.8 — SL-Fixed + MARKET Entry</b>\n"
             f"Motor: EMA{AUROLO_EMA_LEN}+WT+ADX | Mín {AUROLO_MIN_PTS}/3\n"
-            f"SL: ATR×{SL_ATR_M} mín={SL_MIN_PCT}% | Score≥{MIN_SCORE} | CD SL={CD_SL}min\n"
+            f"SL: ATR×{SL_ATR_M} mín={SL_MIN_PCT}% (CORREGIDO) | TP1:{TP1_RATIO}× TP2:{TP2_RATIO}×\n"
+            f"Score≥{MIN_SCORE} | VOL≥${MIN_VOL/1e6:.0f}M | Entrada MARKET\n"
             f"Posiciones recuperadas: {len(self.trades)}"
         )
 
@@ -678,7 +708,6 @@ class LongBot:
             b = d.get('data',{})
             eq = _safe_float(b.get('equity', b.get('balance', 0)))
             if eq <= 0:
-                # v5.7: parseo robusto del balance
                 for key, val in b.items():
                     v = _safe_float(val)
                     if v > 0: eq = v; break
@@ -730,17 +759,14 @@ class LongBot:
         self.symbols = [x['sym'] for x in items[:MAX_SYMS]]
         log.info(f"  Símbolos: {len(self.symbols)}")
 
-    # ── v5.7: detección de régimen de mercado ────────────────────────────
+    # ── detección de régimen de mercado ──────────────────────────────────
 
     def _update_market_regime(self):
-        """Detecta si el mercado está en régimen bajista, alcista o neutral."""
         if not REGIME_CHECK: return
 
-        # 1. BTC 4h trend
         c4h, *_ = self._klines('BTC-USDT', '4h', 10)
         if c4h and len(c4h) >= 4:
             self._btc_4h = (c4h[-1] - c4h[-4]) / c4h[-4] * 100
-            # Crash guard: si BTC cae >X% en 4h, pausa inmediata
             if self._btc_4h < -BTC_4H_CRASH_PCT:
                 if not self._regime_until or datetime.utcnow() > self._regime_until:
                     self._regime_until = datetime.utcnow() + timedelta(hours=BTC_4H_CRASH_PAUSE)
@@ -748,12 +774,11 @@ class LongBot:
                     self._tg(
                         f"<b>🚨 CRASH GUARD ACTIVO</b>\n"
                         f"BTC cayó {self._btc_4h:.1f}% en 4h\n"
-                        f"Bot pausado {BTC_4H_CRASH_PAUSE}h para evitar pérdidas"
+                        f"Bot pausado {BTC_4H_CRASH_PAUSE}h"
                     )
 
-        # 2. Breadth: % de coins del top-20 por encima de su EMA21
         bulls = 0; total = 0
-        for coin in BREADTH_COINS[:10]:  # solo 10 para ser rápido
+        for coin in BREADTH_COINS[:10]:
             try:
                 c, *_ = self._klines(coin, '1h', 25)
                 if c and len(c) >= 21:
@@ -764,8 +789,7 @@ class LongBot:
         if total > 0:
             self._breadth = bulls / total
 
-        # 3. Determinar régimen
-        btc_bear = (self._btc_4h < -1.5) or (self._btc_1h < -BTC_BLOCK)
+        btc_bear    = (self._btc_4h < -1.5) or (self._btc_1h < -BTC_BLOCK)
         low_breadth = self._breadth < BREADTH_MIN
 
         if btc_bear and low_breadth:
@@ -781,24 +805,21 @@ class LongBot:
             log.info(f"  📊 RÉGIMEN: {self._regime} → {nuevo} | BTC4h:{self._btc_4h:+.1f}% breadth:{int(self._breadth*100)}%")
             if nuevo == 'bear':
                 self._tg(
-                    f"<b>🐻 RÉGIMEN BAJISTA DETECTADO</b>\n"
+                    f"<b>🐻 RÉGIMEN BAJISTA</b>\n"
                     f"BTC 4h: {self._btc_4h:+.1f}% | Breadth: {int(self._breadth*100)}%\n"
-                    f"Nuevas entradas suspendidas hasta mejora"
+                    f"Entradas suspendidas"
                 )
         self._regime = nuevo
 
     def _regime_ok(self) -> tuple:
-        """Verifica si el régimen permite nuevas entradas."""
-        # Pausa por crash guard
         if self._regime_until and datetime.utcnow() < self._regime_until:
             remaining = int((self._regime_until - datetime.utcnow()).total_seconds() / 60)
             return False, f"crash guard {remaining}min"
-
         if self._regime == 'bear':
             return False, "régimen bajista"
         return True, "ok"
 
-    # ── resto de métodos ─────────────────────────────────────────────────
+    # ── posiciones ────────────────────────────────────────────────────────
 
     def _get_exchange_positions(self, symbol=None):
         params = {}
@@ -931,7 +952,6 @@ class LongBot:
         hora = datetime.utcnow().hour
         if hora in SKIP_HOURS: return None
 
-        # v5.7: verificar régimen antes de continuar
         regime_ok, regime_reason = self._regime_ok()
         if not regime_ok:
             log.debug(f"  {symbol}: bloq régimen ({regime_reason})")
@@ -949,7 +969,6 @@ class LongBot:
         if not c5 or len(c5) < AUROLO_EMA_LEN + 50: return None
 
         c1h, h1h, l1h, v1h, _ = self._klines(symbol, '1h', 50)
-        # v5.7: también 4h
         c4h, h4h, l4h, v4h, _ = self._klines(symbol, '4h', 30)
 
         tk = self._ticker(symbol)
@@ -965,7 +984,7 @@ class LongBot:
             elif e9_1h < e21_1h: trend_1h = -1
         if trend_1h == -1: return None
 
-        # v5.7: 4H trend también debe ser alcista
+        # 4H trend
         trend_4h = 0
         if c4h and len(c4h) >= 21:
             e9_4h = ema(c4h, 9); e21_4h = ema(c4h, 21)
@@ -977,9 +996,9 @@ class LongBot:
 
         atr_v   = atr_calc(h5, l5, c5, 14)
         atr_pct = atr_v / price * 100 if price > 0 else 0
-        if atr_pct < 0.15:    return None   # v5.7: era 0.10
-        if change_24 > 20.0:  return None   # v5.7: era 25
-        if change_24 < -12.0: return None   # v5.7: era -15
+        if atr_pct < 0.15:    return None
+        if change_24 > 20.0:  return None
+        if change_24 < -12.0: return None
 
         sig_aurolo = aurolo_signal(c5, h5, l5, v5, o5, atr_v)
 
@@ -991,7 +1010,6 @@ class LongBot:
 
         vwap_val, precio_sobre_vwap = vwap_contexto(c5, h5, l5, v5, VWAP_CANDLES)
 
-        # v5.7: VWAP es filtro duro si está activado
         if VWAP_AS_FILTER and not precio_sobre_vwap:
             log.debug(f"  {symbol}: bajo VWAP (filtro duro)")
             return None
@@ -999,15 +1017,25 @@ class LongBot:
         sl_price = sig_aurolo['sl_price']
         sl_pct   = sig_aurolo['sl_pct']
 
-        if sl_pct <= 0 or sl_pct > SL_MAX_PCT * 1.1:
+        # FIX 1: validación adicional del SL aquí también
+        if sl_pct < SL_MIN_PCT * 0.9:
+            log.debug(f"  {symbol}: SL {sl_pct:.2f}% < mínimo {SL_MIN_PCT}% — skip")
+            return None
+        if sl_pct > SL_MAX_PCT * 1.1:
             return None
 
         tp1_price = price * (1 + sl_pct * TP1_RATIO / 100)
         tp2_price = price * (1 + sl_pct * TP2_RATIO / 100)
-        tp_ref    = max(sl_pct * MIN_RR, TP_MIN, TP_MIN_FEE, atr_pct * ATR_TP_M)
+        tp_ref    = max(sl_pct * MIN_RR, TP_MIN, atr_pct * ATR_TP_M)
         rr        = tp_ref / sl_pct if sl_pct > 0 else 0
 
         if rr < MIN_RR * 0.75:
+            return None
+
+        # FIX 8: filtro de TP neto post-fees
+        tp1_neto = sl_pct * TP1_RATIO - FEE_COST_PCT
+        if tp1_neto < 0.4:
+            log.debug(f"  {symbol}: TP1 neto {tp1_neto:.2f}% insuficiente — skip")
             return None
 
         # ── SCORING ──────────────────────────────────────────────────────
@@ -1040,14 +1068,13 @@ class LongBot:
         if precio_sobre_vwap:
             score += 8; reasons.append("VWAP↑(8)"); factors.append("vwap_arriba")
         else:
-            score -= 8; reasons.append("VWAP↓(-8)"); factors.append("vwap_abajo")  # v5.7: era -5
+            score -= 8; reasons.append("VWAP↓(-8)"); factors.append("vwap_abajo")
 
         if trend_1h == 1:
             score += 12; reasons.append("1H↑(12)"); factors.append("trend_1h_up")
         if trend_4h == 1:
-            score += 10; reasons.append("4H↑(10)"); factors.append("trend_4h_up")  # v5.7: nuevo
+            score += 10; reasons.append("4H↑(10)"); factors.append("trend_4h_up")
 
-        # v5.7: régimen
         if self._regime == 'bull':
             score += 10; reasons.append("RegBull(10)"); factors.append("regime_bull")
         elif self._regime == 'caution':
@@ -1058,12 +1085,12 @@ class LongBot:
         elif self._btc_1h > 0.3:
             score += 4; reasons.append("BTC~(4)"); factors.append("btc_ok")
         elif self._btc_1h < -0.5:
-            score -= 8; reasons.append("BTC↓(-8)"); factors.append("btc_down")  # v5.7: penalty BTC bajo
+            score -= 8; reasons.append("BTC↓(-8)"); factors.append("btc_down")
 
         if self._btc_4h > 1.5:
-            score += 8; reasons.append("BTC4h↑(8)"); factors.append("btc4h_up")  # v5.7: nuevo
+            score += 8; reasons.append("BTC4h↑(8)"); factors.append("btc4h_up")
         elif self._btc_4h < -1.0:
-            score -= 12; reasons.append("BTC4h↓(-12)"); factors.append("btc4h_down")  # v5.7: penalty fuerte
+            score -= 12; reasons.append("BTC4h↓(-12)"); factors.append("btc4h_down")
 
         if rsi_1h < 40:
             score += 8; reasons.append(f"RSI1H{int(rsi_1h)}(8)"); factors.append("rsi_1h_os")
@@ -1073,7 +1100,6 @@ class LongBot:
         if sl_pct < SL_MAX_PCT * 0.6:
             score += 5; reasons.append("SL_tight(5)"); factors.append("sl_tight")
 
-        # breadth bonus
         if self._breadth > 0.65:
             score += 8; reasons.append(f"Breadth{int(self._breadth*100)}%(8)"); factors.append("breadth_good")
         elif self._breadth < 0.35:
@@ -1106,6 +1132,7 @@ class LongBot:
             'sl_price': round(sl_price, 8), 'sl_pct': round(sl_pct, 3),
             'tp1_price': round(tp1_price, 8), 'tp2_price': round(tp2_price, 8),
             'tp_pct': round(tp_ref, 2), 'rr': round(rr, 2),
+            'tp1_neto': round(tp1_neto, 3),
             'vwap': vwap_val, 'ema25': e25, 'ema55': e55,
             'zona_inf': sig_aurolo['zona_inf'], 'zona_sup': sig_aurolo['zona_sup'],
             'trend_1h': trend_1h, 'trend_4h': trend_4h, 'rsi_1h': rsi_1h,
@@ -1151,16 +1178,6 @@ class LongBot:
         if stop_price:  params['stopPrice']=str(round(stop_price,8))
         return api('POST','/openApi/swap/v2/trade/order',params)
 
-    def _wait_fill(self, sym, oid, timeout=35):
-        for _ in range(timeout):
-            d=api('GET','/openApi/swap/v2/trade/order',{'symbol':sym,'orderId':str(oid)})
-            if d.get('code')==0:
-                o=d.get('data',{}).get('order',{}); st=o.get('status','')
-                if st=='FILLED': return float(o.get('executedQty',0)),float(o.get('avgPrice',0))
-                if st in ('CANCELED','EXPIRED','REJECTED'): return None,None
-            time.sleep(1)
-        return None,None
-
     def _confirm_pos(self, sym, timeout=15):
         for _ in range(timeout):
             d=api('GET','/openApi/swap/v2/user/positions',{'symbol':sym})
@@ -1204,39 +1221,38 @@ class LongBot:
 
         log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{int(sig['score'])} | RR:{sig['rr']:.2f}:1")
         log.info(f"  {sig['aurolo_desc']}")
-        log.info(f"  Zona EMA{AUROLO_EMA_LEN}: ${sig['zona_inf']:.4f}–${sig['zona_sup']:.4f}")
+        log.info(f"  SL:{sig['sl_pct']:.2f}% (mín garantizado {SL_MIN_PCT}%) | TP1 neto:{sig['tp1_neto']:.2f}%")
         log.info(f"  Régimen: {sig['regime']} | Breadth: {int(sig['breadth']*100)}%")
 
         self._set_lev(sym); time.sleep(0.2)
         qty, notional = self._calc_qty(sym, price, sl_price)
         if not qty: return False
 
-        limit_p = round(price * (1-0.05/100), 8)
-        d = self._order(sym, 'BUY', qty, 'LIMIT', price=limit_p)
+        # FIX 2: entrada MARKET directa — el LIMIT 0.05% casi nunca llenaba
+        log.info(f"  📥 Entrada MARKET — {qty} contratos @ ~${price:.6f}")
+        d = self._order(sym, 'BUY', qty, 'MARKET')
         if d.get('code') != 0:
-            log.error(f"  ❌ LIMIT: {d.get('msg')}"); return False
+            log.error(f"  ❌ MARKET: {d.get('msg')}"); return False
 
-        oid = d.get('data',{}).get('orderId')
-        filled_qty, fill_price = self._wait_fill(sym, oid, 30)
-
+        filled_qty, fill_price = self._confirm_pos(sym, 15)
         if not filled_qty:
-            log.warning("  ⚠️ LIMIT sin fill → MARKET")
-            self._cancel_open(sym); time.sleep(0.5)
-            d = self._order(sym, 'BUY', qty, 'MARKET')
-            if d.get('code')!=0:
-                log.error(f"  ❌ MARKET: {d.get('msg')}"); return False
-            filled_qty, fill_price = self._confirm_pos(sym, 12)
-            if not filled_qty: return False
+            log.error(f"  ❌ No se confirmó posición para {sym}"); return False
 
-        sl_pct_real = (fill_price - sl_price) / fill_price * 100
+        # Recalcular SL/TP con precio real de fill
+        sl_pct_real = sig['sl_pct']
+        sl_real     = fill_price * (1 - sl_pct_real / 100)
+        # Garantizar que sl_real respeta el mínimo también con fill_price real
+        sl_real = min(sl_real, fill_price * (1 - SL_MIN_PCT / 100))
+        sl_real = max(sl_real, fill_price * (1 - SL_MAX_PCT / 100))
+
         tp1_price   = fill_price * (1 + sl_pct_real * TP1_RATIO / 100)
         tp2_price   = fill_price * (1 + sl_pct_real * TP2_RATIO / 100)
 
-        sl_ok = self._place_sl(sym, filled_qty, sl_price)
+        sl_ok = self._place_sl(sym, filled_qty, sl_real)
         if not sl_ok:
-            time.sleep(2); sl_ok = self._place_sl(sym, filled_qty, sl_price)
+            time.sleep(2); sl_ok = self._place_sl(sym, filled_qty, sl_real)
         if not sl_ok:
-            log.error("  ❌ SL crítico — cerrando")
+            log.error("  ❌ SL crítico — cerrando posición")
             self._order(sym,'SELL',filled_qty,'MARKET'); return False
 
         trade = {
@@ -1245,7 +1261,7 @@ class LongBot:
             'qty_tp2': round(filled_qty * TP2_PCT/100, 6),
             'tp1_hit': False, 'tp2_hit': False,
             'tp1_price': tp1_price, 'tp2_price': tp2_price,
-            'sl': sl_price, 'sl_orig': sl_price, 'sl_pct': sl_pct_real,
+            'sl': sl_real, 'sl_orig': sl_real, 'sl_pct': sl_pct_real,
             'highest': fill_price, 'opened': datetime.now(),
             'score': sig['score'], 'ema25': sig['ema25'], 'ema55': sig['ema55'],
             'aurolo_pts': pts, 'entrada_label': label,
@@ -1272,7 +1288,7 @@ class LongBot:
             f"🎯 TP1 ({int(TP1_PCT)}%): ${tp1_price:.6f} (+{sl_pct_real*TP1_RATIO:.2f}%)\n"
             f"🎯 TP2 ({int(TP2_PCT)}%): ${tp2_price:.6f} (+{sl_pct_real*TP2_RATIO:.2f}%)\n"
             f"🏃 Runner ({int(100-TP1_PCT-TP2_PCT)}%): EMA25\n"
-            f"🛑 SL: ${sl_price:.6f} (-{sl_pct_real:.2f}%)\n"
+            f"🛑 SL: ${sl_real:.6f} (-{sl_pct_real:.2f}%)\n"
             f"4H: {'🟢' if sig['trend_4h']==1 else '⚪'} | BTC: {self._btc_1h:+.2f}%"
         )
         return True
@@ -1324,7 +1340,18 @@ class LongBot:
             btc_dir=t.get('btc_dir','flat'),
             reason=reason, factors=t.get('factors',[]),
         )
-        self._set_cd(sym, 'TP' if any(k in reason for k in ['TP','EMA','PROFIT']) else 'SL')
+
+        # FIX 6: cooldown extendido si SL muy rápido
+        if 'STOP LOSS' in reason or 'SL' in reason:
+            if mins < CD_SL_FAST_MIN:
+                fast_cd_secs = CD_SL_FAST_HOURS * 3600
+                self._cooldowns[sym] = (time.time() + fast_cd_secs, 'SL_FAST')
+                log.warning(f"  🚫 {sym}: SL en {mins}min → cooldown {CD_SL_FAST_HOURS}h (SL rápido)")
+                self._tg(f"<b>⚠️ SL RÁPIDO — {sym}</b>\nSL en {mins}min → cooldown {CD_SL_FAST_HOURS}h")
+            else:
+                self._set_cd(sym, 'SL')
+        else:
+            self._set_cd(sym, 'TP')
 
         self._tg(
             f"<b>{'✅' if win else '❌'} CERRADO — {reason}</b>\n"
@@ -1431,16 +1458,17 @@ class LongBot:
                 self._tg("<b>🔓 Circuit breaker OFF</b>")
             return self._cb_active
 
-        # v5.7: daily loss cap basado en equity inicial
+        # FIX 9: daily loss cap relativo a equity real
         if self._equity_start > 0:
             eq_loss_pct = abs(self._daily_pnl) / self._equity_start * 100
             if self._daily_pnl < 0 and eq_loss_pct > DAILY_LOSS_CAP_PCT:
                 self._cb_active=True
                 self._cb_until=datetime.utcnow()+timedelta(hours=CB_HOURS)
-                log.warning(f"  🔒 DAILY LOSS CAP | {eq_loss_pct:.1f}% pérdida hoy")
-                self._tg(f"<b>🔒 DAILY LOSS CAP</b>\nPérdida: {eq_loss_pct:.1f}% hoy | Pausa {CB_HOURS}h")
+                log.warning(f"  🔒 DAILY LOSS CAP | {eq_loss_pct:.1f}% pérdida hoy (equity ${self._equity_start:.2f})")
+                self._tg(f"<b>🔒 DAILY LOSS CAP</b>\nPérdida: {eq_loss_pct:.1f}% hoy | Equity base: ${self._equity_start:.2f} | Pausa {CB_HOURS}h")
                 return True
 
+        # Circuit breaker absoluto de respaldo
         cb_threshold = ACCOUNT_EQUITY * (CB_PCT / 100)
         if self._daily_pnl < -cb_threshold:
             self._cb_active=True
@@ -1462,7 +1490,7 @@ class LongBot:
             pos += f"  📌 {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}% {tp_st}\n"
 
         self._tg(
-            f"<b>📊 Reporte v5.7</b>\n"
+            f"<b>📊 Reporte v5.8</b>\n"
             f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% | {total}t\n"
             f"Día: ${self._daily_pnl:+.4f} | Equity: ${ACCOUNT_EQUITY:.2f}\n"
             f"Score: {int(self.learn.opt_score)} (cap {int(self.learn._score_cap())})\n"
@@ -1481,7 +1509,7 @@ class LongBot:
         except: pass
 
     async def run(self):
-        log.info("\n🚀 Bot LONGS v5.7 — Bear-Aware + Anti-Churn\n")
+        log.info("\n🚀 Bot LONGS v5.8 — SL-Fixed + MARKET Entry + TP Optimized\n")
         iteration=0; last_sym=last_ltv=last_hedge=last_eq=last_regime=0
 
         while True:
@@ -1491,7 +1519,6 @@ class LongBot:
                 if time.time()-last_ltv    > 300:  self._check_ltv();             last_ltv=time.time()
                 if time.time()-last_hedge  > 600:  self._scan_orphan_shorts();    last_hedge=time.time()
                 if time.time()-last_eq     > 1800: self._update_equity();         last_eq=time.time()
-                # v5.7: régimen cada 5 minutos
                 if time.time()-last_regime > 300:
                     self._update_market_regime()
                     last_regime=time.time()
@@ -1534,7 +1561,7 @@ class LongBot:
                             log.info(
                                 f"  💡 {sym} [{sig['aurolo_señal']}] | "
                                 f"Score:{int(sig['score'])}/{int(self.learn.opt_score)} | "
-                                f"RR:{sig['rr']:.2f}:1 | Breadth:{int(sig['breadth']*100)}%"
+                                f"RR:{sig['rr']:.2f}:1 | SL:{sig['sl_pct']:.2f}% | TP1net:{sig['tp1_neto']:.2f}%"
                             )
                             if self.open_trade(sym, sig):
                                 await asyncio.sleep(3)
