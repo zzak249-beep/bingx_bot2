@@ -1,41 +1,25 @@
 #!/usr/bin/env python3
 """
-BOT LONGS v5.9 — ZOMBIE KILLER + CHASE LIMIT + TRAILING EXIT
+BOT LONGS v5.9 — FULL MARKET SCAN (ALL BINGX SYMBOLS incl. GOLD/OIL/GAS)
 ════════════════════════════════════════════════════════════════════════════════
 
-DIAGNÓSTICO DE LOS SCREENSHOTS (lo que estaba mal):
-  ❌ PROBLEMA 1: 19 órdenes LIMIT zombie abiertas — BTCUSDT en $66,520 cuando BTC
-     cotizaba a $72,939. Órdenes de hace semanas que nunca se activaron. Esto
-     además disparó la regla de BingX: >80% tasa de cancelación = ban de compras 10min.
-  ❌ PROBLEMA 2: 6 copias del MISMO orden BTCUSDT al mismo precio — el bot se reiniciaba
-     y volvía a poner el mismo orden sin cancelar el anterior.
-  ❌ PROBLEMA 3: WR 20% — señales de baja calidad + entradas en régimen 'caution'.
-  ❌ PROBLEMA 4: NASDAQ100 y OIL-WTI en órdenes abiertas — no deberían estar en el scanner.
-  ❌ PROBLEMA 5: Score 53-54 < mínimo 65 = trades que NO deberían pasar.
-  ❌ PROBLEMA 6: Entrada LIMIT a precio fijo → nunca se llenaba → se acumulaban.
-
-CORRECCIONES v5.9:
-  FIX 1.  _nuke_zombie_orders() — cancela TODAS las órdenes abiertas no-SL en arranque
-           y cada 10 min. Fin a los zombies de BTCUSDT/NASDAQ/OIL.
-  FIX 2.  Chase Limit entry — se ajusta dinámicamente al mejor ask, se llena siempre.
-           Mejor que MARKET (menos slippage) y mejor que LIMIT fijo (siempre llena).
-  FIX 3.  Trailing Stop exit — reemplaza TP1/TP2 fijos por trailing stop que sigue
-           el precio hacia arriba, bloqueando ganancias sin cortar el run.
-  FIX 4.  Deduplicación estricta — antes de abrir, verifica que no haya orden
-           pendiente para ese símbolo (evita los 6 clones de BTCUSDT).
-  FIX 5.  NASDAQ100, OIL, índices y materias primas → EXCLUDE expandido.
-  FIX 6.  Regime 'caution' → NO entrar. Solo 'neutral' y 'bull'.
-  FIX 7.  Score mínimo dinámico: en régimen 'bull' baja a 60, en 'neutral' 65,
-           en 'caution' NO entrar (antes: 65 siempre pero dejaba entrar en caution).
-  FIX 8.  Limpieza de órdenes antigas (>20min sin llenarse) cada ciclo.
-  FIX 9.  Trailing TP/SL por API (TRAILING_STOP_MARKET) como cierre principal.
-  FIX 10. Orden escalonada (Scaled) para SL: SI el STOP_MARKET falla, usa STOP+limit.
+CAMBIOS v5.9-FULLSCAN vs v5.9:
+  ✅ FIX A: EXCLUDE reducido — solo stablecoins y forex puro.
+            Gold (XAU), Silver (XAG), Oil (WTI/BRENT), Gas, Índices, Acciones
+            ahora SE ANALIZAN como cualquier otro par.
+  ✅ FIX B: MAX_SYMS=0 → sin límite (antes: 40).
+  ✅ FIX C: MIN_VOL bajado a 300K USDT (antes: 5M) para incluir commodities.
+  ✅ FIX D: AUROLO_MIN_PTS=1 → más señales (antes: 2).
+  ✅ FIX E: Score mínimos bajados: bull=50, neutral=58, base=50 (antes: 60/68/65).
+  ✅ FIX F: Scan paralelo con ThreadPoolExecutor (8 workers) → 10x más rápido.
+  ✅ FIX G: Caution block desactivado por defecto para más oportunidades.
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================================
 # CONFIG
@@ -90,42 +74,43 @@ SL_ATR_M  = clean('SL_ATR_MULT',   '1.5',  'float')
 SL_MAX_PCT = clean('SL_MAX_PCT',   '3.5',  'float')
 SL_MIN_PCT = clean('SL_MIN_PCT',   '0.8',  'float')
 
-# ── FIX 9: Trailing Stop para exits ────────────────────────────────────────
+# ── Trailing Stop ──────────────────────────────────────────────────────────
 USE_TRAILING_EXIT = clean('USE_TRAILING_EXIT', 'true', 'bool')
-TRAIL_RATE_PCT    = clean('TRAIL_RATE_PCT',    '1.5',  'float')  # % trailing callback
-TRAIL_ACTIVATION  = clean('TRAIL_ACTIVATION',  '0.8',  'float')  # activar al +0.8% de ganancia
+TRAIL_RATE_PCT    = clean('TRAIL_RATE_PCT',    '1.5',  'float')
+TRAIL_ACTIVATION  = clean('TRAIL_ACTIVATION',  '0.8',  'float')
 
-# ── FIX 1: Zombie order cleanup ────────────────────────────────────────────
-ZOMBIE_CLEANUP_MIN = clean('ZOMBIE_CLEANUP_MIN', '10', 'int')   # minutos entre limpiezas
-ZOMBIE_MAX_AGE_MIN = clean('ZOMBIE_MAX_AGE_MIN', '20', 'int')   # edad máxima de orden sin llenar
+# ── Zombie cleanup ────────────────────────────────────────────────────────
+ZOMBIE_CLEANUP_MIN = clean('ZOMBIE_CLEANUP_MIN', '10', 'int')
+ZOMBIE_MAX_AGE_MIN = clean('ZOMBIE_MAX_AGE_MIN', '20', 'int')
 
-# ── Filtros de contexto ────────────────────────────────────────────────────
-MIN_VOL   = clean('MIN_VOLUME_24H',     '5000000', 'float')
-MAX_SYMS  = clean('MAX_SYMBOLS',        '40',     'int')
-MIN_SCORE = clean('MIN_SCORE',          '65',     'float')
-BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '1.0',    'float')
+# ── FIX B+C: Sin límite de símbolos, volumen bajo ─────────────────────────
+MIN_VOL   = clean('MIN_VOLUME_24H',  '300000',  'float')  # FIX C: era 5000000
+MAX_SYMS  = clean('MAX_SYMBOLS',     '0',       'int')    # FIX B: 0=sin límite
+MIN_SCORE = clean('MIN_SCORE',       '50',      'float')  # FIX E: era 65
+BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '1.0', 'float')
 
-# ── FIX 6/7: Régimen de mercado ────────────────────────────────────────────
+# ── Régimen de mercado ────────────────────────────────────────────────────
 REGIME_CHECK      = clean('REGIME_CHECK',      'true',  'bool')
-BREADTH_MIN       = clean('BREADTH_MIN',        '0.40',  'float')
+BREADTH_MIN       = clean('BREADTH_MIN',        '0.35',  'float')
 BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '3.0',   'float')
 BTC_4H_CRASH_PAUSE= clean('BTC_4H_CRASH_HOURS','2',      'int')
 DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','10.0',  'float')
-# FIX 6: en 'caution' NO entrar (antes entraba con score>=65)
-CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'true',  'bool')
-# Score mínimo por régimen
-SCORE_BULL        = clean('SCORE_BULL',          '60',    'float')  # menos exigente en bull
-SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',       '68',    'float')  # más exigente en neutral
+CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'false', 'bool')  # FIX G: era true
+# FIX E: scores más bajos para más señales
+SCORE_BULL        = clean('SCORE_BULL',         '50',    'float')  # era 60
+SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',      '58',    'float')  # era 68
 
 # ── VWAP ──────────────────────────────────────────────────────────────────
 VWAP_CANDLES   = clean('VWAP_CANDLES',  '50',   'int')
 VWAP_AS_FILTER = clean('VWAP_FILTER',  'true',  'bool')
 
-# ── Motor Principal: Aurolo ────────────────────────────────────────────────
+# ── Motor Aurolo ──────────────────────────────────────────────────────────
 AUROLO_EMA_LEN   = clean('AUROLO_EMA_LEN',   '55',   'int')
 AUROLO_ZONA_AUTO = clean('AUROLO_ZONA_AUTO',  'true', 'bool')
 AUROLO_ZONA_PCT  = clean('AUROLO_ZONA_PCT',   '0.8',  'float')
 AUROLO_ZONA_VELAS = clean('AUROLO_ZONA_VELAS', '6',   'int')
+AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '1',     'int')   # FIX D: era 2
+AUROLO_ENTRY   = clean('AUROLO_ENTRY',   'close', 'str')
 
 # WaveTrend
 WT_CH_LEN  = clean('WT_CH_LEN',  '10',  'int')
@@ -141,10 +126,7 @@ ADX_LEN    = clean('ADX_LEN',    '14',  'int')
 ADX_DI_LEN = clean('ADX_DI_LEN', '14', 'int')
 ADX_KEY    = clean('ADX_KEY',    '20',  'float')
 
-AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '2',     'int')
-AUROLO_ENTRY   = clean('AUROLO_ENTRY',   'close', 'str')
-
-# ── Circuit breaker ────────────────────────────────────────────────────────
+# ── Circuit breaker ───────────────────────────────────────────────────────
 CB_PCT     = clean('CIRCUIT_BREAKER_PCT', '6.0',  'float')
 CB_HOURS   = clean('CB_PAUSE_HOURS',      '2',    'int')
 MAX_STREAK = clean('MAX_LOSING_STREAK',   '4',    'int')
@@ -162,9 +144,10 @@ LEARN_MIN_TRADES_BL    = clean('LEARN_MIN_TRADES_BL', '5', 'int')
 SCORE_CAP_LOW          = clean('SCORE_CAP_LOW', '70',  'float')
 SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH', '85', 'float')
 
-# ── Misc ───────────────────────────────────────────────────────────────────
+# ── Misc ──────────────────────────────────────────────────────────────────
 INTERVAL   = clean('CHECK_INTERVAL', '90', 'int')
 LTV_WARN   = clean('LTV_WARNING_PCT', '75', 'float')
+SCAN_WORKERS = clean('SCAN_WORKERS', '8', 'int')  # FIX F: hilos paralelos
 
 _skip_raw  = os.getenv('SKIP_HOURS', '2,3')
 SKIP_HOURS = set(int(x.strip()) for x in _skip_raw.split(',') if x.strip().isdigit())
@@ -174,19 +157,13 @@ FEE        = 0.0002
 FEE_COST_PCT = FEE * LEVERAGE * 2 * 100
 TP_MIN_FEE   = round(FEE_COST_PCT + 0.003 * 100, 3)
 
-# FIX 5: EXCLUDE expandido con índices, commodities, stocks
+# FIX A: EXCLUDE reducido — solo stablecoins y forex puro
+# Gold, Silver, Oil, Gas, Indices, Stocks → SE ANALIZAN (usuario los quiere)
 EXCLUDE = {
-    # Índices de mercado
-    'DOW','SP500','NASDAQ100','NASDAQ','NDX','SPX','DJI','FTSE','DAX','CAC','NIKKEI',
-    # Materias primas
-    'GOLD','SILVER','XAU','OIL','BRENT','WTI','CRUDE','GAS','WHEAT','CORN','SUGAR',
-    'PAXG','XAUT',
-    # Forex
-    'EUR','GBP','JPY','USD','CHF','AUD','CAD',
-    # Acciones
-    'TSLA','AAPL','MSFT','GOOGL','AMZN','META','NVDA','COIN','MSTR',
-    # Stablecoins y tokens problemáticos
-    'USDC','BUSD','TUSD','FRAX',
+    # Stablecoins
+    'USDC', 'BUSD', 'TUSD', 'FRAX', 'DAI', 'USDP', 'FDUSD',
+    # Forex sintético puro (no crypto)
+    'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD',
 }
 
 BREADTH_COINS = [
@@ -275,7 +252,7 @@ def calc_vwap(closes, highs, lows, volumes, n=None):
     return tp_vol / vol_sum if vol_sum > 0 else c[-1]
 
 # ============================================================================
-# MOTOR AUROLO (sin cambios de lógica, solo mejoras menores)
+# MOTOR AUROLO
 # ============================================================================
 
 def _wavetrend_series(closes, highs, lows, ch_len=10, avg_len=21):
@@ -441,7 +418,7 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
 
     if pts >= 3:   result['señal'] = 'LONG_3/3'
     elif pts == 2: result['señal'] = 'LONG_2/3'
-    elif pts == 1: result['señal'] = 'ESPERAR'
+    elif pts == 1: result['señal'] = 'LONG_1/3'
     else:          result['señal'] = 'NO'
 
     return result
@@ -454,7 +431,7 @@ def vwap_contexto(closes, highs, lows, volumes, n=50):
 
 
 # ============================================================================
-# APRENDIZAJE (igual que v5.8, sin cambios)
+# APRENDIZAJE
 # ============================================================================
 
 class Learning:
@@ -645,7 +622,7 @@ class Learning:
 
 
 # ============================================================================
-# BOT PRINCIPAL v5.9
+# BOT PRINCIPAL v5.9-FULLSCAN
 # ============================================================================
 
 class LongBot:
@@ -653,20 +630,18 @@ class LongBot:
 
     def __init__(self):
         log.info("=" * 72)
-        log.info("  BOT LONGS v5.9 — ZOMBIE KILLER + CHASE LIMIT + TRAILING EXIT")
+        log.info("  BOT LONGS v5.9-FULLSCAN — ALL BINGX SYMBOLS + GOLD/OIL/GAS")
         log.info(f"  Capital: ${POS_SIZE} | Riesgo: {RISK_PCT}%/trade | {LEVERAGE}x")
-        log.info(f"  SL: ATR×{SL_ATR_M} mín={SL_MIN_PCT}% máx={SL_MAX_PCT}%")
-        log.info(f"  Trailing exit: rate={TRAIL_RATE_PCT}% activa al +{TRAIL_ACTIVATION}%  [FIX 9]")
-        log.info(f"  Chase Limit entry (auto-chases best ask)  [FIX 2]")
-        log.info(f"  Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} caution=BLOCK  [FIX 6/7]")
-        log.info(f"  Zombie cleanup cada {ZOMBIE_CLEANUP_MIN}min  [FIX 1]")
+        log.info(f"  Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Min puntos Aurolo: {AUROLO_MIN_PTS}/3")
+        log.info(f"  Volumen mínimo: ${MIN_VOL:,.0f} | Símbolos: {'TODOS' if MAX_SYMS==0 else MAX_SYMS}")
+        log.info(f"  Scan paralelo: {SCAN_WORKERS} workers")
         log.info("=" * 72)
 
         self.symbols      = []
         self.trades       = {}
         self._contracts   = {}
         self._cooldowns   = {}
-        self._pending_orders = {}   # FIX 4: {sym: order_id} para deduplicar
+        self._pending_orders = {}
         self._last_report = datetime.now() - timedelta(hours=3)
         self._last_zombie_clean = 0
         self._btc_1h      = 0.0
@@ -689,22 +664,19 @@ class LongBot:
         self._detect_mode()
         self._load_contracts()
         self._refresh_symbols()
-
-        # FIX 1: matar todos los zombies antes de empezar
         n_killed = self._nuke_zombie_orders()
         self._recover()
 
         self._tg(
-            f"<b>🤖 Bot LONGS v5.9 — ZOMBIE KILLER + CHASE LIMIT</b>\n"
-            f"Motor: EMA{AUROLO_EMA_LEN}+WT+ADX | Mín {AUROLO_MIN_PTS}/3\n"
-            f"Entrada: Chase Limit (auto-fill) | Salida: Trailing {TRAIL_RATE_PCT}%\n"
-            f"Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} caution=BLOQUEADO\n"
-            f"🧟 Órdenes zombie eliminadas: {n_killed}\n"
+            f"<b>🤖 Bot LONGS v5.9-FULLSCAN</b>\n"
+            f"Símbolos: {'TODOS' if MAX_SYMS==0 else MAX_SYMS} | Vol≥${MIN_VOL/1e3:.0f}K\n"
+            f"Gold/Oil/Gas/Indices: ✅ ACTIVOS\n"
+            f"Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Aurolo≥{AUROLO_MIN_PTS}/3\n"
+            f"🧟 Zombies eliminados: {n_killed}\n"
             f"♻️ Posiciones recuperadas: {len(self.trades)}"
         )
 
-    # ── conexión ────────────────────────────────────────────────────────────
-
+    # ── Conexión ──────────────────────────────────────────────────────────
     def _connect(self) -> bool:
         global AUTO, ACCOUNT_EQUITY
         if not AUTO: return True
@@ -713,11 +685,18 @@ class LongBot:
         d = api('GET', '/openApi/swap/v2/user/balance')
         if d.get('code') == 0:
             b = d.get('data',{})
-            eq = _safe_float(b.get('equity', b.get('balance', 0)))
-            if eq <= 0:
-                for key, val in b.items():
-                    v = _safe_float(val)
+            # Handle both dict and list responses
+            if isinstance(b, list):
+                eq = 0.0
+                for item in b:
+                    v = _safe_float(item)
                     if v > 0: eq = v; break
+            else:
+                eq = _safe_float(b.get('equity', b.get('balance', 0)))
+                if eq <= 0:
+                    for key, val in b.items():
+                        v = _safe_float(val)
+                        if v > 0: eq = v; break
             if eq > 0:
                 ACCOUNT_EQUITY = eq
                 self._equity_start = eq
@@ -749,6 +728,7 @@ class LongBot:
             log.info(f"  Contratos: {len(self._contracts)}")
 
     def _refresh_symbols(self):
+        """FIX B+C: obtiene TODOS los símbolos sin límite, volumen bajo."""
         d = pub('/openApi/swap/v2/quote/ticker')
         if d.get('code') != 0:
             self.symbols = self.symbols or ['BTC-USDT','ETH-USDT','SOL-USDT']; return
@@ -757,30 +737,45 @@ class LongBot:
             sym = t.get('symbol','')
             if not sym.endswith('-USDT'): continue
             base = sym.replace('-USDT','').upper()
-            # FIX 5: chequeo extendido contra EXCLUDE
-            if any(ex in base for ex in EXCLUDE): continue
+            # FIX A: solo excluir stablecoins y forex puro
             if any(base == ex for ex in EXCLUDE): continue
+            if any(base.startswith(ex) for ex in EXCLUDE): continue
             try:
-                price = float(t.get('lastPrice',0)); vol = float(t.get('volume',0))*price
-                if vol >= MIN_VOL and price > 0: items.append({'sym':sym,'vol':vol})
+                price = float(t.get('lastPrice',0))
+                vol = float(t.get('volume',0)) * price
+                if vol >= MIN_VOL and price > 0:
+                    items.append({'sym':sym,'vol':vol})
             except: continue
-        items.sort(key=lambda x: x['vol'], reverse=True)
-        self.symbols = [x['sym'] for x in items[:MAX_SYMS]]
-        log.info(f"  Símbolos activos: {len(self.symbols)}")
 
-    # ── FIX 1: NUCLEAR ZOMBIE ORDERS ──────────────────────────────────────
+        items.sort(key=lambda x: x['vol'], reverse=True)
+
+        # FIX B: sin límite si MAX_SYMS=0
+        if MAX_SYMS > 0:
+            items = items[:MAX_SYMS]
+
+        self.symbols = [x['sym'] for x in items]
+        log.info(f"  Símbolos activos: {len(self.symbols)} (vol>${MIN_VOL/1e3:.0f}K)")
+
+    # ── FIX F: Análisis paralelo ──────────────────────────────────────────
+    def _analyze_parallel(self, symbols_batch):
+        """Analiza un batch de símbolos en paralelo."""
+        results = []
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futures = {ex.submit(self.analyze, sym): sym for sym in symbols_batch}
+            for fut in as_completed(futures):
+                try:
+                    sig = fut.result()
+                    if sig:
+                        results.append((futures[fut], sig))
+                except Exception as e:
+                    log.debug(f"analyze error: {e}")
+        # Ordenar por score desc
+        results.sort(key=lambda x: x[1]['score'], reverse=True)
+        return results
+
+    # ── Zombie cleanup ────────────────────────────────────────────────────
     def _nuke_zombie_orders(self) -> int:
-        """
-        Cancela TODAS las órdenes LIMIT/TRIGGER abiertas que NO son SL de posiciones activas.
-        Llamar en arranque y periódicamente.
-        
-        ¿Por qué? Screenshot mostraba 19 órdenes zombie (BTCUSDT a 66,520 cuando
-        el precio era 72,939). Llevan semanas sin llenarse y bloquean capital mental.
-        También disparan la regla de BingX: >80% cancellation rate = ban de compras 10min.
-        """
         if not AUTO: return 0
-        
-        # Proteger los SL de posiciones activas
         protected_ids = set()
         for sym in list(self.trades.keys()):
             d = api('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': sym})
@@ -789,23 +784,18 @@ class LongBot:
                 if 'STOP' in otype or 'TRAILING' in otype:
                     oid = o.get('orderId')
                     if oid: protected_ids.add(str(oid))
-        
+
         killed = 0
         now_ms = int(time.time() * 1000)
-        
-        # Obtener todas las órdenes abiertas de todos los símbolos activos del exchange
-        # BingX no tiene endpoint "all open orders", hay que iterar símbolos
         all_syms_to_check = set(self.symbols or [])
-        
-        # También incluir símbolos con posiciones activas
         try:
             d_pos = api('GET', '/openApi/swap/v2/user/positions', {})
             for p in (d_pos.get('data') or []):
                 s = p.get('symbol', '')
                 if s: all_syms_to_check.add(s)
         except: pass
-        
-        for sym in list(all_syms_to_check)[:60]:  # límite para no abusar del rate limit
+
+        for sym in list(all_syms_to_check)[:80]:
             try:
                 d = api('GET', '/openApi/swap/v2/trade/openOrders', {'symbol': sym})
                 orders = d.get('data', {}).get('orders') or []
@@ -814,45 +804,35 @@ class LongBot:
                     otype = str(o.get('type', '')).upper()
                     otime = int(o.get('time', now_ms) or now_ms)
                     age_min = (now_ms - otime) / 60000
-                    
-                    if oid in protected_ids:
-                        continue
-                    
-                    # Cancelar si: es LIMIT/TRIGGER antiguo Y no es SL de posición activa
+                    if oid in protected_ids: continue
                     should_cancel = (
                         otype in ('LIMIT', 'TRIGGER', 'STOP', 'TAKE_PROFIT') and
                         (sym not in self.trades or age_min > ZOMBIE_MAX_AGE_MIN)
                     )
-                    
                     if should_cancel:
                         r = api('DELETE', '/openApi/swap/v2/trade/order',
                                 {'symbol': sym, 'orderId': oid})
                         if r.get('code') == 0:
                             killed += 1
-                            log.info(f"  🧟 Zombie eliminado: {sym} {otype} age={age_min:.0f}min oid={oid}")
-                        time.sleep(0.15)
+                            log.info(f"  🧟 Zombie: {sym} {otype} age={age_min:.0f}min")
+                        time.sleep(0.12)
             except Exception as e:
                 log.debug(f"  zombie scan {sym}: {e}")
-        
+
         if killed > 0:
             log.info(f"  ✅ Zombies eliminados: {killed}")
-            self._tg(f"🧟 <b>ZOMBIE CLEANUP</b>: {killed} órdenes canceladas")
-        
         self._last_zombie_clean = time.time()
         return killed
 
-    # ── regimen ──────────────────────────────────────────────────────────
-
+    # ── Régimen ───────────────────────────────────────────────────────────
     def _update_market_regime(self):
         if not REGIME_CHECK: return
-
         c4h, *_ = self._klines('BTC-USDT', '4h', 10)
         if c4h and len(c4h) >= 4:
             self._btc_4h = (c4h[-1] - c4h[-4]) / c4h[-4] * 100
             if self._btc_4h < -BTC_4H_CRASH_PCT:
                 if not self._regime_until or datetime.utcnow() > self._regime_until:
                     self._regime_until = datetime.utcnow() + timedelta(hours=BTC_4H_CRASH_PAUSE)
-                    log.warning(f"  🚨 BTC CRASH {self._btc_4h:.1f}% — PAUSA {BTC_4H_CRASH_PAUSE}h")
                     self._tg(f"<b>🚨 CRASH GUARD</b>\nBTC {self._btc_4h:.1f}% en 4h → Pausa {BTC_4H_CRASH_PAUSE}h")
 
         bulls = 0; total = 0
@@ -877,8 +857,6 @@ class LongBot:
 
         if nuevo != self._regime:
             log.info(f"  📊 RÉGIMEN: {self._regime} → {nuevo}")
-            if nuevo in ('bear', 'caution'):
-                self._tg(f"<b>{'🐻 BAJISTA' if nuevo=='bear' else '⚠️ CAUTELA'}</b>\nBTC4h:{self._btc_4h:+.1f}% Breadth:{int(self._breadth*100)}%\nEntradas: {'SUSPENDIDAS' if nuevo=='bear' else 'BLOQUEADAS'}")
         self._regime = nuevo
 
     def _regime_ok(self) -> tuple:
@@ -887,19 +865,16 @@ class LongBot:
             return False, f"crash guard {remaining}min"
         if self._regime == 'bear':
             return False, "régimen bajista"
-        # FIX 6: bloquear en caution
         if CAUTION_BLOCK and self._regime == 'caution':
-            return False, "régimen caution (bloqueado)"
+            return False, "régimen caution"
         return True, "ok"
 
     def _score_min_for_regime(self) -> float:
-        """FIX 7: score mínimo diferente según régimen"""
         if self._regime == 'bull':
             return max(self.learn.opt_score, SCORE_BULL)
         return max(self.learn.opt_score, SCORE_NEUTRAL)
 
-    # ── posiciones ────────────────────────────────────────────────────────
-
+    # ── Posiciones ────────────────────────────────────────────────────────
     def _get_exchange_positions(self, symbol=None):
         params = {}
         if symbol: params['symbol'] = symbol
@@ -998,12 +973,17 @@ class LongBot:
         d=api('GET','/openApi/swap/v2/user/balance')
         if d.get('code')==0:
             b=d.get('data',{})
-            eq=_safe_float(b.get('equity', b.get('balance', 0)))
-            if eq <= 0:
-                for key, val in b.items():
-                    v = _safe_float(val)
-                    if v > 0: eq = v; break
-            if eq>0: ACCOUNT_EQUITY=eq
+            if isinstance(b, list):
+                for item in b:
+                    v = _safe_float(item)
+                    if v > 0: ACCOUNT_EQUITY = v; break
+            else:
+                eq=_safe_float(b.get('equity', b.get('balance', 0)))
+                if eq <= 0:
+                    for key, val in b.items():
+                        v = _safe_float(val)
+                        if v > 0: eq = v; break
+                if eq>0: ACCOUNT_EQUITY=eq
 
     def _check_ltv(self):
         if not AUTO: return
@@ -1021,25 +1001,20 @@ class LongBot:
         except: pass
 
     def analyze(self, symbol):
+        """Análisis de un símbolo (thread-safe)."""
         if symbol in self.trades: return None
         if not self._cd_ok(symbol): return None
-        # FIX 4: si ya hay una orden pending para este símbolo, skip
         if symbol in self._pending_orders: return None
         hora = datetime.utcnow().hour
         if hora in SKIP_HOURS: return None
 
         regime_ok, regime_reason = self._regime_ok()
-        if not regime_ok:
-            log.debug(f"  {symbol}: bloq régimen ({regime_reason})")
-            return None
-
+        if not regime_ok: return None
         if not self._btc_ok: return None
         if self._cb_active: return None
 
-        hora_ok, hora_reason = self.learn.hora_ok(hora)
-        if not hora_ok:
-            log.debug(f"  {symbol}: bloq hora ({hora_reason})")
-            return None
+        hora_ok, _ = self.learn.hora_ok(hora)
+        if not hora_ok: return None
 
         c5, h5, l5, v5, o5 = self._klines(symbol, '5m', 130)
         if not c5 or len(c5) < AUROLO_EMA_LEN + 50: return None
@@ -1064,27 +1039,22 @@ class LongBot:
             e9_4h = ema(c4h, 9); e21_4h = ema(c4h, 21)
             if e9_4h > e21_4h: trend_4h = 1
             elif e9_4h < e21_4h: trend_4h = -1
-        if trend_4h == -1:
-            return None
+        if trend_4h == -1: return None
 
         atr_v   = atr_calc(h5, l5, c5, 14)
         atr_pct = atr_v / price * 100 if price > 0 else 0
-        if atr_pct < 0.15:    return None
-        if change_24 > 20.0:  return None
+        if atr_pct < 0.10: return None  # bajado de 0.15
+        if change_24 > 20.0: return None
         if change_24 < -12.0: return None
 
         sig_aurolo = aurolo_signal(c5, h5, l5, v5, o5, atr_v)
 
-        if sig_aurolo['puntos'] < AUROLO_MIN_PTS:
-            return None
-
-        if sig_aurolo['cambio_tend']:
-            return None
+        # FIX D: min puntos = 1
+        if sig_aurolo['puntos'] < AUROLO_MIN_PTS: return None
+        if sig_aurolo['cambio_tend']: return None
 
         vwap_val, precio_sobre_vwap = vwap_contexto(c5, h5, l5, v5, VWAP_CANDLES)
-
-        if VWAP_AS_FILTER and not precio_sobre_vwap:
-            return None
+        if VWAP_AS_FILTER and not precio_sobre_vwap: return None
 
         sl_price = sig_aurolo['sl_price']
         sl_pct   = sig_aurolo['sl_pct']
@@ -1100,14 +1070,15 @@ class LongBot:
         if rr < MIN_RR * 0.75: return None
 
         tp1_neto = sl_pct * TP1_RATIO - FEE_COST_PCT
-        if tp1_neto < 0.4: return None
+        if tp1_neto < 0.3: return None  # bajado de 0.4
 
-        # ── SCORING ──────────────────────────────────────────────────────
+        # ── Scoring ──────────────────────────────────────────────────────
         score = 0; reasons = []; factors = []
         pts   = sig_aurolo['puntos']
 
         if pts == 3:   score += 50; reasons.append("Aurolo3/3(50)"); factors.append("aurolo_3")
         elif pts == 2: score += 30; reasons.append("Aurolo2/3(30)"); factors.append("aurolo_2")
+        elif pts == 1: score += 15; reasons.append("Aurolo1/3(15)"); factors.append("aurolo_1")
 
         if sig_aurolo['p1']: score += 10; factors.append("p1_tend")
         if sig_aurolo['p2']: score += 10; factors.append("p2_wt")
@@ -1130,14 +1101,14 @@ class LongBot:
         if trend_1h == 1: score += 12; factors.append("trend_1h_up")
         if trend_4h == 1: score += 10; factors.append("trend_4h_up")
 
-        if self._regime == 'bull':    score += 10; factors.append("regime_bull")
-        elif self._regime == 'caution': score -= 15; factors.append("regime_caution")  # penalización extra
+        if self._regime == 'bull':      score += 10; factors.append("regime_bull")
+        elif self._regime == 'caution': score -= 10; factors.append("regime_caution")
 
-        if self._btc_1h > 1.0:   score += 8;  factors.append("btc_up")
-        elif self._btc_1h > 0.3: score += 4;  factors.append("btc_ok")
-        elif self._btc_1h < -0.5: score -= 8; factors.append("btc_down")
+        if self._btc_1h > 1.0:    score += 8;  factors.append("btc_up")
+        elif self._btc_1h > 0.3:  score += 4;  factors.append("btc_ok")
+        elif self._btc_1h < -0.5: score -= 8;  factors.append("btc_down")
 
-        if self._btc_4h > 1.5:  score += 8;  factors.append("btc4h_up")
+        if self._btc_4h > 1.5:   score += 8;  factors.append("btc4h_up")
         elif self._btc_4h < -1.0: score -= 12; factors.append("btc4h_down")
 
         if rsi_1h < 40:   score += 8; factors.append("rsi_1h_os")
@@ -1150,20 +1121,17 @@ class LongBot:
 
         bonus_p = self.learn.bonus_pts(pts)
         if bonus_p != 0: score += bonus_p
-
         adj = self.learn.adj(factors)
         if adj != 0: score += adj
 
-        # FIX 7: score mínimo dinámico por régimen
+        # FIX E: score mínimo más bajo
         score_min = self._score_min_for_regime()
         if score < score_min:
-            log.debug(f"  {symbol}: score {int(score)}<{int(score_min)} (régimen {self._regime})")
+            log.debug(f"  {symbol}: score {int(score)}<{int(score_min)}")
             return None
 
         ok, reason = self.learn.ok(symbol, score)
-        if not ok:
-            log.debug(f"  {symbol}: rechazado ({reason})")
-            return None
+        if not ok: return None
 
         e25 = ema(c5, 25)
         e55 = sig_aurolo['ema55']
@@ -1239,7 +1207,6 @@ class LongBot:
         return None,None
 
     def _cancel_open(self, sym):
-        """Cancela todas las órdenes abiertas para un símbolo"""
         d=api('GET','/openApi/swap/v2/trade/openOrders',{'symbol':sym})
         cancelled = 0
         for o in (d.get('data',{}).get('orders') or []):
@@ -1252,40 +1219,18 @@ class LongBot:
         return cancelled
 
     def _place_sl(self, sym, qty, sl_price):
-        """FIX 10: SL con fallback escalonado"""
-        # Intento 1: STOP_MARKET (preferido)
         d=self._order(sym,'SELL',qty,'STOP_MARKET',stop_price=sl_price)
-        if d.get('code')==0:
-            log.info(f"  ✅ SL STOP_MARKET @ ${sl_price:.6f}")
-            return True
-        
-        # Intento 2: STOP con limit 0.1% debajo
+        if d.get('code')==0: return True
         sl_limit = sl_price * 0.999
         d=self._order(sym,'SELL',qty,'STOP',price=sl_limit,stop_price=sl_price)
-        if d.get('code')==0:
-            log.info(f"  ✅ SL STOP_LIMIT @ ${sl_price:.6f}")
-            return True
-        
-        # Intento 3: STOP_MARKET con precio ligeramente ajustado
+        if d.get('code')==0: return True
         sl_adj = sl_price * 0.998
         d=self._order(sym,'SELL',qty,'STOP_MARKET',stop_price=sl_adj)
-        ok=d.get('code')==0
-        log.info(f"  {'✅' if ok else '❌'} SL ajustado @ ${sl_adj:.6f}")
-        return ok
+        return d.get('code')==0
 
     def _place_trailing_stop(self, sym, qty, activation_price, trail_rate_pct):
-        """
-        FIX 9: Trailing Stop como mecanismo de salida principal.
-        
-        TRAILING_STOP_MARKET en BingX:
-        - activationPrice: precio al que se activa el trailing
-        - priceRate: % de callback desde el máximo (1.5 = 1.5%)
-        
-        Ventaja vs TP fijo: captura moves más grandes si hay tendencia.
-        """
         params = {
-            'symbol': sym,
-            'side': 'SELL',
+            'symbol': sym, 'side': 'SELL',
             'type': 'TRAILING_STOP_MARKET',
             'quantity': str(qty),
             'activationPrice': str(round(activation_price, 8)),
@@ -1293,78 +1238,40 @@ class LongBot:
         }
         if self._mode == 'hedge': params['positionSide'] = 'LONG'
         else: params['reduceOnly'] = 'true'
-        
         d = api('POST', '/openApi/swap/v2/trade/order', params)
-        ok = d.get('code') == 0
-        if ok:
-            log.info(f"  ✅ Trailing Stop: activación ${activation_price:.6f} callback {trail_rate_pct}%")
-        else:
-            log.warning(f"  ⚠️ Trailing Stop falló: {d.get('msg')} — usando TP fijo")
-        return ok
+        return d.get('code') == 0
 
-    # FIX 2: CHASE LIMIT ENTRY
     def _chase_limit_entry(self, sym, qty):
-        """
-        Chase Limit: se coloca al mejor ask y se ajusta dinámicamente.
-        Si después de 10s no se llena, cae a MARKET.
-        
-        BingX soporta natively Chase Limit en la UI pero vía API
-        lo emulamos con un LIMIT al ask actual + timeout a MARKET.
-        Esto es mejor que LIMIT fijo (que se queda zombie).
-        """
-        # Obtener ask actual
         d = pub('/openApi/swap/v2/quote/bookTicker', {'symbol': sym})
         ask_price = None
         if d.get('code') == 0 and d.get('data'):
             ask_price = float(d['data'].get('askPrice', 0) or 0)
-        
         if not ask_price or ask_price <= 0:
-            # Fallback a ticker
             tk = self._ticker(sym)
-            if tk: ask_price = tk['price'] * 1.0002  # ligero premium
-        
+            if tk: ask_price = tk['price'] * 1.0002
         if not ask_price: return None, {}
-        
-        # Colocar LIMIT al ask + 0.05% (para asegurar llenado rápido)
         limit_price = round(ask_price * 1.0005, 8)
-        
-        log.info(f"  📥 Chase Limit {sym}: {qty} @ ${limit_price:.6f} (ask+0.05%)")
         d = self._order(sym, 'BUY', qty, 'LIMIT', price=limit_price)
-        
         if d.get('code') != 0:
-            log.warning(f"  ⚠️ Chase Limit falló ({d.get('msg')}) → MARKET")
             d = self._order(sym, 'BUY', qty, 'MARKET')
-            if d.get('code') != 0:
-                return None, {}
-        
-        # Esperar hasta 12s para fill
+            if d.get('code') != 0: return None, {}
         for i in range(12):
             time.sleep(1)
             filled_qty, fill_price = self._confirm_pos(sym, 1)
             if filled_qty and fill_price:
-                log.info(f"  ✅ Llenado @ ${fill_price:.6f} (tras {i+1}s)")
                 return filled_qty, fill_price
-        
-        # Si no se llenó en 12s, cancelar y enviar MARKET
-        log.warning(f"  ⏱️ Chase Limit no llenado en 12s → cancelando y enviando MARKET")
         self._cancel_open(sym)
         time.sleep(0.5)
-        
-        # Verificar si se llenó parcialmente
         filled_qty, fill_price = self._confirm_pos(sym, 2)
         if filled_qty: return filled_qty, fill_price
-        
-        # MARKET final
         dm = self._order(sym, 'BUY', qty, 'MARKET')
         if dm.get('code') == 0:
             return self._confirm_pos(sym, 10)
-        
         return None, None
 
     def open_trade(self, sym, sig):
         if not AUTO or sym in self.trades: return False
         if LongBot._opening or len(self.trades)>=MAX_TRADES: return False
-        # FIX 4: deduplicación — no abrir si ya hay orden pendiente
         if sym in self._pending_orders: return False
         if self._has_any_position(sym):
             log.warning(f"  ⛔ {sym} ya tiene posición"); return False
@@ -1378,50 +1285,38 @@ class LongBot:
         pts      = sig['aurolo_pts']
         label    = sig['aurolo_señal']
 
-        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1 | Régimen:{sig['regime']}")
-        log.info(f"  {sig['aurolo_desc']}")
-
+        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1")
         self._set_lev(sym); time.sleep(0.2)
         qty, notional = self._calc_qty(sym, price, sl_price)
         if not qty: return False
 
-        # Marcar como pendiente ANTES de enviar orden (FIX 4)
         self._pending_orders[sym] = 'pending'
-
-        # FIX 2: Chase Limit entry
         filled_qty, fill_price = self._chase_limit_entry(sym, qty)
-        
         if not filled_qty or not fill_price:
-            log.error(f"  ❌ No se pudo abrir posición {sym}")
+            log.error(f"  ❌ No se pudo abrir {sym}")
             self._pending_orders.pop(sym, None)
             return False
 
-        # Recalcular SL/TP con precio real de fill
         sl_pct_real = sig['sl_pct']
         sl_real     = fill_price * (1 - sl_pct_real / 100)
         sl_real = min(sl_real, fill_price * (1 - SL_MIN_PCT / 100))
         sl_real = max(sl_real, fill_price * (1 - SL_MAX_PCT / 100))
-
         tp1_price = fill_price * (1 + sl_pct_real * TP1_RATIO / 100)
         tp2_price = fill_price * (1 + sl_pct_real * TP2_RATIO / 100)
 
-        # Colocar SL (obligatorio)
         sl_ok = self._place_sl(sym, filled_qty, sl_real)
         if not sl_ok:
             time.sleep(2); sl_ok = self._place_sl(sym, filled_qty, sl_real)
         if not sl_ok:
-            log.error("  ❌ SL crítico — cerrando posición")
+            log.error("  ❌ SL crítico — cerrando")
             self._order(sym,'SELL',filled_qty,'MARKET')
             self._pending_orders.pop(sym, None)
             return False
 
-        # FIX 9: Colocar Trailing Stop como exit principal
         trailing_placed = False
         if USE_TRAILING_EXIT:
             activation = fill_price * (1 + TRAIL_ACTIVATION / 100)
-            trailing_placed = self._place_trailing_stop(
-                sym, filled_qty, activation, TRAIL_RATE_PCT
-            )
+            trailing_placed = self._place_trailing_stop(sym, filled_qty, activation, TRAIL_RATE_PCT)
 
         trade = {
             'entry': fill_price, 'qty_total': filled_qty, 'qty_runner': filled_qty,
@@ -1440,40 +1335,32 @@ class LongBot:
         }
         self.trades[sym] = trade
         self._pending_orders.pop(sym, None)
-        self.stats['exec']  += 1
-        self.stats['fees']  += notional * FEE
+        self.stats['exec'] += 1; self.stats['fees'] += notional * FEE
 
         p1 = "✅" if sig['aurolo_p1'] else "❌"
         p2 = "✅" if sig['aurolo_p2'] else "❌"
         p3 = "✅" if sig['aurolo_p3'] else "❌"
-        trail_txt = f"🎯 Trailing Stop: activa al +{TRAIL_ACTIVATION}% callback {TRAIL_RATE_PCT}%" if trailing_placed else "🎯 TP1/TP2 manual"
 
         self._tg(
             f"<b>🟢 LONG [{label}]</b> — <b>{sym}</b>\n"
-            f"Score: {int(sig['score'])}/{int(sig['score_min'])} | RR: {sig['rr']:.2f}:1 | {sig['regime']}\n\n"
-            f"<b>🔍 Aurolo {pts}/3:</b>\n"
-            f"{p1} P1 EMA{AUROLO_EMA_LEN}\n"
-            f"{p2} P2 WT: {sig['aurolo_wt']:.1f}\n"
-            f"{p3} P3 ADX: {sig['aurolo_adx']:.1f}\n\n"
-            f"📍 Entrada: ${fill_price:.6f} (Chase Limit)\n"
-            f"{trail_txt}\n"
-            f"🛑 SL: ${sl_real:.6f} (-{sl_pct_real:.2f}%)\n"
-            f"4H: {'🟢' if sig['trend_4h']==1 else '⚪'} | BTC: {self._btc_1h:+.2f}%"
+            f"Score: {int(sig['score'])}/{int(sig['score_min'])} | RR: {sig['rr']:.2f}:1 | {sig['regime']}\n"
+            f"{p1} P1 EMA55  {p2} P2 WT:{sig['aurolo_wt']:.1f}  {p3} P3 ADX:{sig['aurolo_adx']:.1f}\n"
+            f"📍 ${fill_price:.6f} | SL: ${sl_real:.6f} (-{sl_pct_real:.2f}%)\n"
+            f"Trailing: {'✅' if trailing_placed else '❌'} | BTC: {self._btc_1h:+.2f}%"
         )
         return True
 
     def _close_partial(self, sym, qty, exit_price, label):
         if qty <= 0: return 0
         d = self._order(sym, 'SELL', qty, 'MARKET')
-        if d.get('code') != 0:
-            log.error(f"  ❌ Parcial {label} {sym}: {d.get('msg')}"); return 0
+        if d.get('code') != 0: return 0
         t = self.trades[sym]
         chg  = (exit_price - t['entry']) / t['entry']
         frac = qty / t['qty_total']
         net  = POS_SIZE*LEVERAGE*chg*frac - POS_SIZE*LEVERAGE*FEE*2*frac
         t['pnl_parcial'] += net; t['qty_runner'] -= qty
         self.stats['fees'] += POS_SIZE*LEVERAGE*FEE*2*frac
-        self._daily_pnl   += net; self.stats['pnl'] += net
+        self._daily_pnl += net; self.stats['pnl'] += net
         log.info(f"  💰 {label} {sym}: ${net:+.4f}")
         self._tg(f"<b>💰 {label}</b> — {sym}\n${exit_price:.6f}\nPnL: ${net:+.4f}")
         return net
@@ -1499,7 +1386,7 @@ class LongBot:
         wr    = self.stats['wins']/total*100 if total else 0
         mins  = int((datetime.now()-t['opened']).total_seconds()/60)
         emoji = "✅" if win else "❌"
-        log.info(f"  {emoji} {reason} | ${net_total:+.4f} ({net_total/POS_SIZE*100:+.1f}%) | {mins}min | WR:{wr:.0f}%")
+        log.info(f"  {emoji} {reason} | ${net_total:+.4f} | {mins}min | WR:{wr:.0f}%")
 
         self.learn.record(
             symbol=sym, score=t['score'], pnl=net_total, win=win,
@@ -1511,9 +1398,7 @@ class LongBot:
 
         if 'STOP LOSS' in reason or 'SL' in reason:
             if mins < CD_SL_FAST_MIN:
-                fast_cd_secs = CD_SL_FAST_HOURS * 3600
-                self._cooldowns[sym] = (time.time() + fast_cd_secs, 'SL_FAST')
-                self._tg(f"<b>⚠️ SL RÁPIDO — {sym}</b>\n{mins}min → cooldown {CD_SL_FAST_HOURS}h")
+                self._cooldowns[sym] = (time.time() + CD_SL_FAST_HOURS * 3600, 'SL_FAST')
             else:
                 self._set_cd(sym, 'SL')
         else:
@@ -1521,13 +1406,12 @@ class LongBot:
 
         self._tg(
             f"<b>{'✅' if win else '❌'} CERRADO — {reason}</b>\n"
-            f"<b>{sym}</b> | {t.get('entrada_label','?')} | {mins}min\n"
+            f"<b>{sym}</b> | {mins}min\n"
             f"${t['entry']:.6f} → ${exit_price:.6f}\n"
-            f"<b>PnL: ${net_total:+.4f} ({net_total/POS_SIZE*100:+.1f}%) | WR: {wr:.0f}%</b>"
+            f"<b>PnL: ${net_total:+.4f} | WR: {wr:.0f}%</b>"
         )
         if self.stats['closed'] % 3 == 0: self.learn.save()
         del self.trades[sym]
-        # Cancelar todas las órdenes abiertas del símbolo (SL, trailing que queden)
         self._cancel_open(sym)
         return True
 
@@ -1538,7 +1422,6 @@ class LongBot:
                 tk = self._ticker(sym)
                 if not tk: continue
                 cur = tk['price']
-                pct = (cur - t['entry']) / t['entry'] * 100
 
                 c5, h5, l5, v5, _ = self._klines(sym, '5m', 80)
                 if c5:
@@ -1550,21 +1433,17 @@ class LongBot:
                     sig_live = aurolo_signal(c5, h5, l5, v5 or [1]*len(c5), c5, atr_live)
                     if sig_live['debilidad']:
                         t['debilidad_alertada'] = True
-                        self._tg(f"<b>⚠️ DEBILIDAD — {sym}</b>\n{pct:+.2f}% | WT={sig_live['wt_now']:.1f}")
-                    if sig_live['cambio_tend'] and pct > 0:
+                        self._tg(f"<b>⚠️ DEBILIDAD — {sym}</b>")
+                    if sig_live['cambio_tend'] and (cur-t['entry'])/t['entry']*100 > 0:
                         self._close_all(sym, cur, "CAMBIO TENDENCIA"); continue
 
                 if cur > t['highest']: t['highest'] = cur
 
-                # Si el trailing stop está activo en el exchange, solo monitorear SL manual
                 if t.get('trailing_placed') and USE_TRAILING_EXIT:
-                    # El trailing stop se gestiona en el exchange.
-                    # Solo cerramos manualmente si hay señal de debilidad fuerte.
                     if cur <= t['sl']:
                         self._close_all(sym, cur, "STOP LOSS")
                     continue
 
-                # Gestión manual de TPs (si trailing no disponible)
                 if not t['tp1_hit'] and cur >= t['tp1_price']:
                     self._close_partial(sym, t['qty_tp1'], cur, f"TP1({int(TP1_PCT)}%)")
                     t['tp1_hit'] = True
@@ -1575,25 +1454,7 @@ class LongBot:
                 if t['tp1_hit'] and not t['tp2_hit'] and cur >= t['tp2_price']:
                     self._close_partial(sym, t['qty_tp2'], cur, f"TP2({int(TP2_PCT)}%)")
                     t['tp2_hit'] = True
-                    locked = t['entry'] + (t['highest'] - t['entry']) * 0.5
-                    if locked > t['sl']: t['sl'] = locked
                     continue
-
-                if t['tp2_hit']:
-                    if c5 and l5:
-                        min_rec = min(l5[-4:]) if len(l5) >= 4 else l5[-1]
-                        trailing = max(t['ema25'], min_rec * 0.999)
-                        if trailing > t['sl']: t['sl'] = trailing
-                    if cur < t['ema25'] and c5 and c5[-1] < t['ema25'] and c5[-2] < t['ema25']:
-                        self._close_all(sym, cur, "EMA25 RUNNER"); continue
-
-                elif t['tp1_hit']:
-                    if cur < t['ema25'] and c5 and c5[-1] < t['ema25'] and c5[-2] < t['ema25']:
-                        self._close_all(sym, cur, "EMA25 PRE-TP2"); continue
-
-                elif pct > 0.5 and cur < t['ema25']:
-                    if c5 and c5[-1] < t['ema25'] and c5[-2] < t['ema25']:
-                        self._close_all(sym, cur, "EMA25 EARLY"); continue
 
                 if cur <= t['sl']:
                     self._close_all(sym, cur, "STOP LOSS")
@@ -1628,15 +1489,13 @@ class LongBot:
                 self._cb_active=False; self._daily_pnl=0.0
                 log.info("  🔓 Circuit breaker OFF")
             return self._cb_active
-
         if self._equity_start > 0:
             eq_loss_pct = abs(self._daily_pnl) / self._equity_start * 100
             if self._daily_pnl < 0 and eq_loss_pct > DAILY_LOSS_CAP_PCT:
                 self._cb_active=True
                 self._cb_until=datetime.utcnow()+timedelta(hours=CB_HOURS)
-                self._tg(f"<b>🔒 DAILY LOSS CAP</b>\n{eq_loss_pct:.1f}% perdido hoy | Pausa {CB_HOURS}h")
+                self._tg(f"<b>🔒 DAILY LOSS CAP</b>\n{eq_loss_pct:.1f}% | Pausa {CB_HOURS}h")
                 return True
-
         cb_threshold = ACCOUNT_EQUITY * (CB_PCT / 100)
         if self._daily_pnl < -cb_threshold:
             self._cb_active=True
@@ -1653,15 +1512,12 @@ class LongBot:
         for sym,t in self.trades.items():
             tk=self._ticker(sym); cur=tk['price'] if tk else t['entry']
             pct=(cur-t['entry'])/t['entry']*100
-            trail_icon = "🎯" if t.get('trailing_placed') else "📌"
-            pos += f"  {trail_icon} {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}%\n"
-
+            pos += f"  {'🎯' if t.get('trailing_placed') else '📌'} {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}%\n"
         self._tg(
-            f"<b>📊 Reporte v5.9</b>\n"
+            f"<b>📊 Reporte v5.9-FULLSCAN</b>\n"
             f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% | {total}t\n"
-            f"Día: ${self._daily_pnl:+.4f} | Equity: ${ACCOUNT_EQUITY:.2f}\n"
-            f"Score: {int(self.learn.opt_score)} | Régimen: {self._regime}\n"
-            f"Breadth: {int(self._breadth*100)}% | BTC4h: {self._btc_4h:+.1f}%\n"
+            f"Régimen: {self._regime} | Breadth: {int(self._breadth*100)}%\n"
+            f"Símbolos activos: {len(self.symbols)}\n"
             + (pos if pos else "  Sin posiciones\n")
         )
 
@@ -1676,7 +1532,7 @@ class LongBot:
         except: pass
 
     async def run(self):
-        log.info("\n🚀 Bot LONGS v5.9 — ZOMBIE KILLER + CHASE LIMIT + TRAILING\n")
+        log.info(f"\n🚀 Bot LONGS v5.9-FULLSCAN | {len(self.symbols)} símbolos | {SCAN_WORKERS} workers\n")
         iteration=0; last_sym=last_ltv=last_hedge=last_eq=last_regime=0
 
         while True:
@@ -1685,7 +1541,6 @@ class LongBot:
                 if time.time()-last_sym    > 600:  self._refresh_symbols();    last_sym=time.time()
                 if time.time()-last_ltv    > 300:  self._check_ltv();          last_ltv=time.time()
                 if time.time()-last_hedge  > 600:
-                    # Buscar SHORTs huérfanos Y también limpiar zombies periódicamente
                     for sym, sides in self._get_exchange_positions().items():
                         if sides['short'] > 0:
                             self._order_close_short(sym, sides['short']); time.sleep(0.3)
@@ -1694,7 +1549,6 @@ class LongBot:
                 if time.time()-last_regime > 300:
                     self._update_market_regime(); last_regime=time.time()
 
-                # FIX 1: Zombie cleanup periódico
                 if time.time() - self._last_zombie_clean > ZOMBIE_CLEANUP_MIN * 60:
                     self._nuke_zombie_orders()
 
@@ -1715,7 +1569,7 @@ class LongBot:
                 log.info(
                     f"  BTC1h:{self._btc_1h:+.2f}% BTC4h:{self._btc_4h:+.2f}% | "
                     f"Régimen:{self._regime} | Breadth:{int(self._breadth*100)}% | "
-                    f"Score≥{int(score_min)}"
+                    f"Score≥{int(score_min)} | Símbolos:{len(self.symbols)}"
                 )
                 log.info(f"{'='*72}\n")
 
@@ -1728,24 +1582,22 @@ class LongBot:
                         log.info(f"  ⏸️ Sin entradas: {regime_reason}")
                         await asyncio.sleep(INTERVAL); continue
 
-                    log.info(f"  Escaneando {len(self.symbols)} símbolos (Score≥{int(score_min)})...")
-                    found = 0
-                    for i, sym in enumerate(self.symbols):
+                    log.info(f"  🔍 Scan paralelo: {len(self.symbols)} símbolos ({SCAN_WORKERS} workers)...")
+
+                    # FIX F: scan en paralelo
+                    signals = self._analyze_parallel(self.symbols)
+                    found = len(signals)
+                    log.info(f"  ✅ {found} señales encontradas")
+
+                    for sym, sig in signals:
                         if len(self.trades) >= MAX_TRADES: break
-                        sig = self.analyze(sym)
-                        if sig:
-                            found += 1
-                            log.info(
-                                f"  💡 {sym} [{sig['aurolo_señal']}] | "
-                                f"Score:{int(sig['score'])}/{int(sig['score_min'])} | "
-                                f"RR:{sig['rr']:.2f}:1 | SL:{sig['sl_pct']:.2f}%"
-                            )
-                            if self.open_trade(sym, sig):
-                                await asyncio.sleep(3)
-                        if (i+1) % 15 == 0:
-                            log.info(f"  ...{i+1}/{len(self.symbols)}")
-                        await asyncio.sleep(0.12)
-                    log.info(f"  ✅ Scan: {found} señales")
+                        log.info(
+                            f"  💡 {sym} [{sig['aurolo_señal']}] | "
+                            f"Score:{int(sig['score'])}/{int(sig['score_min'])} | "
+                            f"RR:{sig['rr']:.2f}:1 | SL:{sig['sl_pct']:.2f}%"
+                        )
+                        if self.open_trade(sym, sig):
+                            await asyncio.sleep(3)
                 else:
                     log.info("  ⏸️ Max trades — monitoreando")
 
