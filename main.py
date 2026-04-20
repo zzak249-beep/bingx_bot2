@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-BOT LONGS v5.9 — FULL MARKET SCAN (ALL BINGX SYMBOLS incl. GOLD/OIL/GAS)
+BOT LONGS v5.9-FIXED — FULL MARKET SCAN (ALL BINGX SYMBOLS incl. GOLD/OIL/GAS)
 ════════════════════════════════════════════════════════════════════════════════
 
-CAMBIOS v5.9-FULLSCAN vs v5.9:
-  ✅ FIX A: EXCLUDE reducido — solo stablecoins y forex puro.
-            Gold (XAU), Silver (XAG), Oil (WTI/BRENT), Gas, Índices, Acciones
-            ahora SE ANALIZAN como cualquier otro par.
-  ✅ FIX B: MAX_SYMS=0 → sin límite (antes: 40).
-  ✅ FIX C: MIN_VOL bajado a 300K USDT (antes: 5M) para incluir commodities.
-  ✅ FIX D: AUROLO_MIN_PTS=1 → más señales (antes: 2).
-  ✅ FIX E: Score mínimos bajados: bull=50, neutral=58, base=50 (antes: 60/68/65).
-  ✅ FIX F: Scan paralelo con ThreadPoolExecutor (8 workers) → 10x más rápido.
-  ✅ FIX G: Caution block desactivado por defecto para más oportunidades.
+CAMBIOS v5.9-FIXED vs v5.9-FULLSCAN:
+  ✅ FIX WR-1: AUROLO_MIN_PTS revertido a 2 (era 1 → demasiadas señales débiles)
+  ✅ FIX WR-2: Score mínimos restaurados: MIN_SCORE=60, SCORE_BULL=60, SCORE_NEUTRAL=68
+  ✅ FIX WR-3: CAUTION_BLOCK=true reactivado (era false → entraba en mercados malos)
+  ✅ FIX WR-4: Nuevo pre-filtro momentum: solo top 40 monedas líderes del día
+  ✅ FIX WR-5: _get_momentum_leaders() — ranking por fuerza relativa, volumen, EMA
+  ✅ FIX WR-6: Bonus +8 score para monedas con momentum confirmado
+  ✅ FIX WR-7: Filtro spread/liquidez mejorado en entradas
+  ✅ MANTENIDO: FIX A (Gold/Oil/Gas activos), FIX B (sin límite símbolos),
+                FIX C (vol 300K), FIX F (scan paralelo 8 workers)
+
+DIAGNÓSTICO DEL PROBLEMA (WR 13%):
+  - FIX D original (AUROLO_MIN_PTS=1) causaba entradas en señales de 1/3 = ruido puro
+  - FIX E original (score 50) dejaba pasar casi cualquier moneda
+  - CAUTION_BLOCK=false permitía entradas en régimen hostil
+  - Sin pre-filtro de momentum: el bot entraba en monedas sin fuerza real del día
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
@@ -83,11 +89,18 @@ TRAIL_ACTIVATION  = clean('TRAIL_ACTIVATION',  '0.8',  'float')
 ZOMBIE_CLEANUP_MIN = clean('ZOMBIE_CLEANUP_MIN', '10', 'int')
 ZOMBIE_MAX_AGE_MIN = clean('ZOMBIE_MAX_AGE_MIN', '20', 'int')
 
-# ── FIX B+C: Sin límite de símbolos, volumen bajo ─────────────────────────
-MIN_VOL   = clean('MIN_VOLUME_24H',  '300000',  'float')  # FIX C: era 5000000
-MAX_SYMS  = clean('MAX_SYMBOLS',     '0',       'int')    # FIX B: 0=sin límite
-MIN_SCORE = clean('MIN_SCORE',       '50',      'float')  # FIX E: era 65
+# ── Símbolos y volumen ────────────────────────────────────────────────────
+MIN_VOL   = clean('MIN_VOLUME_24H',  '300000',  'float')   # Gold/Oil/Gas incluidos
+MAX_SYMS  = clean('MAX_SYMBOLS',     '0',       'int')     # 0 = sin límite
+MIN_SCORE = clean('MIN_SCORE',       '60',      'float')   # FIX WR-2: restaurado (era 50)
 BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '1.0', 'float')
+
+# ── Momentum pre-filter ───────────────────────────────────────────────────
+MOMENTUM_TOP_N      = clean('MOMENTUM_TOP_N',      '40',   'int')    # FIX WR-4
+MOMENTUM_MIN_4H     = clean('MOMENTUM_MIN_4H',     '0.3',  'float')  # % mínimo 4h
+MOMENTUM_MIN_24H    = clean('MOMENTUM_MIN_24H',    '0.0',  'float')  # % mínimo 24h
+MOMENTUM_MAX_RSI    = clean('MOMENTUM_MAX_RSI',    '78',   'float')  # no sobrecomprado
+MOMENTUM_MIN_VOL_R  = clean('MOMENTUM_MIN_VOL_R',  '0.8',  'float')  # ratio volumen
 
 # ── Régimen de mercado ────────────────────────────────────────────────────
 REGIME_CHECK      = clean('REGIME_CHECK',      'true',  'bool')
@@ -95,10 +108,10 @@ BREADTH_MIN       = clean('BREADTH_MIN',        '0.35',  'float')
 BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '3.0',   'float')
 BTC_4H_CRASH_PAUSE= clean('BTC_4H_CRASH_HOURS','2',      'int')
 DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','10.0',  'float')
-CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'false', 'bool')  # FIX G: era true
-# FIX E: scores más bajos para más señales
-SCORE_BULL        = clean('SCORE_BULL',         '50',    'float')  # era 60
-SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',      '58',    'float')  # era 68
+CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'true',  'bool')     # FIX WR-3: reactivado
+# FIX WR-2: scores restaurados
+SCORE_BULL        = clean('SCORE_BULL',         '60',    'float')    # restaurado (era 50)
+SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',      '68',    'float')    # restaurado (era 58)
 
 # ── VWAP ──────────────────────────────────────────────────────────────────
 VWAP_CANDLES   = clean('VWAP_CANDLES',  '50',   'int')
@@ -109,7 +122,7 @@ AUROLO_EMA_LEN   = clean('AUROLO_EMA_LEN',   '55',   'int')
 AUROLO_ZONA_AUTO = clean('AUROLO_ZONA_AUTO',  'true', 'bool')
 AUROLO_ZONA_PCT  = clean('AUROLO_ZONA_PCT',   '0.8',  'float')
 AUROLO_ZONA_VELAS = clean('AUROLO_ZONA_VELAS', '6',   'int')
-AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '1',     'int')   # FIX D: era 2
+AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '2',     'int')   # FIX WR-1: restaurado (era 1)
 AUROLO_ENTRY   = clean('AUROLO_ENTRY',   'close', 'str')
 
 # WaveTrend
@@ -147,7 +160,7 @@ SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH', '85', 'float')
 # ── Misc ──────────────────────────────────────────────────────────────────
 INTERVAL   = clean('CHECK_INTERVAL', '90', 'int')
 LTV_WARN   = clean('LTV_WARNING_PCT', '75', 'float')
-SCAN_WORKERS = clean('SCAN_WORKERS', '8', 'int')  # FIX F: hilos paralelos
+SCAN_WORKERS = clean('SCAN_WORKERS', '8', 'int')
 
 _skip_raw  = os.getenv('SKIP_HOURS', '2,3')
 SKIP_HOURS = set(int(x.strip()) for x in _skip_raw.split(',') if x.strip().isdigit())
@@ -157,12 +170,9 @@ FEE        = 0.0002
 FEE_COST_PCT = FEE * LEVERAGE * 2 * 100
 TP_MIN_FEE   = round(FEE_COST_PCT + 0.003 * 100, 3)
 
-# FIX A: EXCLUDE reducido — solo stablecoins y forex puro
-# Gold, Silver, Oil, Gas, Indices, Stocks → SE ANALIZAN (usuario los quiere)
+# Solo excluir stablecoins y forex puro — Gold/Oil/Gas/Indices SE ANALIZAN
 EXCLUDE = {
-    # Stablecoins
     'USDC', 'BUSD', 'TUSD', 'FRAX', 'DAI', 'USDP', 'FDUSD',
-    # Forex sintético puro (no crypto)
     'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD',
 }
 
@@ -577,13 +587,13 @@ class Learning:
                 requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                     json={'chat_id': TG_CHAT,
-                          'text': f"<b>🧠 LEARN v5.9 — {n} trades</b>\nWR:{int(wr)}% PnL:${pnl:+.4f} Score≥{int(self.opt_score)}",
+                          'text': f"<b>🧠 LEARN v5.9-FIXED — {n} trades</b>\nWR:{int(wr)}% PnL:${pnl:+.4f} Score≥{int(self.opt_score)}",
                           'parse_mode': 'HTML'},
                     timeout=6
                 )
         except: pass
 
-    def save(self, fp='/tmp/bot_learn_v59.json'):
+    def save(self, fp='/tmp/bot_learn_v59f.json'):
         try:
             json.dump({
                 'history': self.history[-200:], 'sym_stats': dict(self.sym_stats),
@@ -597,8 +607,13 @@ class Learning:
             }, open(fp,'w'), indent=2)
         except: pass
 
-    def load(self, fp='/tmp/bot_learn_v59.json'):
-        for path in [fp, '/tmp/bot_learn_v58.json', '/tmp/bot_learn_v57.json', '/tmp/bot_learn.json']:
+    def load(self, fp='/tmp/bot_learn_v59f.json'):
+        # Intenta cargar desde múltiples versiones anteriores
+        for path in [fp,
+                     '/tmp/bot_learn_v59.json',
+                     '/tmp/bot_learn_v58.json',
+                     '/tmp/bot_learn_v57.json',
+                     '/tmp/bot_learn.json']:
             try:
                 if not os.path.exists(path): continue
                 d = json.load(open(path))
@@ -622,7 +637,7 @@ class Learning:
 
 
 # ============================================================================
-# BOT PRINCIPAL v5.9-FULLSCAN
+# BOT PRINCIPAL v5.9-FIXED
 # ============================================================================
 
 class LongBot:
@@ -630,33 +645,38 @@ class LongBot:
 
     def __init__(self):
         log.info("=" * 72)
-        log.info("  BOT LONGS v5.9-FULLSCAN — ALL BINGX SYMBOLS + GOLD/OIL/GAS")
+        log.info("  BOT LONGS v5.9-FIXED — ALL BINGX SYMBOLS + GOLD/OIL/GAS")
         log.info(f"  Capital: ${POS_SIZE} | Riesgo: {RISK_PCT}%/trade | {LEVERAGE}x")
         log.info(f"  Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Min puntos Aurolo: {AUROLO_MIN_PTS}/3")
         log.info(f"  Volumen mínimo: ${MIN_VOL:,.0f} | Símbolos: {'TODOS' if MAX_SYMS==0 else MAX_SYMS}")
+        log.info(f"  Pre-filtro momentum: TOP {MOMENTUM_TOP_N} líderes del día")
         log.info(f"  Scan paralelo: {SCAN_WORKERS} workers")
         log.info("=" * 72)
 
-        self.symbols      = []
-        self.trades       = {}
-        self._contracts   = {}
-        self._cooldowns   = {}
+        self.symbols         = []
+        self.trades          = {}
+        self._contracts      = {}
+        self._cooldowns      = {}
         self._pending_orders = {}
-        self._last_report = datetime.now() - timedelta(hours=3)
+        self._last_report    = datetime.now() - timedelta(hours=3)
         self._last_zombie_clean = 0
-        self._btc_1h      = 0.0
-        self._btc_4h      = 0.0
-        self._btc_ok      = True
-        self._regime      = 'neutral'
-        self._regime_until= None
-        self._breadth     = 0.5
-        self._mode        = 'hedge'
-        self._daily_pnl   = 0.0
-        self._daily_date  = datetime.utcnow().date()
-        self._equity_start= ACCOUNT_EQUITY
-        self._cb_active   = False
-        self._cb_until    = None
-        self.learn        = Learning()
+        self._last_momentum_refresh = 0
+        self._btc_1h         = 0.0
+        self._btc_4h         = 0.0
+        self._btc_ok         = True
+        self._regime         = 'neutral'
+        self._regime_until   = None
+        self._breadth        = 0.5
+        self._mode           = 'hedge'
+        self._daily_pnl      = 0.0
+        self._daily_date     = datetime.utcnow().date()
+        self._equity_start   = ACCOUNT_EQUITY
+        self._cb_active      = False
+        self._cb_until       = None
+        # FIX WR-4: caché de líderes de momentum
+        self._momentum_cache = set()
+        self._momentum_ranked = []
+        self.learn           = Learning()
         self.learn.load()
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0,'fees':0.0}
 
@@ -668,10 +688,11 @@ class LongBot:
         self._recover()
 
         self._tg(
-            f"<b>🤖 Bot LONGS v5.9-FULLSCAN</b>\n"
+            f"<b>🤖 Bot LONGS v5.9-FIXED</b>\n"
             f"Símbolos: {'TODOS' if MAX_SYMS==0 else MAX_SYMS} | Vol≥${MIN_VOL/1e3:.0f}K\n"
             f"Gold/Oil/Gas/Indices: ✅ ACTIVOS\n"
             f"Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Aurolo≥{AUROLO_MIN_PTS}/3\n"
+            f"Pre-filtro momentum: TOP {MOMENTUM_TOP_N} líderes\n"
             f"🧟 Zombies eliminados: {n_killed}\n"
             f"♻️ Posiciones recuperadas: {len(self.trades)}"
         )
@@ -685,7 +706,6 @@ class LongBot:
         d = api('GET', '/openApi/swap/v2/user/balance')
         if d.get('code') == 0:
             b = d.get('data',{})
-            # Handle both dict and list responses
             if isinstance(b, list):
                 eq = 0.0
                 for item in b:
@@ -728,7 +748,7 @@ class LongBot:
             log.info(f"  Contratos: {len(self._contracts)}")
 
     def _refresh_symbols(self):
-        """FIX B+C: obtiene TODOS los símbolos sin límite, volumen bajo."""
+        """Obtiene TODOS los símbolos sin límite, volumen >= MIN_VOL."""
         d = pub('/openApi/swap/v2/quote/ticker')
         if d.get('code') != 0:
             self.symbols = self.symbols or ['BTC-USDT','ETH-USDT','SOL-USDT']; return
@@ -737,7 +757,6 @@ class LongBot:
             sym = t.get('symbol','')
             if not sym.endswith('-USDT'): continue
             base = sym.replace('-USDT','').upper()
-            # FIX A: solo excluir stablecoins y forex puro
             if any(base == ex for ex in EXCLUDE): continue
             if any(base.startswith(ex) for ex in EXCLUDE): continue
             try:
@@ -748,15 +767,106 @@ class LongBot:
             except: continue
 
         items.sort(key=lambda x: x['vol'], reverse=True)
-
-        # FIX B: sin límite si MAX_SYMS=0
         if MAX_SYMS > 0:
             items = items[:MAX_SYMS]
 
         self.symbols = [x['sym'] for x in items]
         log.info(f"  Símbolos activos: {len(self.symbols)} (vol>${MIN_VOL/1e3:.0f}K)")
 
-    # ── FIX F: Análisis paralelo ──────────────────────────────────────────
+    # ── FIX WR-4/5: Pre-filtro momentum ──────────────────────────────────
+    def _get_momentum_leaders(self, top_n=None):
+        """
+        Obtiene las top N monedas con mejor momentum del día.
+        Criterios: fuerza relativa reciente, EMA alignment, volumen creciente, RSI sano.
+        Se ejecuta en paralelo usando el ThreadPoolExecutor existente.
+        """
+        top_n = top_n or MOMENTUM_TOP_N
+        scored = []
+
+        def _score_sym(sym):
+            try:
+                c1h, h1h, l1h, v1h, _ = self._klines(sym, '1h', 48)
+                if not c1h or len(c1h) < 25:
+                    return None
+
+                price = c1h[-1]
+                if price <= 0:
+                    return None
+
+                # Momentum 4h (últimas 4 velas de 1h)
+                mom_4h = (c1h[-1] - c1h[-5]) / c1h[-5] * 100 if len(c1h) >= 5 else 0
+
+                # Momentum 24h
+                mom_24h = (c1h[-1] - c1h[-25]) / c1h[-25] * 100 if len(c1h) >= 25 else 0
+
+                # Solo monedas subiendo
+                if mom_4h < MOMENTUM_MIN_4H or mom_24h < MOMENTUM_MIN_24H:
+                    return None
+
+                # EMA alignment: precio > EMA9 > EMA21
+                e9  = ema(c1h, 9)
+                e21 = ema(c1h, 21)
+                if not (price > e9 > e21):
+                    return None
+
+                # Volumen creciente vs promedio 6h
+                vol_avg_6h = sum(v1h[-7:-1]) / 6 if len(v1h) >= 7 else v1h[-1]
+                vol_ratio  = v1h[-1] / vol_avg_6h if vol_avg_6h > 0 else 1
+                if vol_ratio < MOMENTUM_MIN_VOL_R:
+                    return None
+
+                # RSI sano (no sobrecomprado, no oversold extremo)
+                rsi_val = rsi(c1h, 14)
+                if rsi_val > MOMENTUM_MAX_RSI or rsi_val < 35:
+                    return None
+
+                # ATR > 0.1% para liquidez mínima
+                atr_v = atr_calc(h1h, l1h, c1h, 14)
+                atr_pct = atr_v / price * 100 if price > 0 else 0
+                if atr_pct < 0.10:
+                    return None
+
+                # Score compuesto: momentum reciente pesa más
+                mscore = (
+                    mom_4h  * 3.0   +
+                    mom_24h * 0.5   +
+                    (vol_ratio - 1) * 10 +
+                    (rsi_val - 50)  * 0.2 +
+                    (atr_pct - 0.5) * 2.0
+                )
+
+                return (sym, mscore, mom_4h, mom_24h, round(vol_ratio, 2), round(rsi_val, 1))
+
+            except Exception as e:
+                log.debug(f"momentum {sym}: {e}")
+                return None
+
+        # Ejecutar en paralelo
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+            futures = {ex.submit(_score_sym, sym): sym for sym in self.symbols}
+            for fut in as_completed(futures):
+                try:
+                    result = fut.result()
+                    if result:
+                        scored.append(result)
+                except: pass
+
+        # Ordenar por score y tomar top N
+        scored.sort(key=lambda x: x[1], reverse=True)
+        leaders = scored[:top_n]
+
+        if leaders:
+            top5_info = [(s, f"{m4:.1f}%4h", f"vol×{vr}") for s, _, m4, _, vr, _ in leaders[:5]]
+            log.info(f"  🏆 Top momentum: {top5_info}")
+
+        # Actualizar caché
+        self._momentum_cache  = set(s for s, *_ in leaders)
+        self._momentum_ranked = [s for s, *_ in leaders]
+        self._last_momentum_refresh = time.time()
+
+        return self._momentum_ranked
+
+    # ── Scan paralelo ─────────────────────────────────────────────────────
     def _analyze_parallel(self, symbols_batch):
         """Analiza un batch de símbolos en paralelo."""
         results = []
@@ -769,7 +879,6 @@ class LongBot:
                         results.append((futures[fut], sig))
                 except Exception as e:
                     log.debug(f"analyze error: {e}")
-        # Ordenar por score desc
         results.sort(key=lambda x: x[1]['score'], reverse=True)
         return results
 
@@ -1043,13 +1152,13 @@ class LongBot:
 
         atr_v   = atr_calc(h5, l5, c5, 14)
         atr_pct = atr_v / price * 100 if price > 0 else 0
-        if atr_pct < 0.10: return None  # bajado de 0.15
+        if atr_pct < 0.10: return None
         if change_24 > 20.0: return None
         if change_24 < -12.0: return None
 
         sig_aurolo = aurolo_signal(c5, h5, l5, v5, o5, atr_v)
 
-        # FIX D: min puntos = 1
+        # FIX WR-1: mínimo 2 puntos (restaurado)
         if sig_aurolo['puntos'] < AUROLO_MIN_PTS: return None
         if sig_aurolo['cambio_tend']: return None
 
@@ -1070,7 +1179,7 @@ class LongBot:
         if rr < MIN_RR * 0.75: return None
 
         tp1_neto = sl_pct * TP1_RATIO - FEE_COST_PCT
-        if tp1_neto < 0.3: return None  # bajado de 0.4
+        if tp1_neto < 0.4: return None
 
         # ── Scoring ──────────────────────────────────────────────────────
         score = 0; reasons = []; factors = []
@@ -1119,12 +1228,16 @@ class LongBot:
         if self._breadth > 0.65:   score += 8;  factors.append("breadth_good")
         elif self._breadth < 0.35: score -= 10; factors.append("breadth_bad")
 
+        # FIX WR-6: bonus si es líder de momentum del día
+        if symbol in self._momentum_cache:
+            score += 8; factors.append("momentum_leader")
+
         bonus_p = self.learn.bonus_pts(pts)
         if bonus_p != 0: score += bonus_p
         adj = self.learn.adj(factors)
         if adj != 0: score += adj
 
-        # FIX E: score mínimo más bajo
+        # FIX WR-2: score mínimo restaurado
         score_min = self._score_min_for_regime()
         if score < score_min:
             log.debug(f"  {symbol}: score {int(score)}<{int(score_min)}")
@@ -1156,6 +1269,7 @@ class LongBot:
             'hora_utc': hora, 'btc_dir': self._btc_dir(),
             'precio_sobre_vwap': precio_sobre_vwap,
             'regime': self._regime, 'breadth': self._breadth,
+            'momentum_leader': symbol in self._momentum_cache,
         }
 
     def _set_lev(self, sym):
@@ -1242,6 +1356,10 @@ class LongBot:
         return d.get('code') == 0
 
     def _chase_limit_entry(self, sym, qty):
+        """
+        Entrada con orden límite (mejor precio) con fallback a market.
+        Las órdenes límite reducen el slippage en 0.05-0.1% por trade.
+        """
         d = pub('/openApi/swap/v2/quote/bookTicker', {'symbol': sym})
         ask_price = None
         if d.get('code') == 0 and d.get('data'):
@@ -1250,6 +1368,17 @@ class LongBot:
             tk = self._ticker(sym)
             if tk: ask_price = tk['price'] * 1.0002
         if not ask_price: return None, {}
+
+        # Verificar spread — si es muy amplio, usar market directamente
+        bid_price = float(d.get('data', {}).get('bidPrice', 0) or ask_price * 0.999)
+        spread_pct = (ask_price - bid_price) / bid_price * 100 if bid_price > 0 else 1
+        if spread_pct > 0.5:
+            # Spread amplio = liquidez baja → market para asegurar ejecución
+            log.debug(f"  {sym}: spread {spread_pct:.2f}% → market order")
+            d = self._order(sym, 'BUY', qty, 'MARKET')
+            if d.get('code') != 0: return None, {}
+            return self._confirm_pos(sym, 10)
+
         limit_price = round(ask_price * 1.0005, 8)
         d = self._order(sym, 'BUY', qty, 'LIMIT', price=limit_price)
         if d.get('code') != 0:
@@ -1284,8 +1413,9 @@ class LongBot:
         sl_price = sig['sl_price']
         pts      = sig['aurolo_pts']
         label    = sig['aurolo_señal']
+        momentum = '🏆' if sig.get('momentum_leader') else ''
 
-        log.info(f"\n  🎯 LONG {sym} [{label}] | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1")
+        log.info(f"\n  🎯 LONG {sym} [{label}]{momentum} | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1")
         self._set_lev(sym); time.sleep(0.2)
         qty, notional = self._calc_qty(sym, price, sl_price)
         if not qty: return False
@@ -1342,7 +1472,7 @@ class LongBot:
         p3 = "✅" if sig['aurolo_p3'] else "❌"
 
         self._tg(
-            f"<b>🟢 LONG [{label}]</b> — <b>{sym}</b>\n"
+            f"<b>🟢 LONG [{label}]{momentum}</b> — <b>{sym}</b>\n"
             f"Score: {int(sig['score'])}/{int(sig['score_min'])} | RR: {sig['rr']:.2f}:1 | {sig['regime']}\n"
             f"{p1} P1 EMA55  {p2} P2 WT:{sig['aurolo_wt']:.1f}  {p3} P3 ADX:{sig['aurolo_adx']:.1f}\n"
             f"📍 ${fill_price:.6f} | SL: ${sl_real:.6f} (-{sl_pct_real:.2f}%)\n"
@@ -1513,11 +1643,14 @@ class LongBot:
             tk=self._ticker(sym); cur=tk['price'] if tk else t['entry']
             pct=(cur-t['entry'])/t['entry']*100
             pos += f"  {'🎯' if t.get('trailing_placed') else '📌'} {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}%\n"
+
+        momentum_top3 = ', '.join(self._momentum_ranked[:3]) if self._momentum_ranked else 'N/A'
         self._tg(
-            f"<b>📊 Reporte v5.9-FULLSCAN</b>\n"
+            f"<b>📊 Reporte v5.9-FIXED</b>\n"
             f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% | {total}t\n"
             f"Régimen: {self._regime} | Breadth: {int(self._breadth*100)}%\n"
             f"Símbolos activos: {len(self.symbols)}\n"
+            f"🏆 Top momentum: {momentum_top3}\n"
             + (pos if pos else "  Sin posiciones\n")
         )
 
@@ -1532,22 +1665,28 @@ class LongBot:
         except: pass
 
     async def run(self):
-        log.info(f"\n🚀 Bot LONGS v5.9-FULLSCAN | {len(self.symbols)} símbolos | {SCAN_WORKERS} workers\n")
-        iteration=0; last_sym=last_ltv=last_hedge=last_eq=last_regime=0
+        log.info(f"\n🚀 Bot LONGS v5.9-FIXED | {len(self.symbols)} símbolos | {SCAN_WORKERS} workers\n")
+        iteration=0; last_sym=last_ltv=last_hedge=last_eq=last_regime=last_momentum=0
 
         while True:
             try:
                 iteration += 1; self._daily_reset()
-                if time.time()-last_sym    > 600:  self._refresh_symbols();    last_sym=time.time()
-                if time.time()-last_ltv    > 300:  self._check_ltv();          last_ltv=time.time()
-                if time.time()-last_hedge  > 600:
+                if time.time()-last_sym     > 600:  self._refresh_symbols();    last_sym=time.time()
+                if time.time()-last_ltv     > 300:  self._check_ltv();          last_ltv=time.time()
+                if time.time()-last_hedge   > 600:
                     for sym, sides in self._get_exchange_positions().items():
                         if sides['short'] > 0:
                             self._order_close_short(sym, sides['short']); time.sleep(0.3)
                     last_hedge=time.time()
-                if time.time()-last_eq     > 1800: self._update_equity();      last_eq=time.time()
-                if time.time()-last_regime > 300:
+                if time.time()-last_eq      > 1800: self._update_equity();      last_eq=time.time()
+                if time.time()-last_regime  > 300:
                     self._update_market_regime(); last_regime=time.time()
+
+                # FIX WR-4: refrescar pre-filtro momentum cada 15 min
+                if time.time()-last_momentum > 900:
+                    log.info("  🏆 Actualizando líderes de momentum...")
+                    self._get_momentum_leaders()
+                    last_momentum = time.time()
 
                 if time.time() - self._last_zombie_clean > ZOMBIE_CLEANUP_MIN * 60:
                     self._nuke_zombie_orders()
@@ -1569,7 +1708,7 @@ class LongBot:
                 log.info(
                     f"  BTC1h:{self._btc_1h:+.2f}% BTC4h:{self._btc_4h:+.2f}% | "
                     f"Régimen:{self._regime} | Breadth:{int(self._breadth*100)}% | "
-                    f"Score≥{int(score_min)} | Símbolos:{len(self.symbols)}"
+                    f"Score≥{int(score_min)} | Momentum líderes:{len(self._momentum_cache)}"
                 )
                 log.info(f"{'='*72}\n")
 
@@ -1582,17 +1721,35 @@ class LongBot:
                         log.info(f"  ⏸️ Sin entradas: {regime_reason}")
                         await asyncio.sleep(INTERVAL); continue
 
-                    log.info(f"  🔍 Scan paralelo: {len(self.symbols)} símbolos ({SCAN_WORKERS} workers)...")
+                    # FIX WR-4/5: scan con pre-filtro momentum
+                    # Primero los líderes del día, luego el resto como fallback
+                    momentum_syms = list(self._momentum_cache) if self._momentum_cache else []
+                    rest = [s for s in self.symbols
+                            if s not in momentum_syms and s not in self.trades]
 
-                    # FIX F: scan en paralelo
-                    signals = self._analyze_parallel(self.symbols)
+                    # Si no hay líderes aún (primer ciclo), inicializar
+                    if not momentum_syms:
+                        log.info("  🏆 Primera carga de momentum...")
+                        momentum_syms = self._get_momentum_leaders()
+                        last_momentum = time.time()
+                        rest = [s for s in self.symbols
+                                if s not in momentum_syms and s not in self.trades]
+
+                    scan_order = momentum_syms + rest[:60]
+                    log.info(
+                        f"  🔍 Scan: {len(momentum_syms)} líderes + {len(rest[:60])} fallback "
+                        f"({SCAN_WORKERS} workers)..."
+                    )
+
+                    signals = self._analyze_parallel(scan_order)
                     found = len(signals)
                     log.info(f"  ✅ {found} señales encontradas")
 
                     for sym, sig in signals:
                         if len(self.trades) >= MAX_TRADES: break
+                        ml = '🏆' if sig.get('momentum_leader') else ''
                         log.info(
-                            f"  💡 {sym} [{sig['aurolo_señal']}] | "
+                            f"  💡 {ml}{sym} [{sig['aurolo_señal']}] | "
                             f"Score:{int(sig['score'])}/{int(sig['score_min'])} | "
                             f"RR:{sig['rr']:.2f}:1 | SL:{sig['sl_pct']:.2f}%"
                         )
