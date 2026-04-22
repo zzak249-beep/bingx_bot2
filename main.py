@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-BOT LONGS v5.9-FIXED — FULL MARKET SCAN (ALL BINGX SYMBOLS incl. GOLD/OIL/GAS)
+BOT LONGS v6.0-ALPHA — MÁXIMA PRECISIÓN + GESTIÓN AVANZADA
 ════════════════════════════════════════════════════════════════════════════════
 
-CAMBIOS v5.9-FIXED vs v5.9-FULLSCAN:
-  ✅ FIX WR-1: AUROLO_MIN_PTS revertido a 2 (era 1 → demasiadas señales débiles)
-  ✅ FIX WR-2: Score mínimos restaurados: MIN_SCORE=60, SCORE_BULL=60, SCORE_NEUTRAL=68
-  ✅ FIX WR-3: CAUTION_BLOCK=true reactivado (era false → entraba en mercados malos)
-  ✅ FIX WR-4: Nuevo pre-filtro momentum: solo top 40 monedas líderes del día
-  ✅ FIX WR-5: _get_momentum_leaders() — ranking por fuerza relativa, volumen, EMA
-  ✅ FIX WR-6: Bonus +8 score para monedas con momentum confirmado
-  ✅ FIX WR-7: Filtro spread/liquidez mejorado en entradas
-  ✅ MANTENIDO: FIX A (Gold/Oil/Gas activos), FIX B (sin límite símbolos),
-                FIX C (vol 300K), FIX F (scan paralelo 8 workers)
-
-DIAGNÓSTICO DEL PROBLEMA (WR 13%):
-  - FIX D original (AUROLO_MIN_PTS=1) causaba entradas en señales de 1/3 = ruido puro
-  - FIX E original (score 50) dejaba pasar casi cualquier moneda
-  - CAUTION_BLOCK=false permitía entradas en régimen hostil
-  - Sin pre-filtro de momentum: el bot entraba en monedas sin fuerza real del día
+MEJORAS v6.0 vs v5.9-FIXED:
+  ✅ [M1]  QUALITY GATE: bloqueo duro Breadth<20%, excluye forex sintéticos
+  ✅ [M2]  VOLATILITY REGIME: detecta compresión/expansión ATR antes de entrar
+  ✅ [M3]  ORDER FLOW PROXY: volumen delta alcista como confirmación de entrada
+  ✅ [M4]  MULTI-TIMEFRAME SCORE: confluencia 5m+1h+4h ponderada
+  ✅ [M5]  DYNAMIC SL: SL ajustado por volatilidad real del símbolo
+  ✅ [M6]  BREAKEVEN AGRESIVO: BE inmediato tras +0.5*SL de beneficio
+  ✅ [M7]  PARTIAL CLOSE DINÁMICO: TP1 basado en ATR, no ratio fijo
+  ✅ [M8]  MOMENTUM QUALITY FILTER: excluye microcaps y pares manipulados
+  ✅ [M9]  LEARNING 2.0: ajuste de score más agresivo, blacklist por hora
+  ✅ [M10] ANTI-CHOP: detecta mercados laterales y los bloquea
+  ✅ [M11] POSITION SIZING DINÁMICO: Kelly fraccionado según WR reciente
+  ✅ [M12] CIERRE PREVENTIVO: sale en verde si régimen se deteriora
+  ✅ [M13] HEAT MAP HORARIO: aprende qué horas son rentables por símbolo
+  ✅ [M14] SPREAD GUARD: rechaza entradas con spread >0.3%
+  ✅ [M15] CORRELATION BLOCK: no abre 2 posiciones correlacionadas (>0.85)
 """
 
 import os, asyncio, logging, requests, hmac, hashlib, time, sys, math, re, json
@@ -62,8 +62,8 @@ POS_SIZE       = clean('MAX_POSITION_SIZE',    '10',    'float')
 MIN_TRADE      = clean('MIN_TRADE_USDT',       '10',    'float')
 _lev           = clean('LEVERAGE',             '2',     'int')
 LEVERAGE       = min(_lev, 3)
-MAX_TRADES     = clean('MAX_OPEN_TRADES',      '3',     'int')
-RISK_PCT       = clean('RISK_PCT',             '1.0',   'float')
+MAX_TRADES     = clean('MAX_OPEN_TRADES',      '2',     'int')   # [M11] reducido a 2
+RISK_PCT       = clean('RISK_PCT',             '0.8',   'float') # [M11] reducido
 ACCOUNT_EQUITY = clean('ACCOUNT_EQUITY',       '100',   'float')
 
 # ── TPs Escalonados ────────────────────────────────────────────────────────
@@ -74,44 +74,49 @@ TP2_RATIO = clean('TP2_RATIO', '3.5', 'float')
 
 # ── TP/SL ──────────────────────────────────────────────────────────────────
 TP_MIN    = clean('TAKE_PROFIT_PCT', '1.5',  'float')
-ATR_TP_M  = clean('ATR_TP_MULT',    '3.0',  'float')
-MIN_RR    = clean('MIN_RR',         '2.2',  'float')
-SL_ATR_M  = clean('SL_ATR_MULT',   '1.5',  'float')
-SL_MAX_PCT = clean('SL_MAX_PCT',   '3.5',  'float')
+ATR_TP_M  = clean('ATR_TP_MULT',    '3.5',  'float')  # [M7] subido
+MIN_RR    = clean('MIN_RR',         '2.5',  'float')  # [M4] más exigente
+SL_ATR_M  = clean('SL_ATR_MULT',   '1.2',  'float')  # [M5] ajustado
+SL_MAX_PCT = clean('SL_MAX_PCT',   '3.0',  'float')  # [M5] reducido de 3.5
 SL_MIN_PCT = clean('SL_MIN_PCT',   '0.8',  'float')
 
 # ── Trailing Stop ──────────────────────────────────────────────────────────
 USE_TRAILING_EXIT = clean('USE_TRAILING_EXIT', 'true', 'bool')
-TRAIL_RATE_PCT    = clean('TRAIL_RATE_PCT',    '1.5',  'float')
-TRAIL_ACTIVATION  = clean('TRAIL_ACTIVATION',  '0.8',  'float')
+TRAIL_RATE_PCT    = clean('TRAIL_RATE_PCT',    '1.2',  'float')  # más ajustado
+TRAIL_ACTIVATION  = clean('TRAIL_ACTIVATION',  '0.6',  'float')  # activa antes [M6]
 
 # ── Zombie cleanup ────────────────────────────────────────────────────────
 ZOMBIE_CLEANUP_MIN = clean('ZOMBIE_CLEANUP_MIN', '10', 'int')
 ZOMBIE_MAX_AGE_MIN = clean('ZOMBIE_MAX_AGE_MIN', '20', 'int')
 
 # ── Símbolos y volumen ────────────────────────────────────────────────────
-MIN_VOL   = clean('MIN_VOLUME_24H',  '300000',  'float')   # Gold/Oil/Gas incluidos
-MAX_SYMS  = clean('MAX_SYMBOLS',     '0',       'int')     # 0 = sin límite
-MIN_SCORE = clean('MIN_SCORE',       '60',      'float')   # FIX WR-2: restaurado (era 50)
+MIN_VOL   = clean('MIN_VOLUME_24H',  '500000',  'float')  # [M8] subido a 500K
+MAX_SYMS  = clean('MAX_SYMBOLS',     '0',       'int')
+MIN_SCORE = clean('MIN_SCORE',       '65',      'float')  # [M9] subido
 BTC_BLOCK = clean('BTC_BEAR_BLOCK_PCT', '1.0', 'float')
 
 # ── Momentum pre-filter ───────────────────────────────────────────────────
-MOMENTUM_TOP_N      = clean('MOMENTUM_TOP_N',      '40',   'int')    # FIX WR-4
-MOMENTUM_MIN_4H     = clean('MOMENTUM_MIN_4H',     '0.3',  'float')  # % mínimo 4h
-MOMENTUM_MIN_24H    = clean('MOMENTUM_MIN_24H',    '0.0',  'float')  # % mínimo 24h
-MOMENTUM_MAX_RSI    = clean('MOMENTUM_MAX_RSI',    '78',   'float')  # no sobrecomprado
-MOMENTUM_MIN_VOL_R  = clean('MOMENTUM_MIN_VOL_R',  '0.8',  'float')  # ratio volumen
+MOMENTUM_TOP_N      = clean('MOMENTUM_TOP_N',      '30',   'int')   # más selectivo
+MOMENTUM_MIN_4H     = clean('MOMENTUM_MIN_4H',     '0.8',  'float') # [M8] subido
+MOMENTUM_MIN_24H    = clean('MOMENTUM_MIN_24H',    '0.5',  'float') # [M8] subido
+MOMENTUM_MAX_RSI    = clean('MOMENTUM_MAX_RSI',    '72',   'float') # más estricto
+MOMENTUM_MIN_VOL_R  = clean('MOMENTUM_MIN_VOL_R',  '1.0',  'float')
+MOMENTUM_MIN_VOL_ABS = clean('MOMENTUM_MIN_VOL_ABS', '1000000', 'float')  # [M8] 1M mínimo
 
 # ── Régimen de mercado ────────────────────────────────────────────────────
 REGIME_CHECK      = clean('REGIME_CHECK',      'true',  'bool')
-BREADTH_MIN       = clean('BREADTH_MIN',        '0.35',  'float')
-BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '3.0',   'float')
-BTC_4H_CRASH_PAUSE= clean('BTC_4H_CRASH_HOURS','2',      'int')
-DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','10.0',  'float')
-CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'true',  'bool')     # FIX WR-3: reactivado
-# FIX WR-2: scores restaurados
-SCORE_BULL        = clean('SCORE_BULL',         '60',    'float')    # restaurado (era 50)
-SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',      '68',    'float')    # restaurado (era 58)
+BREADTH_MIN       = clean('BREADTH_MIN',        '0.45',  'float')  # [M1] subido
+BREADTH_CRITICAL  = clean('BREADTH_CRITICAL',   '0.20',  'float')  # [M1] bloqueo duro
+BTC_4H_CRASH_PCT  = clean('BTC_4H_CRASH_PCT',  '2.5',   'float')  # más sensible
+BTC_4H_CRASH_PAUSE= clean('BTC_4H_CRASH_HOURS','3',      'int')
+DAILY_LOSS_CAP_PCT= clean('DAILY_LOSS_CAP_PCT','8.0',   'float')  # más conservador
+CAUTION_BLOCK     = clean('CAUTION_BLOCK',      'true',  'bool')
+SCORE_BULL        = clean('SCORE_BULL',         '63',    'float')
+SCORE_NEUTRAL     = clean('SCORE_NEUTRAL',      '72',    'float')  # más exigente
+
+# ── Anti-chop [M10] ───────────────────────────────────────────────────────
+CHOP_CHECK        = clean('CHOP_CHECK',         'true',  'bool')
+CHOP_ATR_RATIO    = clean('CHOP_ATR_RATIO',     '0.6',   'float')  # ATR/rango comprimido
 
 # ── VWAP ──────────────────────────────────────────────────────────────────
 VWAP_CANDLES   = clean('VWAP_CANDLES',  '50',   'int')
@@ -122,7 +127,7 @@ AUROLO_EMA_LEN   = clean('AUROLO_EMA_LEN',   '55',   'int')
 AUROLO_ZONA_AUTO = clean('AUROLO_ZONA_AUTO',  'true', 'bool')
 AUROLO_ZONA_PCT  = clean('AUROLO_ZONA_PCT',   '0.8',  'float')
 AUROLO_ZONA_VELAS = clean('AUROLO_ZONA_VELAS', '6',   'int')
-AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '2',     'int')   # FIX WR-1: restaurado (era 1)
+AUROLO_MIN_PTS = clean('AUROLO_MIN_PTS', '2',     'int')
 AUROLO_ENTRY   = clean('AUROLO_ENTRY',   'close', 'str')
 
 # WaveTrend
@@ -137,29 +142,29 @@ WT_OS_ENTRY = clean('WT_OS_ENTRY', '-20', 'float')
 # ADX
 ADX_LEN    = clean('ADX_LEN',    '14',  'int')
 ADX_DI_LEN = clean('ADX_DI_LEN', '14', 'int')
-ADX_KEY    = clean('ADX_KEY',    '20',  'float')
+ADX_KEY    = clean('ADX_KEY',    '22',  'float')  # más exigente
 
 # ── Circuit breaker ───────────────────────────────────────────────────────
-CB_PCT     = clean('CIRCUIT_BREAKER_PCT', '6.0',  'float')
-CB_HOURS   = clean('CB_PAUSE_HOURS',      '2',    'int')
-MAX_STREAK = clean('MAX_LOSING_STREAK',   '4',    'int')
+CB_PCT     = clean('CIRCUIT_BREAKER_PCT', '5.0',  'float')  # más sensible
+CB_HOURS   = clean('CB_PAUSE_HOURS',      '3',    'int')
+MAX_STREAK = clean('MAX_LOSING_STREAK',   '3',    'int')   # [M9] reducido a 3
 
 # ── Cooldowns ─────────────────────────────────────────────────────────────
-CD_TP        = clean('COOLDOWN_TP_MIN',  '10',  'int')
-CD_SL        = clean('COOLDOWN_SL_MIN', '240',  'int')
+CD_TP        = clean('COOLDOWN_TP_MIN',  '15',  'int')
+CD_SL        = clean('COOLDOWN_SL_MIN', '360',  'int')  # 6h tras SL
 CD_SL_TODAY  = clean('COOLDOWN_SL_TODAY', 'true', 'bool')
-CD_SL_FAST_MIN   = clean('COOLDOWN_SL_FAST_MIN', '8', 'int')
-CD_SL_FAST_HOURS = clean('COOLDOWN_SL_FAST_HOURS', '8', 'int')
+CD_SL_FAST_MIN   = clean('COOLDOWN_SL_FAST_MIN', '5', 'int')
+CD_SL_FAST_HOURS = clean('COOLDOWN_SL_FAST_HOURS', '12', 'int')  # más largo
 
 # ── Aprendizaje ───────────────────────────────────────────────────────────
-LEARN_MIN_TRADES_SCORE = clean('LEARN_MIN_TRADES', '10', 'int')
-LEARN_MIN_TRADES_BL    = clean('LEARN_MIN_TRADES_BL', '5', 'int')
-SCORE_CAP_LOW          = clean('SCORE_CAP_LOW', '70',  'float')
-SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH', '85', 'float')
+LEARN_MIN_TRADES_SCORE = clean('LEARN_MIN_TRADES', '8', 'int')   # reacciona antes
+LEARN_MIN_TRADES_BL    = clean('LEARN_MIN_TRADES_BL', '4', 'int')
+SCORE_CAP_LOW          = clean('SCORE_CAP_LOW', '72',  'float')
+SCORE_CAP_HIGH         = clean('SCORE_CAP_HIGH', '88', 'float')
 
 # ── Misc ──────────────────────────────────────────────────────────────────
 INTERVAL   = clean('CHECK_INTERVAL', '90', 'int')
-LTV_WARN   = clean('LTV_WARNING_PCT', '75', 'float')
+LTV_WARN   = clean('LTV_WARNING_PCT', '70', 'float')  # más conservador
 SCAN_WORKERS = clean('SCAN_WORKERS', '8', 'int')
 
 _skip_raw  = os.getenv('SKIP_HOURS', '2,3')
@@ -170,11 +175,17 @@ FEE        = 0.0002
 FEE_COST_PCT = FEE * LEVERAGE * 2 * 100
 TP_MIN_FEE   = round(FEE_COST_PCT + 0.003 * 100, 3)
 
-# Solo excluir stablecoins y forex puro — Gold/Oil/Gas/Indices SE ANALIZAN
+# [M1] Excluir stablecoins, forex puro Y patrones de pares sintéticos
 EXCLUDE = {
     'USDC', 'BUSD', 'TUSD', 'FRAX', 'DAI', 'USDP', 'FDUSD',
     'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD',
 }
+
+# [M1] Patrones de pares sintéticos/forex a excluir
+EXCLUDE_PATTERNS = [
+    'NCSK', 'NCF', 'NCS', 'GBP2', 'JPY2', 'USD2', 'EUR2',
+    'MSFT', 'AAPL', 'GOOGL', 'TSLA', 'AMZN',  # stocks sintéticos
+]
 
 BREADTH_COINS = [
     'BTC-USDT','ETH-USDT','BNB-USDT','SOL-USDT','XRP-USDT',
@@ -261,8 +272,98 @@ def calc_vwap(closes, highs, lows, volumes, n=None):
     vol_sum = sum(v)
     return tp_vol / vol_sum if vol_sum > 0 else c[-1]
 
+# [M2] Volatility Regime Detection
+def volatility_regime(highs, lows, closes, n=14, lookback=50):
+    """
+    Detecta si el mercado está en expansión o compresión de volatilidad.
+    Retorna: 'expanding', 'normal', 'compressed'
+    """
+    if len(closes) < lookback + n:
+        return 'normal', 1.0
+
+    atr_now = atr_calc(highs[-n:], lows[-n:], closes[-n:], n)
+    atr_hist = []
+    for i in range(lookback, 0, -10):
+        a = atr_calc(highs[-(i+n):-i], lows[-(i+n):-i], closes[-(i+n):-i], n)
+        if a > 0:
+            atr_hist.append(a)
+
+    if not atr_hist:
+        return 'normal', 1.0
+
+    atr_avg = sum(atr_hist) / len(atr_hist)
+    ratio = atr_now / atr_avg if atr_avg > 0 else 1.0
+
+    if ratio > 1.5:   return 'expanding', ratio
+    elif ratio < 0.6: return 'compressed', ratio
+    else:             return 'normal', ratio
+
+# [M3] Order Flow Proxy — volumen delta
+def order_flow_delta(closes, volumes, n=10):
+    """
+    Proxy del order flow: compara velas alcistas vs bajistas por volumen.
+    Positivo = presión compradora. Rango: -1 a +1
+    """
+    if len(closes) < n + 1:
+        return 0.0
+
+    bull_vol = 0.0
+    bear_vol = 0.0
+    for i in range(-n, 0):
+        if closes[i] >= closes[i-1]:
+            bull_vol += volumes[i]
+        else:
+            bear_vol += volumes[i]
+
+    total = bull_vol + bear_vol
+    if total == 0:
+        return 0.0
+    return (bull_vol - bear_vol) / total  # -1 a +1
+
+# [M10] Anti-Chop: detecta mercados laterales
+def is_choppy(highs, lows, closes, n=20):
+    """
+    Detecta mercado lateral/choppy usando el Choppiness Index.
+    CI > 61.8 = choppy, < 38.2 = tendencia fuerte
+    """
+    if len(closes) < n + 1:
+        return False
+
+    h = highs[-n:]; l = lows[-n:]; c = closes[-(n+1):]
+    atr_sum = 0.0
+    for i in range(1, n + 1):
+        tr = max(h[i-1] - l[i-1],
+                 abs(h[i-1] - c[i-1]),
+                 abs(l[i-1] - c[i-1]))
+        atr_sum += tr
+
+    highest = max(h)
+    lowest  = min(l)
+    rango   = highest - lowest
+
+    if rango == 0 or atr_sum == 0:
+        return False
+
+    ci = 100 * math.log10(atr_sum / rango) / math.log10(n)
+    return ci > 61.8  # choppy si CI > 61.8
+
+# [M15] Correlación entre símbolos
+def correlation(a_prices, b_prices, n=20):
+    """Correlación de Pearson entre dos series de precios."""
+    n = min(n, len(a_prices), len(b_prices))
+    if n < 5:
+        return 0.0
+    a = a_prices[-n:]; b = b_prices[-n:]
+    ma = sum(a) / n; mb = sum(b) / n
+    num = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+    da  = math.sqrt(sum((x - ma)**2 for x in a))
+    db  = math.sqrt(sum((x - mb)**2 for x in b))
+    if da == 0 or db == 0:
+        return 0.0
+    return num / (da * db)
+
 # ============================================================================
-# MOTOR AUROLO
+# MOTOR AUROLO (mejorado)
 # ============================================================================
 
 def _wavetrend_series(closes, highs, lows, ch_len=10, avg_len=21):
@@ -320,6 +421,7 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
         'wt_now': 0, 'wt_prev': 0, 'adx_now': 0, 'dip': 0, 'din': 0,
         'sl_price': 0, 'sl_pct': 0, 'debilidad': False,
         'cambio_tend': False, 'descripcion': '', 'vol_ratio': 1,
+        'of_delta': 0.0,  # [M3] order flow delta
     }
 
     min_len = AUROLO_EMA_LEN + WT_CH_LEN + WT_AVG_LEN + 5
@@ -387,6 +489,7 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     pts = int(result['p1']) + int(result['p2']) + int(result['p3'])
     result['puntos'] = pts
 
+    # [M5] SL dinámico basado en ATR real
     atr_actual   = atr_v or atr_calc(highs, lows, closes, 14)
     min_reciente = min(lows[-8:-1]) if len(lows) >= 8 else lows[-1]
     sl_vulner    = min_reciente - atr_actual * SL_ATR_M
@@ -417,13 +520,17 @@ def aurolo_signal(closes, highs, lows, volumes, opens, atr_v=None):
     vol_avg = sum(volumes[-6:-1]) / 5 if len(volumes) >= 6 else volumes[-1]
     result['vol_ratio'] = volumes[-1] / vol_avg if vol_avg > 0 else 1
 
+    # [M3] Order flow delta
+    result['of_delta'] = order_flow_delta(closes, volumes, 10)
+
     p1_icon = '✅' if result['p1'] else '❌'
     p2_icon = '✅' if result['p2'] else '❌'
     p3_icon = '✅' if result['p3'] else '❌'
     result['descripcion'] = (
         f"P1({p1_icon})EMA{AUROLO_EMA_LEN} | "
         f"P2({p2_icon})WT={round(wt_now,1)} | "
-        f"P3({p3_icon})ADX={round(adx_now,1)} DI+={round(dip_now,1)}"
+        f"P3({p3_icon})ADX={round(adx_now,1)} DI+={round(dip_now,1)} | "
+        f"OF={round(result['of_delta'],2)}"
     )
 
     if pts >= 3:   result['señal'] = 'LONG_3/3'
@@ -441,7 +548,7 @@ def vwap_contexto(closes, highs, lows, volumes, n=50):
 
 
 # ============================================================================
-# APRENDIZAJE
+# APRENDIZAJE 2.0 [M9] [M13]
 # ============================================================================
 
 class Learning:
@@ -461,6 +568,10 @@ class Learning:
         self.score_boost   = {}
         self.daily_losers  = set()
         self._daily_date   = datetime.utcnow().date()
+        # [M13] Blacklist horaria por símbolo
+        self.hour_blacklist = defaultdict(set)  # hora -> set(symbols)
+        # [M11] Kelly tracking
+        self.kelly_mult = 1.0
 
     def _check_daily_reset(self):
         today = datetime.utcnow().date()
@@ -477,11 +588,11 @@ class Learning:
     def record(self, symbol, score, pnl, win, hora_utc=None,
                pts_aurolo=0, btc_dir='flat', reason='?', factors=None):
         self._check_daily_reset()
+        hora = hora_utc or datetime.utcnow().hour
         rec = {
             'ts': datetime.now().isoformat(), 'sym': symbol,
             'score': score, 'pnl': pnl, 'win': win,
-            'hora': hora_utc or datetime.utcnow().hour,
-            'pts': pts_aurolo, 'btc': btc_dir,
+            'hora': hora, 'pts': pts_aurolo, 'btc': btc_dir,
             'reason': reason, 'factors': factors or [],
         }
         self.history.append(rec); self.last10.append(rec)
@@ -494,8 +605,10 @@ class Learning:
             s['l'] += 1; self.streak += 1
             if CD_SL_TODAY and 'SL' in reason.upper():
                 self.daily_losers.add(symbol)
+            # [M13] Si pierde en esta hora, registrar
+            self.hour_blacklist[hora].add(symbol)
 
-        self.by_hour[rec['hora']][k] += 1; self.by_hour[rec['hora']]['pnl'] += pnl
+        self.by_hour[hora][k] += 1; self.by_hour[hora]['pnl'] += pnl
         self.by_pts[pts_aurolo][k]   += 1; self.by_pts[pts_aurolo]['pnl']   += pnl
         self.by_btc[btc_dir][k]      += 1; self.by_btc[btc_dir]['pnl']      += pnl
         self.by_reason[reason]['n']  += 1; self.by_reason[reason]['pnl']    += pnl
@@ -510,14 +623,26 @@ class Learning:
         cap = self._score_cap()
         if n >= LEARN_MIN_TRADES_SCORE:
             wr = sum(1 for t in self.last10 if t['win']) / len(self.last10)
-            if wr < 0.30:
-                self.opt_score = min(self.opt_score + 5, cap)
+
+            # [M9] Ajuste más agresivo que v5.9
+            if wr < 0.20:
+                self.opt_score = min(self.opt_score + 15, cap)
+                log.warning(f"  [LEARN] 🚨 WR crítico {int(wr*100)}% → score +15")
+            elif wr < 0.30:
+                self.opt_score = min(self.opt_score + 8, cap)
             elif wr < 0.40:
-                self.opt_score = min(self.opt_score + 2, cap)
+                self.opt_score = min(self.opt_score + 3, cap)
             elif wr > 0.65:
                 self.opt_score = max(self.opt_score - 2, MIN_SCORE)
             elif wr > 0.75:
                 self.opt_score = max(self.opt_score - 4, MIN_SCORE)
+
+            # [M11] Kelly fraccionado: ajusta multiplicador de posición
+            avg_win  = sum(t['pnl'] for t in self.last10 if t['win'])  / max(sum(1 for t in self.last10 if t['win']), 1)
+            avg_loss = sum(abs(t['pnl']) for t in self.last10 if not t['win']) / max(sum(1 for t in self.last10 if not t['win']), 1)
+            if avg_loss > 0 and avg_win > 0:
+                kelly = (wr - (1 - wr) / (avg_win / avg_loss))
+                self.kelly_mult = max(0.3, min(1.0, kelly * 0.5))  # kelly fraccionado
         else:
             if self.opt_score > cap:
                 self.opt_score = cap
@@ -526,30 +651,35 @@ class Learning:
         for sym, s in self.sym_stats.items():
             tot = s['w'] + s['l']
             if (tot >= LEARN_MIN_TRADES_BL and
-                    s['pnl'] < -1.5 and
-                    s['w'] / tot < 0.25):
+                    s['pnl'] < -1.0 and  # más sensible
+                    s['w'] / tot < 0.30):  # más estricto
                 if sym not in self.blacklist:
                     self.blacklist.add(sym)
                     log.warning(f"  [LEARN] 🚫 {sym} → blacklist")
 
-        if n >= 15:
+        if n >= 10:  # reacciona antes
             for f in set(list(self.factor_wins) + list(self.factor_losses)):
                 w = self.factor_wins.get(f, 0); l = self.factor_losses.get(f, 0)
-                if w+l < 5: continue
+                if w+l < 4: continue
                 wr_f = w/(w+l)
-                if wr_f < 0.30:   self.score_boost[f] = -10
-                elif wr_f > 0.70: self.score_boost[f] = +6
+                if wr_f < 0.30:   self.score_boost[f] = -12
+                elif wr_f > 0.70: self.score_boost[f] = +8
                 else:             self.score_boost.pop(f, None)
 
     def hora_ok(self, h):
         d = self.by_hour.get(h)
         if not d: return True, "ok"
         tot = d['w']+d['l']
-        if tot < 6: return True, "ok"
+        if tot < 5: return True, "ok"
         wr_hora = d['w'] / tot
-        if wr_hora < 0.25:
+        # [M13] Más estricto: bloquea si WR<30% en esa hora
+        if wr_hora < 0.30:
             return False, f"hora {h}h WR={int(wr_hora*100)}%"
         return True, "ok"
+
+    def sym_hora_ok(self, sym, h):
+        """[M13] Bloquea símbolo específico si perdió en esta hora."""
+        return sym not in self.hour_blacklist.get(h, set())
 
     def bonus_pts(self, pts) -> int:
         d = self.by_pts.get(pts)
@@ -557,16 +687,22 @@ class Learning:
         tot = d['w']+d['l']
         if tot < 5: return 0
         wr = d['w']/tot
-        if wr > 0.65: return +10
-        if wr < 0.35: return -15
+        if wr > 0.65: return +12
+        if wr < 0.35: return -18
         return 0
 
-    def ok(self, sym, score):
+    def get_kelly_size(self, base_size):
+        """[M11] Ajusta tamaño de posición por Kelly fraccionado."""
+        return round(base_size * self.kelly_mult, 2)
+
+    def ok(self, sym, score, hora=None):
         self._check_daily_reset()
         if sym in self.blacklist:
             return False, "blacklist"
         if sym in self.daily_losers:
             return False, "SL hoy"
+        if hora is not None and not self.sym_hora_ok(sym, hora):
+            return False, f"sym perdió hora {hora}h"
         threshold = max(self.opt_score, MIN_SCORE)
         if score < threshold:
             return False, f"score {int(score)}<{int(threshold)}"
@@ -581,19 +717,19 @@ class Learning:
         n = len(self.history)
         wr  = sum(1 for t in self.history if t['win'])/n*100 if n else 0
         pnl = sum(t['pnl'] for t in self.history)
-        log.info(f"[LEARN] #{n//10}: WR={int(wr)}% PnL=${pnl:+.4f} Score={int(self.opt_score)}")
+        log.info(f"[LEARN] #{n//10}: WR={int(wr)}% PnL=${pnl:+.4f} Score={int(self.opt_score)} Kelly={self.kelly_mult:.2f}")
         try:
             if TG_TOKEN and TG_CHAT:
                 requests.post(
                     f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                     json={'chat_id': TG_CHAT,
-                          'text': f"<b>🧠 LEARN v5.9-FIXED — {n} trades</b>\nWR:{int(wr)}% PnL:${pnl:+.4f} Score≥{int(self.opt_score)}",
+                          'text': f"<b>🧠 LEARN v6.0 — {n} trades</b>\nWR:{int(wr)}% PnL:${pnl:+.4f} Score≥{int(self.opt_score)} Kelly×{self.kelly_mult:.2f}",
                           'parse_mode': 'HTML'},
                     timeout=6
                 )
         except: pass
 
-    def save(self, fp='/tmp/bot_learn_v59f.json'):
+    def save(self, fp='/tmp/bot_learn_v60.json'):
         try:
             json.dump({
                 'history': self.history[-200:], 'sym_stats': dict(self.sym_stats),
@@ -604,15 +740,16 @@ class Learning:
                 'factor_losses': dict(self.factor_losses),
                 'score_boost': self.score_boost,
                 'daily_losers': list(self.daily_losers),
+                'kelly_mult': self.kelly_mult,
+                'hour_blacklist': {str(k): list(v) for k, v in self.hour_blacklist.items()},
             }, open(fp,'w'), indent=2)
         except: pass
 
-    def load(self, fp='/tmp/bot_learn_v59f.json'):
-        # Intenta cargar desde múltiples versiones anteriores
+    def load(self, fp='/tmp/bot_learn_v60.json'):
         for path in [fp,
+                     '/tmp/bot_learn_v59f.json',
                      '/tmp/bot_learn_v59.json',
                      '/tmp/bot_learn_v58.json',
-                     '/tmp/bot_learn_v57.json',
                      '/tmp/bot_learn.json']:
             try:
                 if not os.path.exists(path): continue
@@ -629,15 +766,18 @@ class Learning:
                 self.factor_losses = defaultdict(int, d.get('factor_losses',{}))
                 self.score_boost   = d.get('score_boost',{})
                 self.daily_losers  = set(d.get('daily_losers', []))
+                self.kelly_mult    = d.get('kelly_mult', 1.0)
+                raw_bl = d.get('hour_blacklist', {})
+                self.hour_blacklist = defaultdict(set, {int(k): set(v) for k, v in raw_bl.items()})
                 cap = self._score_cap()
                 self.opt_score = max(min(raw_score, cap), MIN_SCORE)
-                log.info(f"  [LEARN] {len(self.history)} trades | Score:{int(self.opt_score)} | BL:{len(self.blacklist)}")
+                log.info(f"  [LEARN] {len(self.history)} trades | Score:{int(self.opt_score)} | BL:{len(self.blacklist)} | Kelly:{self.kelly_mult:.2f}")
                 return
             except: continue
 
 
 # ============================================================================
-# BOT PRINCIPAL v5.9-FIXED
+# BOT PRINCIPAL v6.0-ALPHA
 # ============================================================================
 
 class LongBot:
@@ -645,12 +785,11 @@ class LongBot:
 
     def __init__(self):
         log.info("=" * 72)
-        log.info("  BOT LONGS v5.9-FIXED — ALL BINGX SYMBOLS + GOLD/OIL/GAS")
+        log.info("  BOT LONGS v6.0-ALPHA — MÁXIMA PRECISIÓN")
         log.info(f"  Capital: ${POS_SIZE} | Riesgo: {RISK_PCT}%/trade | {LEVERAGE}x")
         log.info(f"  Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Min puntos Aurolo: {AUROLO_MIN_PTS}/3")
-        log.info(f"  Volumen mínimo: ${MIN_VOL:,.0f} | Símbolos: {'TODOS' if MAX_SYMS==0 else MAX_SYMS}")
-        log.info(f"  Pre-filtro momentum: TOP {MOMENTUM_TOP_N} líderes del día")
-        log.info(f"  Scan paralelo: {SCAN_WORKERS} workers")
+        log.info(f"  Volumen mínimo: ${MIN_VOL:,.0f} | Breadth mín: {int(BREADTH_MIN*100)}%")
+        log.info(f"  MEJORAS: QualityGate+VolRegime+OrderFlow+AntiChop+KellySizing+CorrBlock")
         log.info("=" * 72)
 
         self.symbols         = []
@@ -673,9 +812,10 @@ class LongBot:
         self._equity_start   = ACCOUNT_EQUITY
         self._cb_active      = False
         self._cb_until       = None
-        # FIX WR-4: caché de líderes de momentum
         self._momentum_cache = set()
         self._momentum_ranked = []
+        # [M15] Caché de precios para correlación
+        self._price_cache    = {}
         self.learn           = Learning()
         self.learn.load()
         self.stats = {'exec':0,'closed':0,'wins':0,'losses':0,'pnl':0.0,'fees':0.0}
@@ -688,11 +828,10 @@ class LongBot:
         self._recover()
 
         self._tg(
-            f"<b>🤖 Bot LONGS v5.9-FIXED</b>\n"
-            f"Símbolos: {'TODOS' if MAX_SYMS==0 else MAX_SYMS} | Vol≥${MIN_VOL/1e3:.0f}K\n"
-            f"Gold/Oil/Gas/Indices: ✅ ACTIVOS\n"
-            f"Score: bull≥{SCORE_BULL} neutral≥{SCORE_NEUTRAL} | Aurolo≥{AUROLO_MIN_PTS}/3\n"
-            f"Pre-filtro momentum: TOP {MOMENTUM_TOP_N} líderes\n"
+            f"<b>🤖 Bot LONGS v6.0-ALPHA</b>\n"
+            f"Símbolos: {len(self.symbols)} | Vol≥${MIN_VOL/1e3:.0f}K\n"
+            f"Quality Gate: ✅ | Anti-Chop: ✅ | Kelly Sizing: ✅\n"
+            f"Order Flow: ✅ | Corr Block: ✅\n"
             f"🧟 Zombies eliminados: {n_killed}\n"
             f"♻️ Posiciones recuperadas: {len(self.trades)}"
         )
@@ -748,7 +887,7 @@ class LongBot:
             log.info(f"  Contratos: {len(self._contracts)}")
 
     def _refresh_symbols(self):
-        """Obtiene TODOS los símbolos sin límite, volumen >= MIN_VOL."""
+        """[M1] Obtiene símbolos con Quality Gate: excluye forex sintéticos."""
         d = pub('/openApi/swap/v2/quote/ticker')
         if d.get('code') != 0:
             self.symbols = self.symbols or ['BTC-USDT','ETH-USDT','SOL-USDT']; return
@@ -757,13 +896,20 @@ class LongBot:
             sym = t.get('symbol','')
             if not sym.endswith('-USDT'): continue
             base = sym.replace('-USDT','').upper()
+
+            # Excluir stablecoins
             if any(base == ex for ex in EXCLUDE): continue
             if any(base.startswith(ex) for ex in EXCLUDE): continue
+
+            # [M1] Excluir pares sintéticos/forex
+            if any(p in base for p in EXCLUDE_PATTERNS): continue
+
+            # [M8] Volumen mínimo más alto
             try:
                 price = float(t.get('lastPrice',0))
                 vol = float(t.get('volume',0)) * price
                 if vol >= MIN_VOL and price > 0:
-                    items.append({'sym':sym,'vol':vol})
+                    items.append({'sym':sym,'vol':vol,'price':price})
             except: continue
 
         items.sort(key=lambda x: x['vol'], reverse=True)
@@ -771,20 +917,39 @@ class LongBot:
             items = items[:MAX_SYMS]
 
         self.symbols = [x['sym'] for x in items]
-        log.info(f"  Símbolos activos: {len(self.symbols)} (vol>${MIN_VOL/1e3:.0f}K)")
+        log.info(f"  Símbolos activos: {len(self.symbols)} (vol>${MIN_VOL/1e3:.0f}K, excl. sintéticos)")
 
-    # ── FIX WR-4/5: Pre-filtro momentum ──────────────────────────────────
+    # ── Quality Gate [M1] ─────────────────────────────────────────────────
+    def _quality_gate(self) -> tuple:
+        """Bloqueo duro antes de cualquier entrada."""
+        # Breadth crítico
+        if self._breadth < BREADTH_CRITICAL:
+            return False, f"🚫 BREADTH CRÍTICO {int(self._breadth*100)}% (<{int(BREADTH_CRITICAL*100)}%)"
+        # Régimen bear
+        if self._regime == 'bear':
+            return False, "régimen bear"
+        # CAUTION bloqueado
+        if CAUTION_BLOCK and self._regime == 'caution':
+            return False, "régimen caution"
+        # Crash guard activo
+        if self._regime_until and datetime.utcnow() < self._regime_until:
+            remaining = int((self._regime_until - datetime.utcnow()).total_seconds() / 60)
+            return False, f"crash guard {remaining}min"
+        return True, "ok"
+
+    # ── Pre-filtro momentum [M8] ──────────────────────────────────────────
     def _get_momentum_leaders(self, top_n=None):
-        """
-        Obtiene las top N monedas con mejor momentum del día.
-        Criterios: fuerza relativa reciente, EMA alignment, volumen creciente, RSI sano.
-        Se ejecuta en paralelo usando el ThreadPoolExecutor existente.
-        """
+        """Filtra microcaps y pares con volumen < 1M USDT."""
         top_n = top_n or MOMENTUM_TOP_N
         scored = []
 
         def _score_sym(sym):
             try:
+                # [M8] Verificar volumen absoluto mínimo antes de analizar
+                tk = self._ticker(sym)
+                if not tk or tk['price'] <= 0:
+                    return None
+
                 c1h, h1h, l1h, v1h, _ = self._klines(sym, '1h', 48)
                 if not c1h or len(c1h) < 25:
                     return None
@@ -793,47 +958,56 @@ class LongBot:
                 if price <= 0:
                     return None
 
-                # Momentum 4h (últimas 4 velas de 1h)
-                mom_4h = (c1h[-1] - c1h[-5]) / c1h[-5] * 100 if len(c1h) >= 5 else 0
+                # [M8] Verificar volumen 24h real
+                vol_24h = sum(v1h[-24:]) * price if len(v1h) >= 24 else 0
+                if vol_24h < MOMENTUM_MIN_VOL_ABS:
+                    return None
 
-                # Momentum 24h
+                mom_4h  = (c1h[-1] - c1h[-5])  / c1h[-5]  * 100 if len(c1h) >= 5  else 0
                 mom_24h = (c1h[-1] - c1h[-25]) / c1h[-25] * 100 if len(c1h) >= 25 else 0
 
-                # Solo monedas subiendo
                 if mom_4h < MOMENTUM_MIN_4H or mom_24h < MOMENTUM_MIN_24H:
                     return None
 
-                # EMA alignment: precio > EMA9 > EMA21
                 e9  = ema(c1h, 9)
                 e21 = ema(c1h, 21)
                 if not (price > e9 > e21):
                     return None
 
-                # Volumen creciente vs promedio 6h
                 vol_avg_6h = sum(v1h[-7:-1]) / 6 if len(v1h) >= 7 else v1h[-1]
                 vol_ratio  = v1h[-1] / vol_avg_6h if vol_avg_6h > 0 else 1
                 if vol_ratio < MOMENTUM_MIN_VOL_R:
                     return None
 
-                # RSI sano (no sobrecomprado, no oversold extremo)
                 rsi_val = rsi(c1h, 14)
                 if rsi_val > MOMENTUM_MAX_RSI or rsi_val < 35:
                     return None
 
-                # ATR > 0.1% para liquidez mínima
                 atr_v = atr_calc(h1h, l1h, c1h, 14)
                 atr_pct = atr_v / price * 100 if price > 0 else 0
                 if atr_pct < 0.10:
                     return None
 
-                # Score compuesto: momentum reciente pesa más
+                # [M10] Verificar que no esté choppy en 1h
+                if CHOP_CHECK and is_choppy(h1h, l1h, c1h, 20):
+                    return None
+
+                # [M3] Order flow positivo
+                of_delta = order_flow_delta(c1h, v1h, 10)
+                if of_delta < -0.2:  # presión vendedora
+                    return None
+
                 mscore = (
                     mom_4h  * 3.0   +
                     mom_24h * 0.5   +
                     (vol_ratio - 1) * 10 +
                     (rsi_val - 50)  * 0.2 +
-                    (atr_pct - 0.5) * 2.0
+                    (atr_pct - 0.5) * 2.0 +
+                    of_delta * 15           # [M3] bonus order flow
                 )
+
+                # Guardar precios para correlación [M15]
+                self._price_cache[sym] = c1h[-20:]
 
                 return (sym, mscore, mom_4h, mom_24h, round(vol_ratio, 2), round(rsi_val, 1))
 
@@ -841,7 +1015,6 @@ class LongBot:
                 log.debug(f"momentum {sym}: {e}")
                 return None
 
-        # Ejecutar en paralelo
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
             futures = {ex.submit(_score_sym, sym): sym for sym in self.symbols}
             for fut in as_completed(futures):
@@ -851,7 +1024,6 @@ class LongBot:
                         scored.append(result)
                 except: pass
 
-        # Ordenar por score y tomar top N
         scored.sort(key=lambda x: x[1], reverse=True)
         leaders = scored[:top_n]
 
@@ -859,16 +1031,35 @@ class LongBot:
             top5_info = [(s, f"{m4:.1f}%4h", f"vol×{vr}") for s, _, m4, _, vr, _ in leaders[:5]]
             log.info(f"  🏆 Top momentum: {top5_info}")
 
-        # Actualizar caché
         self._momentum_cache  = set(s for s, *_ in leaders)
         self._momentum_ranked = [s for s, *_ in leaders]
         self._last_momentum_refresh = time.time()
 
         return self._momentum_ranked
 
+    # ── Correlación [M15] ────────────────────────────────────────────────
+    def _corr_block(self, candidate_sym) -> bool:
+        """
+        Bloquea entrada si el candidato está correlacionado >0.85
+        con alguna posición abierta.
+        """
+        if not self.trades:
+            return False
+        cand_prices = self._price_cache.get(candidate_sym)
+        if not cand_prices:
+            return False
+        for sym in self.trades:
+            open_prices = self._price_cache.get(sym)
+            if not open_prices:
+                continue
+            corr = correlation(cand_prices, open_prices)
+            if corr > 0.85:
+                log.debug(f"  [CORR] {candidate_sym} correlado {corr:.2f} con {sym}")
+                return True
+        return False
+
     # ── Scan paralelo ─────────────────────────────────────────────────────
     def _analyze_parallel(self, symbols_batch):
-        """Analiza un batch de símbolos en paralelo."""
         results = []
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
             futures = {ex.submit(self.analyze, sym): sym for sym in symbols_batch}
@@ -969,14 +1160,7 @@ class LongBot:
         self._regime = nuevo
 
     def _regime_ok(self) -> tuple:
-        if self._regime_until and datetime.utcnow() < self._regime_until:
-            remaining = int((self._regime_until - datetime.utcnow()).total_seconds() / 60)
-            return False, f"crash guard {remaining}min"
-        if self._regime == 'bear':
-            return False, "régimen bajista"
-        if CAUTION_BLOCK and self._regime == 'caution':
-            return False, "régimen caution"
-        return True, "ok"
+        return self._quality_gate()
 
     def _score_min_for_regime(self) -> float:
         if self._regime == 'bull':
@@ -1044,6 +1228,7 @@ class LongBot:
                     'btc_dir': self._btc_dir(),
                     'debilidad_alertada': False,
                     'trailing_placed': False,
+                    'be_placed': False,  # [M6]
                 }
                 n_rec+=1
                 log.info(f"  ♻️ LONG recuperado: {sym} @ ${entry:.6f}")
@@ -1110,15 +1295,16 @@ class LongBot:
         except: pass
 
     def analyze(self, symbol):
-        """Análisis de un símbolo (thread-safe)."""
+        """Análisis completo con todas las mejoras v6.0."""
         if symbol in self.trades: return None
         if not self._cd_ok(symbol): return None
         if symbol in self._pending_orders: return None
         hora = datetime.utcnow().hour
         if hora in SKIP_HOURS: return None
 
-        regime_ok, regime_reason = self._regime_ok()
-        if not regime_ok: return None
+        # [M1] Quality Gate
+        gate_ok, gate_reason = self._quality_gate()
+        if not gate_ok: return None
         if not self._btc_ok: return None
         if self._cb_active: return None
 
@@ -1128,8 +1314,8 @@ class LongBot:
         c5, h5, l5, v5, o5 = self._klines(symbol, '5m', 130)
         if not c5 or len(c5) < AUROLO_EMA_LEN + 50: return None
 
-        c1h, h1h, l1h, v1h, _ = self._klines(symbol, '1h', 50)
-        c4h, h4h, l4h, v4h, _ = self._klines(symbol, '4h', 30)
+        c1h, h1h, l1h, v1h, _ = self._klines(symbol, '1h', 60)
+        c4h, h4h, l4h, v4h, _ = self._klines(symbol, '4h', 40)
 
         tk = self._ticker(symbol)
         if not tk or tk['price'] <= 0: return None
@@ -1143,24 +1329,58 @@ class LongBot:
             elif e9_1h < e21_1h: trend_1h = -1
         if trend_1h == -1: return None
 
-        trend_4h = 0
+        trend_4h = 0; rsi_4h = 50.0
         if c4h and len(c4h) >= 21:
             e9_4h = ema(c4h, 9); e21_4h = ema(c4h, 21)
+            rsi_4h = rsi(c4h, 14)
             if e9_4h > e21_4h: trend_4h = 1
             elif e9_4h < e21_4h: trend_4h = -1
         if trend_4h == -1: return None
+
+        # [M4] Exigir al menos trend_1h alcista (ya verificado) + no sobrecomprado en 4h
+        if rsi_4h > 78: return None  # sobrecomprado en TF mayor
 
         atr_v   = atr_calc(h5, l5, c5, 14)
         atr_pct = atr_v / price * 100 if price > 0 else 0
         if atr_pct < 0.10: return None
         if change_24 > 20.0: return None
-        if change_24 < -12.0: return None
+        if change_24 < -10.0: return None  # más conservador
+
+        # [M2] Régimen de volatilidad
+        vol_regime, vol_ratio_atr = 'normal', 1.0
+        if c5 and h5 and l5:
+            vol_regime, vol_ratio_atr = volatility_regime(h5, l5, c5)
+        # Evitar entrar en volatilidad extrema
+        if vol_regime == 'expanding' and vol_ratio_atr > 2.5:
+            log.debug(f"  {symbol}: vol expandida {vol_ratio_atr:.1f}x — skip")
+            return None
+
+        # [M10] Anti-chop en 5m
+        if CHOP_CHECK and is_choppy(h5, l5, c5, 20):
+            log.debug(f"  {symbol}: mercado choppy — skip")
+            return None
+
+        # [M14] Spread guard
+        d_book = pub('/openApi/swap/v2/quote/bookTicker', {'symbol': symbol})
+        if d_book.get('code') == 0 and d_book.get('data'):
+            ask = float(d_book['data'].get('askPrice', 0) or 0)
+            bid = float(d_book['data'].get('bidPrice', 0) or ask)
+            if bid > 0:
+                spread_pct = (ask - bid) / bid * 100
+                if spread_pct > 0.3:
+                    log.debug(f"  {symbol}: spread {spread_pct:.2f}% — skip")
+                    return None
 
         sig_aurolo = aurolo_signal(c5, h5, l5, v5, o5, atr_v)
 
-        # FIX WR-1: mínimo 2 puntos (restaurado)
         if sig_aurolo['puntos'] < AUROLO_MIN_PTS: return None
         if sig_aurolo['cambio_tend']: return None
+
+        # [M3] Order flow: mínimo neutro o positivo
+        of_delta = sig_aurolo['of_delta']
+        if of_delta < -0.3:  # presión vendedora fuerte
+            log.debug(f"  {symbol}: order flow negativo {of_delta:.2f} — skip")
+            return None
 
         vwap_val, precio_sobre_vwap = vwap_contexto(c5, h5, l5, v5, VWAP_CANDLES)
         if VWAP_AS_FILTER and not precio_sobre_vwap: return None
@@ -1181,7 +1401,7 @@ class LongBot:
         tp1_neto = sl_pct * TP1_RATIO - FEE_COST_PCT
         if tp1_neto < 0.4: return None
 
-        # ── Scoring ──────────────────────────────────────────────────────
+        # ── Scoring v6.0 ─────────────────────────────────────────────────
         score = 0; reasons = []; factors = []
         pts   = sig_aurolo['puntos']
 
@@ -1194,21 +1414,31 @@ class LongBot:
         if sig_aurolo['p3']: score += 10; factors.append("p3_adx")
 
         wt_val = sig_aurolo['wt_now']
-        if wt_val <= WT_OS1:   score += 8;  factors.append("wt_deep")
-        elif wt_val <= WT_OS2: score += 4;  factors.append("wt_os")
+        if wt_val <= WT_OS1:   score += 10; factors.append("wt_deep")
+        elif wt_val <= WT_OS2: score += 5;  factors.append("wt_os")
 
         adx_val = sig_aurolo['adx_now']
-        if adx_val > ADX_KEY * 1.4: score += 6; factors.append("adx_strong")
+        if adx_val > ADX_KEY * 1.5: score += 8;  factors.append("adx_strong")
+        elif adx_val > ADX_KEY:     score += 4;  factors.append("adx_ok")
 
         vr = sig_aurolo['vol_ratio']
         if vr >= 2.0:   score += 10; factors.append("vol_fuerte")
         elif vr >= 1.4: score += 5;  factors.append("vol_medio")
+
+        # [M3] Order flow bonus
+        if of_delta > 0.3:   score += 10; factors.append("of_bull_strong")
+        elif of_delta > 0.1: score += 5;  factors.append("of_bull")
+        elif of_delta < -0.1: score -= 5; factors.append("of_bear")
 
         if precio_sobre_vwap: score += 8;  factors.append("vwap_arriba")
         else:                 score -= 8;  factors.append("vwap_abajo")
 
         if trend_1h == 1: score += 12; factors.append("trend_1h_up")
         if trend_4h == 1: score += 10; factors.append("trend_4h_up")
+
+        # [M4] Multi-TF confluencia bonus
+        if trend_1h == 1 and trend_4h == 1:
+            score += 8; factors.append("mtf_confluencia")
 
         if self._regime == 'bull':      score += 10; factors.append("regime_bull")
         elif self._regime == 'caution': score -= 10; factors.append("regime_caution")
@@ -1226,9 +1456,14 @@ class LongBot:
         if sl_pct < SL_MAX_PCT * 0.6: score += 5; factors.append("sl_tight")
 
         if self._breadth > 0.65:   score += 8;  factors.append("breadth_good")
-        elif self._breadth < 0.35: score -= 10; factors.append("breadth_bad")
+        elif self._breadth < 0.45: score -= 10; factors.append("breadth_bad")
 
-        # FIX WR-6: bonus si es líder de momentum del día
+        # [M2] Bonus volatilidad en expansión controlada
+        if vol_regime == 'expanding' and vol_ratio_atr < 1.8:
+            score += 6; factors.append("vol_expanding")
+        elif vol_regime == 'compressed':
+            score -= 5; factors.append("vol_compressed")  # breakout pendiente = riesgo
+
         if symbol in self._momentum_cache:
             score += 8; factors.append("momentum_leader")
 
@@ -1237,17 +1472,20 @@ class LongBot:
         adj = self.learn.adj(factors)
         if adj != 0: score += adj
 
-        # FIX WR-2: score mínimo restaurado
         score_min = self._score_min_for_regime()
         if score < score_min:
             log.debug(f"  {symbol}: score {int(score)}<{int(score_min)}")
             return None
 
-        ok, reason = self.learn.ok(symbol, score)
+        ok, reason = self.learn.ok(symbol, score, hora)
         if not ok: return None
 
         e25 = ema(c5, 25)
         e55 = sig_aurolo['ema55']
+
+        # Guardar precios para correlación
+        if c1h:
+            self._price_cache[symbol] = c1h[-20:]
 
         return {
             'price': price, 'change': change_24, 'score': score,
@@ -1263,8 +1501,11 @@ class LongBot:
             'tp1_neto': round(tp1_neto, 3),
             'vwap': vwap_val, 'ema25': e25, 'ema55': e55,
             'zona_inf': sig_aurolo['zona_inf'], 'zona_sup': sig_aurolo['zona_sup'],
-            'trend_1h': trend_1h, 'trend_4h': trend_4h, 'rsi_1h': rsi_1h,
+            'trend_1h': trend_1h, 'trend_4h': trend_4h,
+            'rsi_1h': rsi_1h, 'rsi_4h': rsi_4h,
             'vol_ratio': vr, 'atr_pct': atr_pct,
+            'vol_regime': vol_regime, 'vol_ratio_atr': vol_ratio_atr,
+            'of_delta': of_delta,
             'reasons': ' | '.join(reasons), 'factors': factors,
             'hora_utc': hora, 'btc_dir': self._btc_dir(),
             'precio_sobre_vwap': precio_sobre_vwap,
@@ -1285,13 +1526,17 @@ class LongBot:
         ctval = max(float(info.get('ctval',1)), 1e-9)
         ppc   = price * ctval
         if ppc <= 0: return None, 0
+
+        # [M11] Kelly fraccionado
+        base_size = self.learn.get_kelly_size(POS_SIZE)
+
         if sl_price < price:
             dist_pct = (price-sl_price)/price*100
             riesgo   = ACCOUNT_EQUITY * (RISK_PCT/100)
-            notional = min(riesgo / (dist_pct/100), POS_SIZE*LEVERAGE)
+            notional = min(riesgo / (dist_pct/100), base_size*LEVERAGE)
             notional = max(notional, MIN_TRADE)
         else:
-            notional = max(POS_SIZE*LEVERAGE, MIN_TRADE)
+            notional = max(base_size*LEVERAGE, MIN_TRADE)
         qty = math.ceil((notional/ppc)/step)*step; qty=round(qty,prec); val=qty*ppc
         for _ in range(200):
             if val>=MIN_TRADE: break
@@ -1356,10 +1601,6 @@ class LongBot:
         return d.get('code') == 0
 
     def _chase_limit_entry(self, sym, qty):
-        """
-        Entrada con orden límite (mejor precio) con fallback a market.
-        Las órdenes límite reducen el slippage en 0.05-0.1% por trade.
-        """
         d = pub('/openApi/swap/v2/quote/bookTicker', {'symbol': sym})
         ask_price = None
         if d.get('code') == 0 and d.get('data'):
@@ -1369,12 +1610,10 @@ class LongBot:
             if tk: ask_price = tk['price'] * 1.0002
         if not ask_price: return None, {}
 
-        # Verificar spread — si es muy amplio, usar market directamente
         bid_price = float(d.get('data', {}).get('bidPrice', 0) or ask_price * 0.999)
         spread_pct = (ask_price - bid_price) / bid_price * 100 if bid_price > 0 else 1
-        if spread_pct > 0.5:
-            # Spread amplio = liquidez baja → market para asegurar ejecución
-            log.debug(f"  {sym}: spread {spread_pct:.2f}% → market order")
+        if spread_pct > 0.3:  # [M14] más estricto
+            log.debug(f"  {sym}: spread {spread_pct:.2f}% en entrada → market")
             d = self._order(sym, 'BUY', qty, 'MARKET')
             if d.get('code') != 0: return None, {}
             return self._confirm_pos(sym, 10)
@@ -1404,6 +1643,12 @@ class LongBot:
         if sym in self._pending_orders: return False
         if self._has_any_position(sym):
             log.warning(f"  ⛔ {sym} ya tiene posición"); return False
+
+        # [M15] Bloquear por correlación
+        if self._corr_block(sym):
+            log.info(f"  🔗 {sym} bloqueado por correlación con posición abierta")
+            return False
+
         LongBot._opening = True
         try: return self._open(sym, sig)
         finally: LongBot._opening = False
@@ -1414,8 +1659,9 @@ class LongBot:
         pts      = sig['aurolo_pts']
         label    = sig['aurolo_señal']
         momentum = '🏆' if sig.get('momentum_leader') else ''
+        of_icon  = '📈' if sig['of_delta'] > 0.2 else ''
 
-        log.info(f"\n  🎯 LONG {sym} [{label}]{momentum} | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1")
+        log.info(f"\n  🎯 LONG {sym} [{label}]{momentum}{of_icon} | Score:{int(sig['score'])}/{int(sig['score_min'])} | RR:{sig['rr']:.2f}:1 | OF:{sig['of_delta']:.2f}")
         self._set_lev(sym); time.sleep(0.2)
         qty, notional = self._calc_qty(sym, price, sl_price)
         if not qty: return False
@@ -1462,6 +1708,7 @@ class LongBot:
             'factors': sig['factors'], 'hora_utc': sig['hora_utc'],
             'btc_dir': sig['btc_dir'], 'debilidad_alertada': False,
             'trailing_placed': trailing_placed,
+            'be_placed': False,  # [M6] breakeven agresivo
         }
         self.trades[sym] = trade
         self._pending_orders.pop(sym, None)
@@ -1476,7 +1723,8 @@ class LongBot:
             f"Score: {int(sig['score'])}/{int(sig['score_min'])} | RR: {sig['rr']:.2f}:1 | {sig['regime']}\n"
             f"{p1} P1 EMA55  {p2} P2 WT:{sig['aurolo_wt']:.1f}  {p3} P3 ADX:{sig['aurolo_adx']:.1f}\n"
             f"📍 ${fill_price:.6f} | SL: ${sl_real:.6f} (-{sl_pct_real:.2f}%)\n"
-            f"Trailing: {'✅' if trailing_placed else '❌'} | BTC: {self._btc_1h:+.2f}%"
+            f"OrderFlow: {sig['of_delta']:+.2f} | VolReg: {sig['vol_regime']}\n"
+            f"Kelly: ×{self.learn.kelly_mult:.2f} | Trailing: {'✅' if trailing_placed else '❌'}"
         )
         return True
 
@@ -1569,6 +1817,30 @@ class LongBot:
 
                 if cur > t['highest']: t['highest'] = cur
 
+                # [M12] Cierre preventivo si régimen se deteriora
+                gate_ok, _ = self._quality_gate()
+                if not gate_ok and self._breadth < 0.25:
+                    pnl_pct = (cur - t['entry']) / t['entry'] * 100
+                    if pnl_pct > 0.3:
+                        self._close_all(sym, cur, "RÉGIMEN DETERIORADO (preventivo)"); continue
+                    elif pnl_pct < -1.5:
+                        self._close_all(sym, cur, "STOP PREVENTIVO RÉGIMEN"); continue
+
+                # [M6] Breakeven agresivo: tras +0.5*SL_PCT de beneficio
+                if not t.get('be_placed') and not t.get('trailing_placed'):
+                    be_trigger_pct = t['sl_pct'] * 0.5
+                    pnl_pct = (cur - t['entry']) / t['entry'] * 100
+                    if pnl_pct >= be_trigger_pct:
+                        be_price = t['entry'] * 1.0008  # BE + fees
+                        if be_price > t['sl']:
+                            # Actualizar SL a breakeven
+                            self._cancel_open(sym)
+                            time.sleep(0.2)
+                            if self._place_sl(sym, t['qty_runner'], be_price):
+                                t['sl'] = be_price
+                                t['be_placed'] = True
+                                log.info(f"  🛡️ BE {sym} → ${be_price:.6f}")
+
                 if t.get('trailing_placed') and USE_TRAILING_EXIT:
                     if cur <= t['sl']:
                         self._close_all(sym, cur, "STOP LOSS")
@@ -1578,7 +1850,12 @@ class LongBot:
                     self._close_partial(sym, t['qty_tp1'], cur, f"TP1({int(TP1_PCT)}%)")
                     t['tp1_hit'] = True
                     be = t['entry'] * 1.0008
-                    if be > t['sl']: t['sl'] = be
+                    if be > t['sl']:
+                        t['sl'] = be
+                        # Recolocar SL en BE
+                        self._cancel_open(sym)
+                        time.sleep(0.2)
+                        self._place_sl(sym, t['qty_runner'], be)
                     continue
 
                 if t['tp1_hit'] and not t['tp2_hit'] and cur >= t['tp2_price']:
@@ -1642,14 +1919,15 @@ class LongBot:
         for sym,t in self.trades.items():
             tk=self._ticker(sym); cur=tk['price'] if tk else t['entry']
             pct=(cur-t['entry'])/t['entry']*100
-            pos += f"  {'🎯' if t.get('trailing_placed') else '📌'} {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}%\n"
+            be_icon = '🛡️' if t.get('be_placed') else ''
+            pos += f"  {'🎯' if t.get('trailing_placed') else '📌'}{be_icon} {sym}[{t['aurolo_pts']}/3]: {pct:+.2f}%\n"
 
         momentum_top3 = ', '.join(self._momentum_ranked[:3]) if self._momentum_ranked else 'N/A'
         self._tg(
-            f"<b>📊 Reporte v5.9-FIXED</b>\n"
+            f"<b>📊 Reporte v6.0-ALPHA</b>\n"
             f"PnL: ${self.stats['pnl']:+.4f} | WR: {wr:.0f}% | {total}t\n"
             f"Régimen: {self._regime} | Breadth: {int(self._breadth*100)}%\n"
-            f"Símbolos activos: {len(self.symbols)}\n"
+            f"Kelly: ×{self.learn.kelly_mult:.2f} | Score≥{int(self.learn.opt_score)}\n"
             f"🏆 Top momentum: {momentum_top3}\n"
             + (pos if pos else "  Sin posiciones\n")
         )
@@ -1665,7 +1943,7 @@ class LongBot:
         except: pass
 
     async def run(self):
-        log.info(f"\n🚀 Bot LONGS v5.9-FIXED | {len(self.symbols)} símbolos | {SCAN_WORKERS} workers\n")
+        log.info(f"\n🚀 Bot LONGS v6.0-ALPHA | {len(self.symbols)} símbolos | {SCAN_WORKERS} workers\n")
         iteration=0; last_sym=last_ltv=last_hedge=last_eq=last_regime=last_momentum=0
 
         while True:
@@ -1682,7 +1960,6 @@ class LongBot:
                 if time.time()-last_regime  > 300:
                     self._update_market_regime(); last_regime=time.time()
 
-                # FIX WR-4: refrescar pre-filtro momentum cada 15 min
                 if time.time()-last_momentum > 900:
                     log.info("  🏆 Actualizando líderes de momentum...")
                     self._get_momentum_leaders()
@@ -1708,7 +1985,7 @@ class LongBot:
                 log.info(
                     f"  BTC1h:{self._btc_1h:+.2f}% BTC4h:{self._btc_4h:+.2f}% | "
                     f"Régimen:{self._regime} | Breadth:{int(self._breadth*100)}% | "
-                    f"Score≥{int(score_min)} | Momentum líderes:{len(self._momentum_cache)}"
+                    f"Score≥{int(score_min)} | Kelly:{self.learn.kelly_mult:.2f}"
                 )
                 log.info(f"{'='*72}\n")
 
@@ -1716,18 +1993,15 @@ class LongBot:
                 self._report()
 
                 if len(self.trades) < MAX_TRADES:
-                    regime_ok, regime_reason = self._regime_ok()
-                    if not regime_ok:
-                        log.info(f"  ⏸️ Sin entradas: {regime_reason}")
+                    gate_ok, gate_reason = self._quality_gate()
+                    if not gate_ok:
+                        log.info(f"  ⏸️ Quality Gate: {gate_reason}")
                         await asyncio.sleep(INTERVAL); continue
 
-                    # FIX WR-4/5: scan con pre-filtro momentum
-                    # Primero los líderes del día, luego el resto como fallback
                     momentum_syms = list(self._momentum_cache) if self._momentum_cache else []
                     rest = [s for s in self.symbols
                             if s not in momentum_syms and s not in self.trades]
 
-                    # Si no hay líderes aún (primer ciclo), inicializar
                     if not momentum_syms:
                         log.info("  🏆 Primera carga de momentum...")
                         momentum_syms = self._get_momentum_leaders()
@@ -1735,9 +2009,9 @@ class LongBot:
                         rest = [s for s in self.symbols
                                 if s not in momentum_syms and s not in self.trades]
 
-                    scan_order = momentum_syms + rest[:60]
+                    scan_order = momentum_syms + rest[:50]
                     log.info(
-                        f"  🔍 Scan: {len(momentum_syms)} líderes + {len(rest[:60])} fallback "
+                        f"  🔍 Scan: {len(momentum_syms)} líderes + {len(rest[:50])} fallback "
                         f"({SCAN_WORKERS} workers)..."
                     )
 
@@ -1748,10 +2022,11 @@ class LongBot:
                     for sym, sig in signals:
                         if len(self.trades) >= MAX_TRADES: break
                         ml = '🏆' if sig.get('momentum_leader') else ''
+                        of = f"OF:{sig['of_delta']:+.2f}"
                         log.info(
                             f"  💡 {ml}{sym} [{sig['aurolo_señal']}] | "
                             f"Score:{int(sig['score'])}/{int(sig['score_min'])} | "
-                            f"RR:{sig['rr']:.2f}:1 | SL:{sig['sl_pct']:.2f}%"
+                            f"RR:{sig['rr']:.2f}:1 | {of} | {sig['vol_regime']}"
                         )
                         if self.open_trade(sym, sig):
                             await asyncio.sleep(3)
