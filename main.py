@@ -1,24 +1,17 @@
 """
-Sniper Bot V26.1 - Institutional Apex Multi-Coin
-ARCHIVO ÚNICO para Railway
-Fixes v3:
-  - Score mínimo bajado a 45 para operar en cualquier condición
-  - Modo fallback: si no hay coins con score alto, opera el TOP 3 por volumen con señal Apex simple
-  - Debug de campos reales de BingX ticker
-  - Filtro de coins basura (stablecoins, coins raras)
-  - Señal LONG/SHORT independiente del scorer (Apex directo sobre watchlist)
+Sniper Bot V26.1 — Fix v4
+Cambios críticos:
+  - Volumen leído desde velas (no ticker) → InstVol funciona
+  - Score recalculado con todos los filtros activos
+  - Watchlist ampliada: top 5 por score SIN umbral mínimo
+  - Señal de entrada en 3 niveles (100/70/50)
+  - SL dinámico con ATR si pivot está muy lejos
+  - Log detallado de cada filtro por coin
 """
 
-import asyncio
-import hashlib
-import hmac
-import logging
-import os
-import time
-import urllib.parse
+import asyncio, hashlib, hmac, logging, os, time, urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
-
 import httpx
 import numpy as np
 
@@ -39,28 +32,27 @@ TIMEFRAME        = os.getenv("TIMEFRAME", "15m")
 LEVERAGE         = int(os.getenv("LEVERAGE", "5"))
 MAX_RISK_PCT     = float(os.getenv("MAX_RISK_PCT", "1.0"))
 SCAN_TOP_N       = int(os.getenv("SCAN_TOP_N", "10"))
-MIN_VOL_USDT     = float(os.getenv("MIN_VOL_USDT", "20000000"))   # 20M mínimo
-SCORE_THRESHOLD  = int(os.getenv("SCORE_THRESHOLD", "45"))        # bajado de 65 a 45
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_MIN", "5")) * 60  # cada 5 min
+MIN_VOL_USDT     = float(os.getenv("MIN_VOL_USDT", "10000000"))   # 10M
+SCORE_THRESHOLD  = int(os.getenv("SCORE_THRESHOLD", "40"))
+SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_MIN", "5")) * 60
+BASE_URL         = "https://open-api.bingx.com"
 
-BASE_URL = "https://open-api.bingx.com"
-
-# Coins que NUNCA operar (stablecoins, coins raras, wrapped)
 BLACKLIST = {
     "USDC-USDT","BUSD-USDT","DAI-USDT","TUSD-USDT","USDP-USDT",
     "FRAX-USDT","GUSD-USDT","LUSD-USDT","SUSD-USDT","USDD-USDT",
     "NCCOGOLD2USD-USDT","PAXG-USDT","XAUT-USDT","WBTC-USDT",
-    "STETH-USDT","WETH-USDT","CBETH-USDT","RETH-USDT",
+    "STETH-USDT","WETH-USDT","CBETH-USDT","RETH-USDT","ZEC-USDT",
 }
 
-# Solo operar estas coins conocidas y líquidas (whitelist modo seguro)
 WHITELIST = {
     "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
     "DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","LINK-USDT",
     "MATIC-USDT","UNI-USDT","ATOM-USDT","LTC-USDT","BCH-USDT",
-    "FIL-USDT","NEAR-USDT","APT-USDT","ARB-USDT","OP-USDT",
-    "INJ-USDT","SUI-USDT","TIA-USDT","WLD-USDT","JTO-USDT",
-    "AAVE-USDT","ONDO-USDT","ENA-USDT","PEPE-USDT","WIF-USDT",
+    "NEAR-USDT","APT-USDT","ARB-USDT","OP-USDT","INJ-USDT",
+    "SUI-USDT","TIA-USDT","WLD-USDT","AAVE-USDT","ONDO-USDT",
+    "ENA-USDT","PEPE-USDT","WIF-USDT","SEI-USDT","JUP-USDT",
+    "FIL-USDT","RENDER-USDT","FET-USDT","ALGO-USDT","SAND-USDT",
+    "MANA-USDT","AXS-USDT","GALA-USDT","IMX-USDT","BLUR-USDT",
 }
 USE_WHITELIST = os.getenv("USE_WHITELIST", "true").lower() == "true"
 
@@ -108,31 +100,29 @@ class BingXClient:
         candles = []
         for c in d["data"]:
             try:
-                # BingX v3 puede devolver lista o dict según versión
                 if isinstance(c, list):
                     candles.append({"time": int(c[0]), "open": float(c[1]),
                                     "high": float(c[2]), "low": float(c[3]),
                                     "close": float(c[4]), "volume": float(c[5])})
                 elif isinstance(c, dict):
-                    candles.append({"time": int(c.get("time",0)),
-                                    "open":   float(c.get("open",   c.get("o",0))),
-                                    "high":   float(c.get("high",   c.get("h",0))),
-                                    "low":    float(c.get("low",    c.get("l",0))),
-                                    "close":  float(c.get("close",  c.get("c",0))),
-                                    "volume": float(c.get("volume", c.get("v",0)))})
+                    candles.append({
+                        "time":   int(c.get("time", c.get("t", 0))),
+                        "open":   float(c.get("open",   c.get("o", 0))),
+                        "high":   float(c.get("high",   c.get("h", 0))),
+                        "low":    float(c.get("low",    c.get("l", 0))),
+                        "close":  float(c.get("close",  c.get("c", 0))),
+                        "volume": float(c.get("volume", c.get("v", c.get("quoteVolume", 0)))),
+                    })
             except Exception:
                 continue
         return candles
 
     async def get_all_tickers(self) -> list:
-        """Obtiene todos los tickers y loguea los campos reales para debug."""
+        """Tickers para obtener la lista de symbols — el volumen real viene de las velas."""
         d = await self._get("/openApi/swap/v2/quote/ticker")
         raw = d.get("data", [])
-
-        # Debug: loguear campos del primer ticker
         if raw:
             log.info(f"[DEBUG] Ticker fields: {list(raw[0].keys())}")
-            log.info(f"[DEBUG] Sample ticker: {raw[0]}")
 
         tickers = []
         for t in raw:
@@ -145,48 +135,60 @@ class BingXClient:
                 if USE_WHITELIST and sym not in WHITELIST:
                     continue
 
-                # BingX puede usar distintos nombres de campo según endpoint
-                vol = 0.0
-                for field_name in ("quoteVolume","volume","vol","turnover","amount","tradeAmount"):
-                    v = t.get(field_name)
-                    if v and float(v) > 0:
-                        vol = float(v)
-                        break
-
+                # Precio — intentar todos los campos posibles
                 price = 0.0
-                for field_name in ("lastPrice","last","price","close","c"):
-                    v = t.get(field_name)
+                for f in ("lastPrice", "last", "price", "close", "c", "markPrice"):
+                    v = t.get(f)
                     if v and float(v) > 0:
                         price = float(v)
                         break
 
+                # Cambio 24h
                 change = 0.0
-                for field_name in ("priceChangePercent","change","changePercent","priceChange24hPercent"):
-                    v = t.get(field_name)
+                for f in ("priceChangePercent","change","changePercent","priceChange"):
+                    v = t.get(f)
                     if v is not None:
-                        change = float(v)
+                        try: change = float(v)
+                        except: pass
                         break
 
-                if vol < MIN_VOL_USDT or price <= 0:
+                # Volumen del ticker (puede ser 0 — se complementa con velas)
+                vol_ticker = 0.0
+                for f in ("quoteVolume","volume","vol","turnover","amount"):
+                    v = t.get(f)
+                    if v:
+                        try:
+                            fv = float(v)
+                            if fv > 0:
+                                vol_ticker = fv
+                                break
+                        except: pass
+
+                if price <= 0:
                     continue
 
-                tickers.append({"symbol": sym, "volume_24h": vol,
-                                 "price": price, "change_24h": change})
+                tickers.append({
+                    "symbol":     sym,
+                    "price":      price,
+                    "change_24h": change,
+                    "vol_ticker": vol_ticker,
+                })
             except Exception as e:
-                log.warning(f"Ticker parse error {t.get('symbol','?')}: {e}")
-                continue
+                log.warning(f"Ticker parse {t.get('symbol','?')}: {e}")
 
-        tickers.sort(key=lambda x: x["volume_24h"], reverse=True)
-        log.info(f"Tickers válidos: {len(tickers)} → top: {[t['symbol'] for t in tickers[:SCAN_TOP_N]]}")
-        return tickers[:SCAN_TOP_N]
+        log.info(f"Tickers parseados: {len(tickers)} coins válidas")
+        return tickers  # devolvemos TODOS, el filtro de volumen lo hacemos con velas
 
     async def get_balance(self) -> float:
         d = await self._get("/openApi/swap/v2/user/balance")
         for a in d["data"]["balance"]:
             if a["asset"] == "USDT":
-                avail = float(a.get("availableMargin", a.get("available", a.get("free", 0))))
-                log.info(f"Balance USDT disponible: {avail}")
-                return avail
+                for f in ("availableMargin","available","free","equity"):
+                    v = a.get(f)
+                    if v is not None:
+                        bal = float(v)
+                        log.info(f"Balance USDT: {bal}")
+                        return bal
         return 0.0
 
     async def get_position(self, symbol: str) -> Optional[dict]:
@@ -198,18 +200,19 @@ class BingXClient:
     async def place_order(self, symbol, side, position_side, qty,
                           stop_loss=None, take_profit=None, reduce_only=False):
         payload = {
-            "symbol": symbol, "side": side,
+            "symbol":       symbol,
+            "side":         side,
             "positionSide": position_side,
-            "type": "MARKET",
-            "quantity": str(qty),
+            "type":         "MARKET",
+            "quantity":     str(qty),
         }
         if reduce_only:
             payload["reduceOnly"] = "true"
         if stop_loss:
-            payload["stopLoss"]   = str(round(stop_loss, 6))
+            payload["stopLoss"]   = str(round(stop_loss, 8))
         if take_profit:
-            payload["takeProfit"] = str(round(take_profit, 6))
-        log.info(f"PLACE ORDER → {payload}")
+            payload["takeProfit"] = str(round(take_profit, 8))
+        log.info(f"ORDER → {symbol} {side} {position_side} qty={qty} sl={stop_loss} tp={take_profit}")
         result = await self._post("/openApi/swap/v2/trade/order", payload)
         log.info(f"ORDER RESULT → {result}")
         return result
@@ -226,18 +229,7 @@ class BingXClient:
                 await self._post("/openApi/swap/v2/trade/leverage",
                                  {"symbol": symbol, "side": side, "leverage": str(leverage)})
             except Exception as e:
-                log.warning(f"Leverage {side} error: {e}")
-
-    async def get_min_qty(self, symbol: str) -> float:
-        """Obtiene la cantidad mínima de orden para el símbolo."""
-        try:
-            d = await self._get("/openApi/swap/v2/quote/contracts")
-            for c in d.get("data", []):
-                if c.get("symbol") == symbol:
-                    return float(c.get("tradeMinQuantity", 0.001))
-        except Exception:
-            pass
-        return 0.001
+                log.warning(f"Leverage {side} {symbol}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -248,10 +240,8 @@ async def tg(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(url, json={"chat_id": TELEGRAM_CHAT_ID,
-                                        "text": text[:4000], "parse_mode": "Markdown"})
-            if r.status_code != 200:
-                log.error(f"Telegram error: {r.text}")
+            await c.post(url, json={"chat_id": TELEGRAM_CHAT_ID,
+                                    "text": text[:4000], "parse_mode": "Markdown"})
     except Exception as e:
         log.error(f"Telegram: {e}")
 
@@ -261,20 +251,23 @@ async def tg(text: str):
 # ══════════════════════════════════════════════════════════════════
 
 def ema(v, p):
-    k, r = 2/(p+1), np.zeros_like(v, dtype=float)
+    v = np.asarray(v, dtype=float)
+    k, r = 2/(p+1), np.zeros(len(v))
     r[0] = v[0]
     for i in range(1, len(v)):
         r[i] = v[i]*k + r[i-1]*(1-k)
     return r
 
 def hma(v, p):
-    return ema(2*ema(v, p//2) - ema(v, p), max(int(np.sqrt(p)),1))
+    return ema(2*ema(v, max(p//2,1)) - ema(v, p), max(int(np.sqrt(p)),1))
 
 def sma(v, p):
+    v = np.asarray(v, dtype=float)
     return np.convolve(v, np.ones(p)/p, mode="same")
 
 def stoch_s(src, p):
-    r = np.zeros_like(src, dtype=float)
+    src = np.asarray(src, dtype=float)
+    r = np.zeros(len(src))
     for i in range(p-1, len(src)):
         w = src[i-p+1:i+1]
         lo, hi = w.min(), w.max()
@@ -282,40 +275,52 @@ def stoch_s(src, p):
     return r
 
 def stc_ind(c):
-    macd = ema(c,23) - ema(c,50)
+    macd = ema(c, 23) - ema(c, 50)
     return stoch_s(stoch_s(macd, 10), 10)
 
 def pivot_hi(h, n):
-    r = np.full_like(h, np.nan, dtype=float)
+    h = np.asarray(h, dtype=float)
+    r = np.full(len(h), np.nan)
     for i in range(n, len(h)-n):
         if h[i] == h[i-n:i+n+1].max():
             r[i] = h[i]
     return r
 
 def pivot_lo(l, n):
-    r = np.full_like(l, np.nan, dtype=float)
+    l = np.asarray(l, dtype=float)
+    r = np.full(len(l), np.nan)
     for i in range(n, len(l)-n):
         if l[i] == l[i-n:i+n+1].min():
             r[i] = l[i]
     return r
 
+def calc_atr(highs, lows, closes, p=14):
+    h, l, c = np.asarray(highs,float), np.asarray(lows,float), np.asarray(closes,float)
+    tr = np.maximum(h-l, np.maximum(np.abs(h-np.roll(c,1)), np.abs(l-np.roll(c,1))))
+    return float(np.mean(tr[-p:]))
+
 
 # ══════════════════════════════════════════════════════════════════
-# SCORER (para rankear coins)
+# SCORER — usa volumen de VELAS, no del ticker
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass
 class CoinScore:
     symbol:     str
-    volume_24h: float
+    vol_24h_usd: float   # calculado desde velas
     score:      int
     direction:  str
     signals:    list = field(default_factory=list)
     change_24h: float = 0.0
 
-def score_coin(ticker: dict, candles: list) -> Optional["CoinScore"]:
-    if len(candles) < 55:
-        log.warning(f"{ticker['symbol']}: solo {len(candles)} velas, skip")
+def candle_volume_usd(candles: list) -> float:
+    """Volumen 24h en USD calculado desde las últimas 96 velas de 15m (= 24h)."""
+    last96 = candles[-96:] if len(candles) >= 96 else candles
+    return sum(c["close"] * c["volume"] for c in last96)
+
+def score_coin(ticker: dict, candles: list) -> Optional[CoinScore]:
+    if len(candles) < 60:
+        log.warning(f"{ticker['symbol']}: solo {len(candles)} velas")
         return None
 
     closes  = np.array([c["close"]  for c in candles], dtype=float)
@@ -323,25 +328,32 @@ def score_coin(ticker: dict, candles: list) -> Optional["CoinScore"]:
     lows    = np.array([c["low"]    for c in candles], dtype=float)
     volumes = np.array([c["volume"] for c in candles], dtype=float)
 
-    # Sanity check: datos válidos
-    if closes[-1] <= 0 or np.any(np.isnan(closes)):
+    if closes[-1] <= 0 or np.any(np.isnan(closes[-10:])):
+        return None
+
+    # Volumen real desde velas
+    vol_usd = candle_volume_usd(candles)
+
+    # Filtrar por volumen mínimo real
+    if vol_usd < MIN_VOL_USDT:
+        log.info(f"{ticker['symbol']}: vol ${vol_usd/1e6:.1f}M < ${MIN_VOL_USDT/1e6:.0f}M, skip")
         return None
 
     e7, e17 = ema(closes,7), ema(closes,17)
     e4, e20 = ema(closes,4), ema(closes,20)
-    h50     = hma(closes,50)
+    h50     = hma(closes, 50)
     stc_v   = stc_ind(closes)
-    vol_ma  = sma(volumes,20)
 
-    # Volumen institucional: >1.5x media 20
-    inst_vol = bool(volumes[-1] > vol_ma[-1]*1.5) if vol_ma[-1] > 0 else False
+    # Volumen institucional: vela actual vs SMA20 del volumen — desde velas reales
+    vol_sma20 = float(sma(volumes, 20)[-1])
+    inst_vol  = bool(volumes[-1] > vol_sma20 * 1.3) if vol_sma20 > 0 else False
 
     ph_vals = pivot_hi(highs, 5)
     pl_vals = pivot_lo(lows,  5)
-    vph = ph_vals[~np.isnan(ph_vals)]
-    vpl = pl_vals[~np.isnan(pl_vals)]
-    peak   = float(vph[-1]) if len(vph) > 0 else float(highs[-1])
-    valley = float(vpl[-1]) if len(vpl) > 0 else float(lows[-1])
+    vph     = ph_vals[~np.isnan(ph_vals)]
+    vpl     = pl_vals[~np.isnan(pl_vals)]
+    peak    = float(vph[-1]) if len(vph) > 0 else float(highs[-1])
+    valley  = float(vpl[-1]) if len(vpl) > 0 else float(lows[-1])
 
     i = -1
     score, signals, direction = 0, [], "NEUTRAL"
@@ -349,52 +361,55 @@ def score_coin(ticker: dict, candles: list) -> Optional["CoinScore"]:
     hull_bull = bool(closes[i] > h50[i])
     hull_bear = bool(closes[i] < h50[i])
 
-    # FILTRO 1: Hull (20 pts)
+    # F1: Hull (20 pts)
     if hull_bull:
         score += 20; signals.append("Hull🟢"); direction = "LONG"
     elif hull_bear:
         score += 20; signals.append("Hull🔴"); direction = "SHORT"
 
-    # FILTRO 2: EMA alineación (20 pts) — más fácil que exigir cruce exacto
+    # F2: EMA alineación (20 pts) + bonus cruce fresco (5 pts)
     if hull_bull and e7[i] > e17[i]:
         score += 20; signals.append("EMA🟢")
-        if e7[i-1] < e17[i-1]:  # cruce fresco = bonus
-            score += 5; signals.append("Cruz✅")
+        if e7[i-1] <= e17[i-1]: score += 5; signals.append("Cruz✅")
     elif hull_bear and e7[i] < e17[i]:
         score += 20; signals.append("EMA🔴")
-        if e7[i-1] > e17[i-1]:
-            score += 5; signals.append("Cruz✅")
+        if e7[i-1] >= e17[i-1]: score += 5; signals.append("Cruz✅")
 
-    # FILTRO 3: Cerca de pivot o rotura (15 pts)
+    # F3: Posición vs rango pivot (15 pts)
     rng = peak - valley
     if rng > 0:
-        if hull_bull and closes[i] > (valley + rng*0.6):
+        pos = (closes[i] - valley) / rng  # 0=valley, 1=peak
+        if hull_bull and pos > 0.5:
             score += 15; signals.append("Zona🟢")
-        elif hull_bear and closes[i] < (peak - rng*0.6):
+        elif hull_bear and pos < 0.5:
             score += 15; signals.append("Zona🔴")
 
-    # FILTRO 4: Volumen institucional (15 pts)
+    # F4: Volumen institucional desde velas (15 pts)
     if inst_vol:
         score += 15; signals.append("Vol💜")
+        log.info(f"{ticker['symbol']}: InstVol ACTIVO vol={volumes[-1]:.0f} sma={vol_sma20:.0f}")
+    else:
+        log.info(f"{ticker['symbol']}: InstVol OFF vol={volumes[-1]:.0f} sma={vol_sma20:.0f} ratio={volumes[-1]/(vol_sma20+1e-10):.2f}x")
 
-    # FILTRO 5: STC momentum (15 pts)
+    # F5: STC momentum (15 pts)
     if hull_bull and stc_v[i] > stc_v[i-1]:
         score += 15; signals.append("STC🟢")
     elif hull_bear and stc_v[i] < stc_v[i-1]:
         score += 15; signals.append("STC🔴")
 
-    # FILTRO 6: Slope ChartArt (10 pts)
-    s4  = (e4[i]  - e4[i-1])
-    s20 = (e20[i] - e20[i-1])
+    # F6: Slope ChartArt (10 pts)
+    s4  = e4[i]  - e4[i-1]
+    s20 = e20[i] - e20[i-1]
     if (hull_bull and s4>0 and s20>0) or (hull_bear and s4<0 and s20<0):
         score += 10; signals.append("Slope✅")
 
-    log.info(f"{ticker['symbol']}: score={score} dir={direction} signals={signals}")
+    score = min(score, 100)
+    log.info(f"{ticker['symbol']}: score={score} dir={direction} vol_24h=${vol_usd/1e6:.1f}M signals={signals}")
 
     return CoinScore(
         symbol=ticker["symbol"],
-        volume_24h=ticker["volume_24h"],
-        score=min(score, 100),
+        vol_24h_usd=vol_usd,
+        score=score,
         direction=direction,
         signals=signals,
         change_24h=ticker.get("change_24h", 0),
@@ -402,20 +417,20 @@ def score_coin(ticker: dict, candles: list) -> Optional["CoinScore"]:
 
 
 # ══════════════════════════════════════════════════════════════════
-# SIGNAL ENGINE (entrada real)
+# SIGNAL ENGINE
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass
 class Signal:
     direction: str
-    entry: float
-    sl: float
-    tp: float
-    score: int = 0
-    note: str = ""
+    entry:     float
+    sl:        float
+    tp:        float
+    score:     int = 0
+    note:      str = ""
 
 def compute_signal(candles: list) -> Signal:
-    if len(candles) < 55:
+    if len(candles) < 60:
         return Signal("NONE", 0, 0, 0)
 
     closes  = np.array([c["close"]  for c in candles], dtype=float)
@@ -425,17 +440,18 @@ def compute_signal(candles: list) -> Signal:
 
     e7, e17 = ema(closes,7), ema(closes,17)
     e2, e4, e20 = ema(closes,2), ema(closes,4), ema(closes,20)
-    h50     = hma(closes,50)
+    h50     = hma(closes, 50)
     stc_v   = stc_ind(closes)
-    vol_ma  = sma(volumes,20)
-    inst_vol = bool(volumes[-1] > vol_ma[-1]*1.3)  # bajado a 1.3x
+    vol_sma = sma(volumes, 20)
+    inst_vol = bool(volumes[-1] > vol_sma[-1] * 1.3) if vol_sma[-1] > 0 else False
 
-    ph_vals = pivot_hi(highs,5); pl_vals = pivot_lo(lows,5)
+    ph_vals = pivot_hi(highs, 5); pl_vals = pivot_lo(lows, 5)
     vph = ph_vals[~np.isnan(ph_vals)]; vpl = pl_vals[~np.isnan(pl_vals)]
-    peak   = float(vph[-1]) if len(vph)>0 else float(highs.max())
-    valley = float(vpl[-1]) if len(vpl)>0 else float(lows.min())
+    peak   = float(vph[-1]) if len(vph) > 0 else float(highs.max())
+    valley = float(vpl[-1]) if len(vpl) > 0 else float(lows.min())
+    atr    = calc_atr(highs, lows, closes)
 
-    i = -1
+    i     = -1
     entry = float(closes[i])
     if entry <= 0:
         return Signal("NONE", 0, 0, 0)
@@ -443,36 +459,42 @@ def compute_signal(candles: list) -> Signal:
     hull_bull = bool(closes[i] > h50[i])
     hull_bear = bool(closes[i] < h50[i])
 
-    # Señal APEX completa (score 100)
+    def make_sig(direction, sl_raw, sc, note=""):
+        # Si SL está a más del 3% del entry, usar ATR*1.5 en su lugar
+        if abs(entry - sl_raw) > entry * 0.03:
+            sl = (entry - atr*1.5) if direction=="LONG" else (entry + atr*1.5)
+        else:
+            sl = sl_raw
+        risk = abs(entry - sl)
+        tp = entry + risk*3 if direction=="LONG" else entry - risk*3
+        return Signal(direction, entry, sl, tp, sc, note)
+
+    # Nivel 1: APEX completo (100)
     apex_l = (hull_bull and e7[i]>e17[i] and closes[i]>peak
               and inst_vol and stc_v[i]>stc_v[i-1] and (e7[i]-e7[i-1])>0)
     apex_s = (hull_bear and e7[i]<e17[i] and closes[i]<valley
               and inst_vol and stc_v[i]<stc_v[i-1] and (e7[i]-e7[i-1])<0)
 
-    # Señal RELAJADA: hull + ema cross + volumen (score 70) — NUEVA
-    relax_l = (hull_bull and e7[i-1]<e17[i-1] and e7[i]>e17[i] and inst_vol)
-    relax_s = (hull_bear and e7[i-1]>e17[i-1] and e7[i]<e17[i] and inst_vol)
+    # Nivel 2: Hull + cruce EMA + vol (70)
+    relax_l = hull_bull and e7[i-1]<e17[i-1] and e7[i]>e17[i] and inst_vol
+    relax_s = hull_bear and e7[i-1]>e17[i-1] and e7[i]<e17[i] and inst_vol
 
-    # Señal MÍNIMA: solo hull + ema cross (score 50) — para no quedarse sin operar
-    min_l = (hull_bull and e7[i-1]<e17[i-1] and e7[i]>e17[i])
-    min_s = (hull_bear and e7[i-1]>e17[i-1] and e7[i]<e17[i])
+    # Nivel 3: Hull + cruce EMA solamente (50) — entra aunque no haya vol inst
+    min_l = hull_bull and e7[i-1]<e17[i-1] and e7[i]>e17[i]
+    min_s = hull_bear and e7[i-1]>e17[i-1] and e7[i]<e17[i]
 
-    def make_signal(direction, sl_level, sc, note=""):
-        sl   = sl_level
-        risk = abs(entry - sl)
-        if risk < entry*0.001:  # SL demasiado cercano (<0.1%), usar ATR
-            tr   = np.mean(np.abs(np.diff(closes[-14:])))
-            risk = tr * 1.5
-            sl   = entry - risk if direction=="LONG" else entry + risk
-        tp = entry + risk*3 if direction=="LONG" else entry - risk*3
-        return Signal(direction, entry, sl, tp, sc, note)
+    # Nivel 4: Hull + EMA alineadas + STC (40) — mercado tendencial sin cruce fresco
+    trend_l = hull_bull and e7[i]>e17[i] and stc_v[i]>stc_v[i-1] and (e4[i]-e4[i-1])>0
+    trend_s = hull_bear and e7[i]<e17[i] and stc_v[i]<stc_v[i-1] and (e4[i]-e4[i-1])<0
 
-    if apex_l:   return make_signal("LONG",  valley, 100)
-    if apex_s:   return make_signal("SHORT", peak,   100)
-    if relax_l:  return make_signal("LONG",  valley,  70, "⚡Relax")
-    if relax_s:  return make_signal("SHORT", peak,    70, "⚡Relax")
-    if min_l:    return make_signal("LONG",  valley,  50, "📊MinSignal")
-    if min_s:    return make_signal("SHORT", peak,    50, "📊MinSignal")
+    if apex_l:   return make_sig("LONG",  valley, 100)
+    if apex_s:   return make_sig("SHORT", peak,   100)
+    if relax_l:  return make_sig("LONG",  valley,  70, "⚡Relax")
+    if relax_s:  return make_sig("SHORT", peak,    70, "⚡Relax")
+    if min_l:    return make_sig("LONG",  valley,  50, "📊Cruz")
+    if min_s:    return make_sig("SHORT", peak,    50, "📊Cruz")
+    if trend_l:  return make_sig("LONG",  valley,  40, "📈Trend")
+    if trend_s:  return make_sig("SHORT", peak,    40, "📉Trend")
 
     return Signal("NONE", entry, 0, 0)
 
@@ -481,75 +503,98 @@ def compute_signal(candles: list) -> Signal:
 # RISK
 # ══════════════════════════════════════════════════════════════════
 
-async def calc_qty(exchange: BingXClient, symbol: str,
-                   balance: float, entry: float, sl: float) -> float:
+async def calc_qty(exchange, symbol: str, balance: float,
+                   entry: float, sl: float) -> float:
     risk_usd = balance * (MAX_RISK_PCT / 100)
     dist = abs(entry - sl)
     if dist < 1e-10:
         return 0.0
-    qty = round(risk_usd / dist, 3)
-    min_q = await exchange.get_min_qty(symbol)
-    if qty < min_q:
-        log.warning(f"Qty {qty} < min {min_q} para {symbol}, usando mínimo")
-        qty = min_q
-    return qty
+    qty = risk_usd / dist
+    # Redondear según precio (contratos grandes necesitan menos decimales)
+    if entry > 10000:   qty = round(qty, 3)
+    elif entry > 100:   qty = round(qty, 2)
+    elif entry > 1:     qty = round(qty, 1)
+    else:               qty = round(qty, 0)
+    return max(qty, 0.001)
 
 
 # ══════════════════════════════════════════════════════════════════
-# MAIN BOT
+# BOT STATE
 # ══════════════════════════════════════════════════════════════════
 
 exchange     = BingXClient()
-watchlist:   list[str] = []
+watchlist:   list[str]   = []
 last_signal: dict[str,str] = {}
+
+
+# ══════════════════════════════════════════════════════════════════
+# SCANNER LOOP
+# ══════════════════════════════════════════════════════════════════
 
 async def scanner_loop():
     global watchlist
     while True:
         try:
-            log.info(f"🔍 Escaneando TOP {SCAN_TOP_N} coins...")
-            tickers = await exchange.get_all_tickers()
+            log.info(f"🔍 Escaneo iniciado — {SCAN_TOP_N} coins objetivo")
+            all_tickers = await exchange.get_all_tickers()
 
-            if not tickers:
-                log.warning("No hay tickers válidos — revisando MIN_VOL_USDT o WHITELIST")
-                await tg("⚠️ Sin tickers válidos. Revisa MIN_VOL_USDT o USE_WHITELIST en Railway.")
+            if not all_tickers:
+                log.warning("Sin tickers — revisa WHITELIST o API key")
+                await tg("⚠️ Sin tickers válidos. Revisa variables en Railway.")
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            tasks   = [exchange.get_klines(t["symbol"], TIMEFRAME, 200) for t in tickers]
+            # Descargar velas en paralelo para TODAS las coins de la whitelist
+            tasks   = [exchange.get_klines(t["symbol"], TIMEFRAME, 200) for t in all_tickers]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             scored = []
-            for ticker, candles in zip(tickers, results):
+            for ticker, candles in zip(all_tickers, results):
                 if isinstance(candles, Exception):
-                    log.warning(f"{ticker['symbol']} klines error: {candles}")
+                    log.warning(f"{ticker['symbol']} klines: {candles}")
                     continue
                 cs = score_coin(ticker, candles)
                 if cs:
                     scored.append(cs)
 
+            # Ordenar por score
             scored.sort(key=lambda x: x.score, reverse=True)
+            top = scored[:SCAN_TOP_N]
 
-            # Watchlist = coins con score >= umbral, o top 5 si nadie llega
-            operables = [c for c in scored if c.score >= SCORE_THRESHOLD and c.direction != "NEUTRAL"]
-            watchlist = [c.symbol for c in operables] if operables else [c.symbol for c in scored[:5]]
+            # Watchlist: coins con score >= umbral, o top 5 sin umbral
+            operables = [c for c in top if c.score >= SCORE_THRESHOLD and c.direction != "NEUTRAL"]
+            watchlist = [c.symbol for c in operables] if operables else [c.symbol for c in top[:5]]
 
-            # Mensaje Telegram
-            lines = [f"🔍 *ESCANEO — TOP {len(scored)} coins*\n"]
-            for n, c in enumerate(scored, 1):
-                emoji = "🟢" if c.direction=="LONG" else "🔴" if c.direction=="SHORT" else "⚪"
-                bar   = "█"*(c.score//10) + "░"*(10-c.score//10)
+            log.info(f"Watchlist: {watchlist}")
+
+            # Telegram: resumen top 10
+            lines = [f"🔍 *ESCANEO — {len(top)} coins analizadas*\n"]
+            for n, c in enumerate(top, 1):
+                e = "🟢" if c.direction=="LONG" else "🔴" if c.direction=="SHORT" else "⚪"
+                bar = "█"*(c.score//10) + "░"*(10-c.score//10)
                 lines.append(
-                    f"*#{n}* {emoji} `{c.symbol}` `{c.score}/100`\n"
-                    f"`{bar}` {' '.join(c.signals)}\n"
-                    f"Vol: `${c.volume_24h/1e6:.0f}M`  Δ:`{c.change_24h:+.1f}%`\n"
+                    f"*#{n}* {e} `{c.symbol}` `{c.score}/100`\n"
+                    f"`{bar}`\n"
+                    f"Vol24h: `${c.vol_24h_usd/1e6:.0f}M`  Δ:`{c.change_24h:+.1f}%`\n"
+                    f"{'  '.join(c.signals)}\n"
                 )
 
-            lines.append(f"\n👀 *Watchlist activa:*")
+            lines.append(f"\n👀 *Watchlist ({len(watchlist)} coins):*")
             for s in watchlist:
                 lines.append(f"  • `{s}`")
 
-            await tg("\n".join(lines))
+            # Enviar en chunks si es largo
+            msg = "\n".join(lines)
+            if len(msg) > 3800:
+                # Enviar resumen corto
+                short = [f"🔍 *TOP {len(top)} — Watchlist activa:*\n"]
+                for n, c in enumerate(top, 1):
+                    e = "🟢" if c.direction=="LONG" else "🔴" if c.direction=="SHORT" else "⚪"
+                    short.append(f"{e} `{c.symbol}` `{c.score}` {' '.join(c.signals[:3])}")
+                short.append(f"\n👀 Watchlist: {', '.join([f'`{s}`' for s in watchlist])}")
+                await tg("\n".join(short))
+            else:
+                await tg(msg)
 
         except Exception as e:
             log.error(f"Scanner error: {e}", exc_info=True)
@@ -558,15 +603,19 @@ async def scanner_loop():
         await asyncio.sleep(SCAN_INTERVAL)
 
 
+# ══════════════════════════════════════════════════════════════════
+# TRADING LOOP
+# ══════════════════════════════════════════════════════════════════
+
 async def trading_loop():
-    await asyncio.sleep(45)  # esperar primer escaneo
+    await asyncio.sleep(60)  # esperar primer escaneo completo
     while True:
         try:
             for symbol in list(watchlist):
                 await trade_coin(symbol)
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
         except Exception as e:
-            log.error(f"Trading loop error: {e}", exc_info=True)
+            log.error(f"Trading loop: {e}", exc_info=True)
         await asyncio.sleep(60)
 
 
@@ -577,9 +626,9 @@ async def trade_coin(symbol: str):
         position = await exchange.get_position(symbol)
         has_pos  = position is not None
 
-        log.info(f"{symbol}: signal={signal.direction} score={signal.score} has_pos={has_pos}")
+        log.info(f"[{symbol}] signal={signal.direction}({signal.score}) pos={has_pos}")
 
-        # Cerrar posición contraria
+        # Cerrar si señal contraria
         if has_pos and signal.direction != "NONE":
             amt      = float(position["positionAmt"])
             pos_side = "LONG" if amt > 0 else "SHORT"
@@ -589,24 +638,23 @@ async def trade_coin(symbol: str):
                 has_pos = False
 
         # Abrir nueva posición
-        if not has_pos and signal.direction != "NONE" and signal.score >= 50:
+        if not has_pos and signal.direction != "NONE" and signal.score >= 40:
             if last_signal.get(symbol) == signal.direction:
-                return  # ya abrimos esta señal, no duplicar
+                return  # ya está abierta esta señal
 
             balance = await exchange.get_balance()
             if balance < 5:
-                log.warning(f"Balance insuficiente: {balance} USDT")
                 await tg(f"⚠️ Balance insuficiente: `{balance:.2f} USDT`")
                 return
 
             qty = await calc_qty(exchange, symbol, balance, signal.entry, signal.sl)
             if qty <= 0:
-                log.warning(f"{symbol}: qty=0, SL muy cerca del entry")
+                log.warning(f"{symbol}: qty=0")
                 return
 
             await exchange.set_leverage(symbol, LEVERAGE)
 
-            side = "BUY" if signal.direction=="LONG" else "SELL"
+            side = "BUY" if signal.direction == "LONG" else "SELL"
             await exchange.place_order(
                 symbol=symbol, side=side,
                 position_side=signal.direction,
@@ -615,18 +663,18 @@ async def trade_coin(symbol: str):
                 take_profit=signal.tp,
             )
 
-            emoji = "🟢" if signal.direction=="LONG" else "🔴"
             risk_usd = abs(signal.entry - signal.sl) * qty
+            emoji = "🟢" if signal.direction == "LONG" else "🔴"
             await tg(
                 f"{emoji} *{signal.direction} ABIERTO*\n"
                 f"Par: `{symbol}`\n"
                 f"Entry: `{signal.entry:.6f}`\n"
-                f"SL: `{signal.sl:.6f}`  TP: `{signal.tp:.6f}`\n"
-                f"Qty: `{qty}`  Score: `{signal.score}/100`\n"
-                f"Riesgo: `~{risk_usd:.2f} USDT`\n"
+                f"SL:    `{signal.sl:.6f}`\n"
+                f"TP:    `{signal.tp:.6f}` *(3R)*\n"
+                f"Qty:   `{qty}` | Score: `{signal.score}/100`\n"
+                f"Riesgo: `≈{risk_usd:.2f} USDT`\n"
                 f"{signal.note}"
             )
-            log.info(f"✅ ORDEN ABIERTA {signal.direction} {symbol} qty={qty}")
             last_signal[symbol] = signal.direction
 
         elif signal.direction == "NONE":
@@ -634,20 +682,23 @@ async def trade_coin(symbol: str):
 
     except Exception as e:
         log.error(f"trade_coin {symbol}: {e}", exc_info=True)
-        # No enviar al telegram cada error de coin individual para no spamear
 
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
 
 async def main():
-    log.info("🚀 Sniper Bot V26.1 — Iniciando...")
+    log.info("🚀 Sniper Bot V26.1 Fix-v4 — Arrancando...")
     await tg(
-        "🟢 *Sniper Bot V26.1 ACTIVO*\n"
+        "🟢 *Sniper Bot V26.1 — Fix v4 ACTIVO*\n"
         f"Timeframe: `{TIMEFRAME}`\n"
-        f"Leverage: `{LEVERAGE}x`\n"
-        f"Riesgo/trade: `{MAX_RISK_PCT}%`\n"
-        f"Score mínimo: `{SCORE_THRESHOLD}/100`\n"
-        f"Vol mínimo: `${MIN_VOL_USDT/1e6:.0f}M`\n"
+        f"Leverage:  `{LEVERAGE}x`\n"
+        f"Riesgo:    `{MAX_RISK_PCT}%/trade`\n"
+        f"Score min: `{SCORE_THRESHOLD}/100`\n"
+        f"Vol min:   `${MIN_VOL_USDT/1e6:.0f}M` *(desde velas)*\n"
         f"Whitelist: `{'ON' if USE_WHITELIST else 'OFF'}`\n"
-        f"Scan cada: `{SCAN_INTERVAL//60}min`"
+        f"Scan:      `cada {SCAN_INTERVAL//60}min`"
     )
     await asyncio.gather(scanner_loop(), trading_loop())
 
