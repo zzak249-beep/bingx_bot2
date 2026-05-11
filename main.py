@@ -155,26 +155,75 @@ class BingXClient:
 
     async def get_balance(self):
         d = await self._get("/openApi/swap/v2/user/balance")
-        for a in d["data"]["balance"]:
-            if a["asset"] == "USDT":
+        raw = d.get("data", d)
+        log.info(f"[DEBUG] Balance raw: {str(raw)[:400]}")
+        # Aplanar cualquier estructura recursivamente hasta encontrar un número
+        def extract_balance(obj, depth=0):
+            if depth > 5: return None
+            if isinstance(obj, (int, float)):
+                return float(obj)
+            if isinstance(obj, str):
+                try: return float(obj)
+                except: return None
+            if isinstance(obj, dict):
+                # Buscar campos conocidos primero
                 for f in ("availableMargin","available","free","equity"):
-                    v = a.get(f)
+                    v = obj.get(f)
                     if v is not None:
-                        bal = float(v)
-                        log.info(f"Balance: {bal:.2f} USDT")
-                        return bal
+                        try: return float(v)
+                        except: pass
+                # Si tiene "balance" como sub-objeto
+                bal_obj = obj.get("balance")
+                if bal_obj is not None:
+                    r = extract_balance(bal_obj, depth+1)
+                    if r is not None and r > 0: return r
+                # Si tiene "asset" y es USDT
+                if obj.get("asset","") == "USDT":
+                    for f in ("availableMargin","available","free","equity","balance"):
+                        v = obj.get(f)
+                        if v is not None:
+                            try: return float(v)
+                            except: pass
+            if isinstance(obj, list):
+                for item in obj:
+                    r = extract_balance(item, depth+1)
+                    if r is not None and r >= 0: return r
+            return None
+        bal = extract_balance(raw)
+        if bal is not None and bal >= 0:
+            log.info(f"Balance: {bal:.2f} USDT")
+            return bal
+        log.error(f"Balance no encontrado en: {str(raw)[:300]}")
         return 0.0
+
+    def _parse_positions(self, data) -> list:
+        """Parsea posiciones de cualquier formato BingX."""
+        if data is None: return []
+        if isinstance(data, list): items = data
+        elif isinstance(data, dict):
+            items = data.get("positions", data.get("list", data.get("data", [])))
+            if isinstance(items, dict): items = [items]
+        else: return []
+        result = []
+        for p in items:
+            if not isinstance(p, dict): continue
+            try:
+                amt = float(p.get("positionAmt", p.get("positionAmount", 0)))
+                if abs(amt) > 0: result.append(p)
+            except: continue
+        return result
 
     async def get_position(self, symbol):
         d = await self._get("/openApi/swap/v2/user/positions",{"symbol":symbol})
-        ps = [p for p in d.get("data",[]) if abs(float(p.get("positionAmt",0))) > 0]
-        return ps[0] if ps else None
+        log.info(f"[DEBUG] Pos raw {symbol}: {str(d)[:200]}")
+        return (self._parse_positions(d.get("data")) or [None])[0]
 
     async def get_all_positions(self):
         try:
             d = await self._get("/openApi/swap/v2/user/positions")
-            return [p for p in d.get("data",[]) if abs(float(p.get("positionAmt",0))) > 0]
-        except: return []
+            return self._parse_positions(d.get("data"))
+        except Exception as e:
+            log.warning(f"get_all_positions: {e}"); return []
 
     async def place_order(self, symbol, side, position_side, qty,
                           stop_loss=None, take_profit=None, reduce_only=False):
