@@ -111,7 +111,7 @@ class BingXClient:
         """
         p = {k: str(v) for k, v in params.items() if k != "signature"}
         # ← SIN sorted() — orden de inserción del dict (Python 3.7+)
-        q = urllib.parse.urlencode(p.items())
+        q = urllib.parse.urlencode(list(p.items()))  # list() requerido en Python 3.12
         sig = hmac.new(
             BINGX_API_SECRET.encode("utf-8"),
             q.encode("utf-8"),
