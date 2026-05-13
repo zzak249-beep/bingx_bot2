@@ -558,10 +558,30 @@ async def run_diagnostics():
         lines.append(f"❌ *Balance = 0* — parsing fallido o cuenta vacía")
         lines.append(f"⚠️ Asegúrate de tener fondos en BingX *Futuros* (no spot)")
 
-    # 3. Test posiciones
+    # 3. Test posiciones con detalle
     try:
         positions = await exchange.get_all_positions()
-        lines.append(f"✅ *Posiciones abiertas:* `{len(positions)}`")
+        n = len(positions)
+        bloq = n >= MAX_POSITIONS
+        icon = "🔴" if bloq else "✅"
+        lines.append(f"{icon} *Posiciones abiertas:* `{n}/{MAX_POSITIONS}`")
+        if bloq:
+            lines.append(f"⛔ *BLOQUEADO — {n} pos >= MAX={MAX_POSITIONS}*")
+            lines.append(f"   → Sube MAX_POSITIONS en Railway")
+        total_unr = 0.0
+        for pos in positions:
+            sym = pos.get("symbol","?")
+            amt = float(pos.get("positionAmt", pos.get("size",0)))
+            avg = float(pos.get("avgPrice",    pos.get("entryPrice",0)))
+            cur = float(pos.get("markPrice",   pos.get("currentPrice",0)))
+            unr = float(pos.get("unrealizedProfit", pos.get("unRealizedProfit",0)))
+            total_unr += unr
+            direction = "LONG" if amt>0 else "SHORT"
+            pnl_pct = ((cur-avg)/avg*100) if amt>0 else ((avg-cur)/avg*100)
+            e2 = "🟢" if unr>=0 else "🔴"
+            lines.append(f"  {e2} {sym} {direction} {pnl_pct:+.1f}% ({unr:+.2f}$)")
+        if positions:
+            lines.append(f"  Total PnL: {total_unr:+.2f} USDT")
     except Exception as e:
         lines.append(f"❌ *Posiciones ERROR:* `{e}`")
 
