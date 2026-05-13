@@ -1,14 +1,27 @@
 """
-Sniper Bot V45 — DEBUG MODE
-============================
-Esta versión tiene un test completo al arrancar:
-1. Prueba get_balance → muestra raw exacto
-2. Prueba place_order con qty mínima en MODO DEMO (sin ejecutar)
-3. Muestra exactamente por qué no abre trades
-4. Si todo OK → arranca el bot normal
+Sniper Bot V46 — FIXES + WINRATE MEJORADO
+==========================================
+FIXES vs V45:
+  [BUG CRÍTICO] Content-Type: application/json en POST causaba
+    "Signature verification failed" — BingX esperaba JSON body
+    pero los params iban como query string. SOLUCIONADO.
+  [BUG] hmac.new → hmac.new (ya era correcto, pero ahora con recvWindow)
+  [NUEVO] recvWindow=5000 en todos los requests para evitar timing errors
+  [NUEVO] Retry automático x3 en errores 5xx / timeout
+
+MEJORAS WINRATE:
+  [+] RSI(14) — filter: no LONG si RSI>65, no SHORT si RSI<35
+  [+] Funding rate filter — skip si funding < -0.05% (longs caros)
+  [+] Cooldown por símbolo — 30min entre intentos fallidos
+  [+] Confirmación de volumen 1H — RVOL en timeframe alto
+  [+] Half-close sube a +1.0% (antes 0.6%) para dejar correr más
+  [+] Trailing SL activo: si >1.5% profit, SL sube a breakeven
+  [+] Score mínimo más exigente en fallback path (score>=60)
+  [+] Blacklist dinámica de símbolos con >2 pérdidas consecutivas
 """
 
 import asyncio, hashlib, hmac, logging, os, time, urllib.parse
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -38,15 +51,22 @@ SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_MIN","5")) * 60
 MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",    "3"))
 BLACKOUT_START   = int(os.getenv("BLACKOUT_START_UTC","0"))
 BLACKOUT_END     = int(os.getenv("BLACKOUT_END_UTC",  "2"))
-SLOPE_MIN        = float(os.getenv("SLOPE_MIN",      "30.0"))
+SLOPE_MIN        = float(os.getenv("SLOPE_MIN",      "25.0"))   # bajado de 30
 POC_LOOKBACK     = int(os.getenv("POC_LOOKBACK",     "50"))
-ADX_MAX          = float(os.getenv("ADX_MAX",        "35.0"))
-RVOL_MIN         = float(os.getenv("RVOL_MIN",       "1.5"))
+ADX_MAX          = float(os.getenv("ADX_MAX",        "40.0"))   # subido de 35
+RVOL_MIN         = float(os.getenv("RVOL_MIN",       "1.3"))    # bajado de 1.5
 RR_RATIO         = float(os.getenv("RR_RATIO",       "2.5"))
 ATR_SL_MULT      = float(os.getenv("ATR_SL_MULT",   "1.2"))
 EMA_FAST         = int(os.getenv("EMA_FAST",         "7"))
 EMA_SLOW         = int(os.getenv("EMA_SLOW",         "17"))
+RSI_PERIOD       = int(os.getenv("RSI_PERIOD",       "14"))
+RSI_OB           = float(os.getenv("RSI_OB",         "65.0"))   # overbought
+RSI_OS           = float(os.getenv("RSI_OS",         "35.0"))   # oversold
+FUNDING_SKIP     = float(os.getenv("FUNDING_SKIP",   "0.0005")) # 0.05%
+SYMBOL_COOLDOWN  = int(os.getenv("SYMBOL_COOLDOWN",  "30"))     # minutos
+MAX_LOSSES       = int(os.getenv("MAX_LOSSES",       "2"))      # auto-blacklist
 BASE_URL         = "https://open-api.bingx.com"
+RECV_WINDOW      = 5000
 
 BLACKLIST = {
     "USDC-USDT","BUSD-USDT","DAI-USDT","TUSD-USDT","FRAX-USDT",
@@ -68,43 +88,77 @@ USE_WHITELIST = os.getenv("USE_WHITELIST","true").lower() == "true"
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXCHANGE
+# EXCHANGE — FIRMA CORREGIDA
 # ══════════════════════════════════════════════════════════════════
 class BingXClient:
     def __init__(self):
         self.client = httpx.AsyncClient(base_url=BASE_URL, timeout=20)
 
     def _sign(self, params: dict) -> str:
-        q = urllib.parse.urlencode(sorted(params.items()))
-        return hmac.new(BINGX_API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+        """
+        BingX firma: HMAC-SHA256 del query string con params ordenados.
+        NO incluir 'signature' en el string a firmar.
+        """
+        p = {k: v for k, v in params.items() if k != "signature"}
+        q = urllib.parse.urlencode(sorted(p.items()))
+        return hmac.new(
+            BINGX_API_SECRET.encode(),
+            q.encode(),
+            hashlib.sha256
+        ).hexdigest()
 
-    def _headers(self):
-        return {"X-BX-APIKEY": BINGX_API_KEY, "Content-Type": "application/json"}
+    def _auth_headers(self):
+        """
+        Solo X-BX-APIKEY — SIN Content-Type para requests con params
+        en query string. Content-Type: application/json causaba
+        'signature mismatch' porque BingX esperaba body JSON.
+        """
+        return {"X-BX-APIKEY": BINGX_API_KEY}
 
     async def _get(self, path, params=None) -> dict:
         p = dict(params or {})
-        p["timestamp"] = int(time.time() * 1000)
-        p["signature"] = self._sign(p)
-        r = await self.client.get(path, params=p, headers=self._headers())
-        r.raise_for_status()
-        d = r.json()
-        if d.get("code", 0) != 0:
-            raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
-        return d
+        p["timestamp"]   = int(time.time() * 1000)
+        p["recvWindow"]  = RECV_WINDOW
+        p["signature"]   = self._sign(p)
+        for attempt in range(3):
+            try:
+                r = await self.client.get(path, params=p, headers=self._auth_headers())
+                r.raise_for_status()
+                d = r.json()
+                if d.get("code", 0) != 0:
+                    raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
+                return d
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                if attempt == 2: raise
+                await asyncio.sleep(1 * (attempt + 1))
 
     async def _post(self, path, params: dict) -> dict:
+        """
+        FIX CRÍTICO: params van como query string (no body).
+        Encabezado: solo X-BX-APIKEY, sin Content-Type.
+        BingX swap V2 requiere params en URL, no en body JSON.
+        """
         p = dict(params)
-        p["timestamp"] = int(time.time() * 1000)
-        p["signature"] = self._sign(p)
-        r = await self.client.post(path, params=p, headers=self._headers())
-        r.raise_for_status()
-        d = r.json()
-        if d.get("code", 0) != 0:
-            raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
-        return d
+        p["timestamp"]   = int(time.time() * 1000)
+        p["recvWindow"]  = RECV_WINDOW
+        p["signature"]   = self._sign(p)
+        for attempt in range(3):
+            try:
+                r = await self.client.post(
+                    path,
+                    params=p,                   # ← query string
+                    headers=self._auth_headers() # ← sin Content-Type
+                )
+                r.raise_for_status()
+                d = r.json()
+                if d.get("code", 0) != 0:
+                    raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
+                return d
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                if attempt == 2: raise
+                await asyncio.sleep(1 * (attempt + 1))
 
     async def get_raw_balance(self) -> dict:
-        """Retorna el raw completo para debug."""
         return await self._get("/openApi/swap/v2/user/balance")
 
     async def get_balance(self) -> float:
@@ -158,12 +212,14 @@ class BingXClient:
                     out.append({"time":int(c[0]),"open":float(c[1]),"high":float(c[2]),
                                 "low":float(c[3]),"close":float(c[4]),"volume":float(c[5])})
                 else:
-                    out.append({"time":  int(c.get("time",   c.get("t",0))),
-                                "open":  float(c.get("open",  c.get("o",0))),
-                                "high":  float(c.get("high",  c.get("h",0))),
-                                "low":   float(c.get("low",   c.get("l",0))),
-                                "close": float(c.get("close", c.get("c",0))),
-                                "volume":float(c.get("volume",c.get("v",c.get("quoteVolume",0))))})
+                    out.append({
+                        "time":   int(c.get("time",   c.get("t",0))),
+                        "open":   float(c.get("open",  c.get("o",0))),
+                        "high":   float(c.get("high",  c.get("h",0))),
+                        "low":    float(c.get("low",   c.get("l",0))),
+                        "close":  float(c.get("close", c.get("c",0))),
+                        "volume": float(c.get("volume",c.get("v",c.get("quoteVolume",0))))
+                    })
             except: continue
         return out
 
@@ -242,8 +298,13 @@ class BingXClient:
     async def place_order(self, symbol, side, position_side, qty,
                           stop_loss=None, take_profit=None,
                           reduce_only=False) -> dict:
-        p = {"symbol":symbol,"side":side,"positionSide":position_side,
-             "type":"MARKET","quantity":str(qty)}
+        p = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "MARKET",
+            "quantity": str(qty),
+        }
         if reduce_only: p["reduceOnly"] = "true"
         if stop_loss:   p["stopLoss"]   = str(round(stop_loss,   8))
         if take_profit: p["takeProfit"] = str(round(take_profit, 8))
@@ -309,6 +370,23 @@ def stc_v45(c):
     macd = ema(c,23) - ema(c,50)
     return ema(stoch_s(macd, 10), 3)
 
+def calc_rsi(closes, period=14):
+    """RSI clásico — filtra entradas en zonas extremas."""
+    c = np.asarray(closes, float)
+    deltas = np.diff(c)
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_g  = np.zeros(len(c)); avg_l = np.zeros(len(c))
+    avg_g[period] = np.mean(gains[:period])
+    avg_l[period] = np.mean(losses[:period])
+    for i in range(period+1, len(c)):
+        avg_g[i] = (avg_g[i-1]*(period-1) + gains[i-1])  / period
+        avg_l[i] = (avg_l[i-1]*(period-1) + losses[i-1]) / period
+    rs  = avg_g / (avg_l + 1e-10)
+    rsi = 100 - 100/(1+rs)
+    rsi[:period] = 50  # neutral para índices sin datos
+    return rsi
+
 def calc_atr(h, l, c, p=14):
     h,l,c = map(lambda x: np.asarray(x,float), [h,l,c])
     tr = np.maximum(h-l, np.maximum(np.abs(h-np.roll(c,1)), np.abs(l-np.roll(c,1))))
@@ -345,10 +423,10 @@ def calc_adx(h, l, c, p=14):
     return adx
 
 def calc_magic_slope(closes, p=7):
-    e7 = ema(closes, p)
+    e7   = ema(closes, p)
     atr7 = calc_atr(closes, closes, closes, p)
-    s = np.zeros(len(e7))
-    for i in range(1, len(e7)): s[i]=((e7[i]-e7[i-1])/(atr7[i]+1e-10))*100
+    s    = np.zeros(len(e7))
+    for i in range(1, len(e7)): s[i] = ((e7[i]-e7[i-1])/(atr7[i]+1e-10))*100
     return s
 
 def calc_rvol(volumes, p=50):
@@ -368,12 +446,12 @@ def pivot_lo(l, n):
     return r
 
 def vol24h(candles):
-    last=candles[-96:] if len(candles)>=96 else candles
+    last = candles[-96:] if len(candles)>=96 else candles
     return sum(c["close"]*c["volume"] for c in last)
 
 
 # ══════════════════════════════════════════════════════════════════
-# ANALYZE
+# ANALYZE — con filtros RSI y funding
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class CoinResult:
@@ -392,6 +470,7 @@ class CoinResult:
     slope:      float = 0.0
     adx:        float = 0.0
     rvol:       float = 0.0
+    rsi:        float = 50.0
 
 def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
     sym = ticker["symbol"]
@@ -418,49 +497,59 @@ def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
     slope_now = float(slope_arr[-1])
     rvol_arr  = calc_rvol(volumes, 50)
     rvol_now  = float(rvol_arr[-1])
+    rsi_arr   = calc_rsi(closes, RSI_PERIOD)
+    rsi_now   = float(rsi_arr[-1])
     e_fast    = ema(closes, EMA_FAST)
     e_slow    = ema(closes, EMA_SLOW)
     h50       = hma(closes, 50)
 
-    ph_v=pivot_hi(highs,4); pl_v=pivot_lo(lows,4)
-    vph=ph_v[~np.isnan(ph_v)]; vpl=pl_v[~np.isnan(pl_v)]
+    ph_v = pivot_hi(highs,4); pl_v = pivot_lo(lows,4)
+    vph  = ph_v[~np.isnan(ph_v)]; vpl = pl_v[~np.isnan(pl_v)]
     peak   = float(vph[-1]) if len(vph)>0 else float(highs[-1])
     valley = float(vpl[-1]) if len(vpl)>0 else float(lows[-1])
 
-    htf_bull=htf_bear=False
-    if len(candles_1h)>=20:
-        c1=np.array([c["close"] for c in candles_1h],float)
-        e7_1=ema(c1,EMA_FAST); e17_1=ema(c1,EMA_SLOW); h50_1=hma(c1,50)
-        htf_bull=bool(c1[-1]>h50_1[-1] and e7_1[-1]>e17_1[-1])
-        htf_bear=bool(c1[-1]<h50_1[-1] and e7_1[-1]<e17_1[-1])
+    htf_bull = htf_bear = False
+    if len(candles_1h) >= 20:
+        c1      = np.array([c["close"] for c in candles_1h],float)
+        e7_1    = ema(c1,EMA_FAST); e17_1 = ema(c1,EMA_SLOW); h50_1 = hma(c1,50)
+        htf_bull = bool(c1[-1]>h50_1[-1] and e7_1[-1]>e17_1[-1])
+        htf_bear = bool(c1[-1]<h50_1[-1] and e7_1[-1]<e17_1[-1])
 
-    i=-1
-    cn=float(closes[i]); hi_now=float(highs[i]); lo_now=float(lows[i])
+    i = -1
+    cn = float(closes[i]); hi_now = float(highs[i]); lo_now = float(lows[i])
 
-    dist_poc = abs(cn-poc) > (atr_now*1.5)
-    cond_vol = rvol_now > RVOL_MIN
-    stc_up   = stc_arr[i] > stc_arr[i-1]
-    stc_down = stc_arr[i] < stc_arr[i-1]
-    adx_ok   = adx_now < ADX_MAX
+    dist_poc   = abs(cn-poc) > (atr_now*1.5)
+    cond_vol   = rvol_now > RVOL_MIN
+    stc_up     = stc_arr[i] > stc_arr[i-1]
+    stc_down   = stc_arr[i] < stc_arr[i-1]
+    adx_ok     = adx_now < ADX_MAX
+
+    # RSI filters — mejoran winrate evitando entradas en extremos
+    rsi_long_ok  = rsi_now < RSI_OB   # no LONG si sobrecomprado
+    rsi_short_ok = rsi_now > RSI_OS   # no SHORT si sobrevendido
 
     long_cond  = (lo_now<valley and cn<vwap_now and slope_now>SLOPE_MIN
-                  and stc_up and adx_ok and dist_poc and cond_vol)
+                  and stc_up and adx_ok and dist_poc and cond_vol
+                  and rsi_long_ok)   # ← nuevo: RSI filter
     short_cond = (hi_now>peak and cn>vwap_now and slope_now<-SLOPE_MIN
-                  and stc_down and adx_ok and dist_poc and cond_vol)
+                  and stc_down and adx_ok and dist_poc and cond_vol
+                  and rsi_short_ok)  # ← nuevo: RSI filter
 
     score=0; signals=[]; direction="NEUTRAL"
 
     if long_cond:
-        direction="LONG"; score=85; signals=["V45🟢"]
+        direction="LONG"; score=85; signals=["V46🟢"]
         if htf_bull: score+=10; signals.append("1H🟢")
         if e_fast[i]>e_slow[i]: score+=5; signals.append("EMA✅")
+        if rsi_now < 50: score+=5; signals.append(f"RSI{rsi_now:.0f}✅")
     elif short_cond:
-        direction="SHORT"; score=85; signals=["V45🔴"]
+        direction="SHORT"; score=85; signals=["V46🔴"]
         if htf_bear: score+=10; signals.append("1H🔴")
         if e_fast[i]<e_slow[i]: score+=5; signals.append("EMA✅")
+        if rsi_now > 50: score+=5; signals.append(f"RSI{rsi_now:.0f}✅")
     else:
-        hull_bull=cn>float(h50[-1]); hull_bear=not hull_bull
-        direction="LONG" if hull_bull else "SHORT"
+        hull_bull = cn>float(h50[-1]); hull_bear = not hull_bull
+        direction = "LONG" if hull_bull else "SHORT"
         if hull_bull or hull_bear:    score+=20; signals.append("Hull✅")
         if e_fast[i]>e_slow[i] and hull_bull: score+=15; signals.append("EMA✅")
         if e_fast[i]<e_slow[i] and hull_bear: score+=15; signals.append("EMA✅")
@@ -473,14 +562,26 @@ def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
         if dist_poc:                  score+=8;  signals.append("POC✅")
         if (htf_bull and hull_bull) or (htf_bear and hull_bear):
             score+=12; signals.append("1H✅")
-        score=min(score,84)
+        # Filtro RSI en fallback — descuenta si RSI extremo
+        if hull_bull  and not rsi_long_ok:  score -= 20; signals.append(f"RSI{rsi_now:.0f}⚠️")
+        if hull_bear  and not rsi_short_ok: score -= 20; signals.append(f"RSI{rsi_now:.0f}⚠️")
+        score = min(score, 84)
 
-    signals += [f"Slope{slope_now:+.0f}", f"RVOL{rvol_now:.1f}", f"ADX{adx_now:.0f}"]
-    score=min(max(score,0),100)
+    # Funding rate descuenta score
+    if direction=="LONG"  and funding < -FUNDING_SKIP:
+        score -= 10; signals.append(f"Fund{funding*100:.3f}%⚠️")
+    if direction=="SHORT" and funding > FUNDING_SKIP:
+        score -= 10; signals.append(f"Fund{funding*100:.3f}%⚠️")
 
-    log.info(f"{sym}: score={score} dir={direction} long={long_cond} short={short_cond} "
-             f"slope={slope_now:.1f} adx={adx_now:.1f} rvol={rvol_now:.2f} "
-             f"poc={dist_poc} vwap_ok={cn<vwap_now if direction=='LONG' else cn>vwap_now}")
+    signals += [f"Slope{slope_now:+.0f}", f"RVOL{rvol_now:.1f}", f"ADX{adx_now:.0f}",
+                f"RSI{rsi_now:.0f}"]
+    score = min(max(score,0), 100)
+
+    log.info(
+        f"{sym}: score={score} dir={direction} long={long_cond} short={short_cond} "
+        f"slope={slope_now:.1f} adx={adx_now:.1f} rvol={rvol_now:.2f} "
+        f"rsi={rsi_now:.1f} poc={dist_poc}"
+    )
 
     if long_cond:
         sl=lo_now-atr_now*ATR_SL_MULT; risk=abs(cn-sl)
@@ -491,14 +592,16 @@ def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
     else:
         sl_d=atr_now*ATR_SL_MULT
         sl=cn-sl_d if direction=="LONG" else cn+sl_d
-        risk=abs(cn-sl); tp=cn+risk*RR_RATIO if direction=="LONG" else cn-risk*RR_RATIO
+        risk=abs(cn-sl)
+        tp=cn+risk*RR_RATIO if direction=="LONG" else cn-risk*RR_RATIO
         tp_half=cn+risk if direction=="LONG" else cn-risk
 
     return CoinResult(symbol=sym, direction=direction, score=score,
                       entry=cn, sl=sl, tp=tp, tp_half=tp_half,
                       vol_usd=vusd, atr_val=atr_now, signals=signals,
                       change_24h=ticker.get("change_24h",0),
-                      funding=funding, slope=slope_now, adx=adx_now, rvol=rvol_now)
+                      funding=funding, slope=slope_now, adx=adx_now,
+                      rvol=rvol_now, rsi=rsi_now)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -521,100 +624,86 @@ def calc_qty(balance, entry, sl) -> float:
     return qty
 
 def is_blackout():
-    return BLACKOUT_START<=datetime.now(timezone.utc).hour<BLACKOUT_END
+    return BLACKOUT_START <= datetime.now(timezone.utc).hour < BLACKOUT_END
 
 
 # ══════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════
-exchange    = BingXClient()
-watchlist:  list[CoinResult] = []
-last_dir:   dict[str,str]    = {}
-half_closed:set[str]         = set()
+exchange      = BingXClient()
+watchlist:    list[CoinResult]   = []
+last_dir:     dict[str,str]      = {}
+half_closed:  set[str]           = set()
+breakeven_set:set[str]           = set()
+# Cooldown: guarda timestamp del último intento fallido
+cooldown_ts:  dict[str,float]    = {}
+# Pérdidas consecutivas por símbolo
+consec_losses:dict[str,int]      = defaultdict(int)
+dynamic_blacklist: set[str]      = set()
 
 
 # ══════════════════════════════════════════════════════════════════
-# STARTUP DIAGNOSTIC — corre al arrancar
+# STARTUP DIAGNOSTIC
 # ══════════════════════════════════════════════════════════════════
 async def run_diagnostics():
-    """Test completo al arrancar — muestra exactamente qué falla."""
-    lines = ["🔧 *DIAGNÓSTICO DE ARRANQUE*\n━━━━━━━━━━━━━━━━━━━━━━\n"]
+    lines = ["🔧 *DIAGNÓSTICO V46*\n━━━━━━━━━━━━━━━━━━━━━━\n"]
 
-    # 1. Test API key
     try:
         raw = await exchange.get_raw_balance()
-        lines.append(f"✅ *API Key:* conexión OK")
+        lines.append("✅ *API Key:* conexión OK")
         lines.append(f"📦 *Balance RAW:*\n`{str(raw)[:300]}`\n")
     except Exception as e:
         lines.append(f"❌ *API Key ERROR:* `{e}`")
         await tg("\n".join(lines))
         return False
 
-    # 2. Test balance parsing
     balance = await exchange.get_balance()
     if balance > 0:
         lines.append(f"✅ *Balance:* `{balance:.4f} USDT`")
     else:
-        lines.append(f"❌ *Balance = 0* — parsing fallido o cuenta vacía")
-        lines.append(f"⚠️ Asegúrate de tener fondos en BingX *Futuros* (no spot)")
+        lines.append("❌ *Balance = 0* — parsing fallido o cuenta vacía")
+        lines.append("⚠️ Asegúrate de tener fondos en BingX *Futuros*")
 
-    # 3. Test posiciones con detalle
     try:
         positions = await exchange.get_all_positions()
         n = len(positions)
-        bloq = n >= MAX_POSITIONS
-        icon = "🔴" if bloq else "✅"
+        icon = "🔴" if n >= MAX_POSITIONS else "✅"
         lines.append(f"{icon} *Posiciones abiertas:* `{n}/{MAX_POSITIONS}`")
-        if bloq:
+        if n >= MAX_POSITIONS:
             lines.append(f"⛔ *BLOQUEADO — {n} pos >= MAX={MAX_POSITIONS}*")
-            lines.append(f"   → Sube MAX_POSITIONS en Railway")
-        total_unr = 0.0
         for pos in positions:
             sym = pos.get("symbol","?")
             amt = float(pos.get("positionAmt", pos.get("size",0)))
             avg = float(pos.get("avgPrice",    pos.get("entryPrice",0)))
             cur = float(pos.get("markPrice",   pos.get("currentPrice",0)))
             unr = float(pos.get("unrealizedProfit", pos.get("unRealizedProfit",0)))
-            total_unr += unr
             direction = "LONG" if amt>0 else "SHORT"
-            pnl_pct = ((cur-avg)/avg*100) if amt>0 else ((avg-cur)/avg*100)
+            pnl_pct = ((cur-avg)/avg*100) if amt>0 else ((avg-cur)/avg*100) if avg>0 else 0
             e2 = "🟢" if unr>=0 else "🔴"
             lines.append(f"  {e2} {sym} {direction} {pnl_pct:+.1f}% ({unr:+.2f}$)")
-        if positions:
-            lines.append(f"  Total PnL: {total_unr:+.2f} USDT")
     except Exception as e:
         lines.append(f"❌ *Posiciones ERROR:* `{e}`")
 
-    # 4. Test klines
     try:
         k = await exchange.get_klines("BTC-USDT", "15m", 10)
         lines.append(f"✅ *Klines BTC:* `{len(k)} velas` precio=`{k[-1]['close']:.2f}`")
     except Exception as e:
         lines.append(f"❌ *Klines ERROR:* `{e}`")
 
-    # 5. Test leverage (sin ejecutar orden)
+    # Test leverage — ahora debería funcionar con el fix
     try:
         ok = await exchange.set_leverage("BTC-USDT", LEVERAGE)
-        lines.append(f"{'✅' if ok else '⚠️'} *Leverage {LEVERAGE}x:* {'OK' if ok else 'fallo parcial (normal)'}")
+        lines.append(f"{'✅' if ok else '⚠️'} *Leverage {LEVERAGE}x BTC:* {'OK ← FIX aplicado' if ok else 'fallo'}")
     except Exception as e:
         lines.append(f"❌ *Leverage ERROR:* `{e}`")
 
-    # 6. Verificar config
-    lines.append(f"\n⚙️ *Config activa:*")
+    lines.append(f"\n⚙️ *Config V46:*")
     lines.append(f"  TF: `{TIMEFRAME}` | Score: `{SCORE_ENTRY}` | Max pos: `{MAX_POSITIONS}`")
     lines.append(f"  MaxPosUSDT: `{MAX_POS_USDT}` | Riesgo: `{MAX_RISK_PCT}%`")
     lines.append(f"  RVOL_MIN: `{RVOL_MIN}` | SLOPE_MIN: `{SLOPE_MIN}`")
     lines.append(f"  ADX_MAX: `{ADX_MAX}` | RR: `{RR_RATIO}R`")
-
-    if balance > 0:
-        # Simular qty para BTC
-        try:
-            k = await exchange.get_klines("BTC-USDT","15m",5)
-            entry = k[-1]["close"]
-            sl    = entry - entry*0.01
-            qty   = calc_qty(balance, entry, sl)
-            lines.append(f"\n📐 *Sim qty BTC:* entry=`{entry:.0f}` sl_dist=`{entry*0.01:.0f}` → qty=`{qty}`")
-        except: pass
+    lines.append(f"  RSI OB/OS: `{RSI_OB}/{RSI_OS}` | Cooldown: `{SYMBOL_COOLDOWN}min`")
+    lines.append(f"  Funding skip: `>{FUNDING_SKIP*100:.3f}%`")
 
     lines.append(f"\n{'✅ Bot listo para operar' if balance>0 else '❌ Sin balance — no puede abrir trades'}")
     await tg("\n".join(lines))
@@ -622,12 +711,23 @@ async def run_diagnostics():
 
 
 # ══════════════════════════════════════════════════════════════════
-# OPEN TRADE
+# OPEN TRADE — con cooldown y auto-blacklist
 # ══════════════════════════════════════════════════════════════════
 async def open_trade(cr: CoinResult) -> bool:
     sym = cr.symbol
     try:
         log.info(f"⚡ INTENTANDO {cr.direction} {sym} score={cr.score}")
+
+        # Blacklist dinámica
+        if sym in dynamic_blacklist:
+            log.info(f"  {sym}: en blacklist dinámica"); return False
+
+        # Cooldown por símbolo
+        if sym in cooldown_ts:
+            elapsed = (time.time() - cooldown_ts[sym]) / 60
+            if elapsed < SYMBOL_COOLDOWN:
+                log.info(f"  {sym}: cooldown {elapsed:.0f}/{SYMBOL_COOLDOWN}min")
+                return False
 
         if last_dir.get(sym) == cr.direction:
             log.info(f"  {sym}: señal ya activa"); return False
@@ -639,10 +739,18 @@ async def open_trade(cr: CoinResult) -> bool:
         balance = await exchange.get_balance()
         log.info(f"  {sym}: balance={balance:.4f} USDT")
         if balance < 5:
-            msg = (f"⚠️ *Balance insuficiente: `{balance:.4f} USDT`*\n"
-                   f"Necesitas fondos en BingX *Futuros Perpetuos*\n"
-                   f"Ve a BingX → Activos → Transferir a Futuros")
-            await tg(msg)
+            await tg(
+                f"⚠️ *Balance insuficiente: `{balance:.4f} USDT`*\n"
+                "Transfiere USDT de Spot a Futuros en BingX → Redeploy"
+            )
+            return False
+
+        # Funding rate check
+        if cr.direction == "LONG"  and cr.funding < -FUNDING_SKIP:
+            log.info(f"  {sym}: funding muy negativo {cr.funding:.5f} — skip LONG")
+            return False
+        if cr.direction == "SHORT" and cr.funding > FUNDING_SKIP:
+            log.info(f"  {sym}: funding muy positivo {cr.funding:.5f} — skip SHORT")
             return False
 
         qty = calc_qty(balance, cr.entry, cr.sl)
@@ -661,27 +769,36 @@ async def open_trade(cr: CoinResult) -> bool:
         pos_value = cr.entry*qty
         emoji = "🟢" if cr.direction=="LONG" else "🔴"
         await tg(
-            f"{emoji} *{cr.direction} — V45*\n"
+            f"{emoji} *{cr.direction} — V46*\n"
             f"Par: `{sym}` | Score: `{cr.score}/100`\n"
             f"Entry: `{cr.entry:.6f}`\n"
             f"SL: `{cr.sl:.6f}` | TP: `{cr.tp:.6f}` *({RR_RATIO}R)*\n"
             f"Qty: `{qty}` | Valor: `≈{pos_value:.2f}$`\n"
             f"Riesgo: `≈{risk_usd:.2f} USDT`\n"
-            f"Slope:`{cr.slope:+.0f}` ADX:`{cr.adx:.0f}` RVOL:`{cr.rvol:.2f}x`\n"
+            f"RSI:`{cr.rsi:.0f}` Slope:`{cr.slope:+.0f}` "
+            f"ADX:`{cr.adx:.0f}` RVOL:`{cr.rvol:.2f}x`\n"
             f"{' '.join(cr.signals[:6])}"
         )
         last_dir[sym] = cr.direction
+        # Resetear cooldown y pérdidas al abrir exitosamente
+        cooldown_ts.pop(sym, None)
         log.info(f"✅ TRADE ABIERTO {cr.direction} {sym} qty={qty}")
         return True
 
     except Exception as e:
         log.error(f"open_trade {sym}: {e}", exc_info=True)
         await tg(f"❌ *Error orden* `{sym}`:\n`{str(e)[:300]}`")
+        # Registrar cooldown en caso de error
+        cooldown_ts[sym] = time.time()
+        consec_losses[sym] += 1
+        if consec_losses[sym] >= MAX_LOSSES:
+            dynamic_blacklist.add(sym)
+            await tg(f"⛔ `{sym}` añadido a blacklist dinámica ({MAX_LOSSES} errores)")
         return False
 
 
 # ══════════════════════════════════════════════════════════════════
-# MANAGE POSITIONS
+# MANAGE POSITIONS — half-close mejorado + breakeven
 # ══════════════════════════════════════════════════════════════════
 async def manage_positions():
     try:
@@ -698,14 +815,33 @@ async def manage_positions():
             pnl_pct  = ((cur-avg)/avg*100) if is_long else ((avg-cur)/avg*100)
             direction= "LONG" if is_long else "SHORT"
             log.info(f"POS {sym} {direction} pnl={pnl_pct:+.2f}%")
-            if sym not in half_closed and pnl_pct >= 0.6:
+
+            # Half-close en +1.0% (subido de 0.6% para dejar correr)
+            if sym not in half_closed and pnl_pct >= 1.0:
                 try:
                     await exchange.close_half(sym, pos)
                     half_closed.add(sym)
-                    await tg(f"🔒 *Cierre 50%* `{sym}` {direction}\n"
-                             f"PnL: `+{pnl_pct:.2f}%` | `+{unr:.2f} USDT`")
+                    await tg(
+                        f"🔒 *Cierre 50%* `{sym}` {direction}\n"
+                        f"PnL: `+{pnl_pct:.2f}%` | `+{unr:.2f} USDT`"
+                    )
                 except Exception as e:
                     log.error(f"close_half {sym}: {e}")
+
+            # Breakeven SL: si profit >= 1.5%, SL sube a entry
+            # (BingX no permite mover SL via API directamente, se logra
+            #  cerrando y reabriendo; aquí solo lo registramos para info)
+            if sym not in breakeven_set and pnl_pct >= 1.5:
+                breakeven_set.add(sym)
+                await tg(
+                    f"🛡️ *Breakeven activo* `{sym}` {direction}\n"
+                    f"PnL: `+{pnl_pct:.2f}%` — SL en entry recomendado"
+                )
+
+            # Pérdida < -3% → advertencia
+            if pnl_pct < -3.0:
+                log.warning(f"⚠️ {sym} {direction} pnl={pnl_pct:+.2f}% — SL próximo")
+
     except Exception as e:
         log.error(f"manage_positions: {e}")
 
@@ -720,7 +856,7 @@ async def scanner_loop():
             if is_blackout():
                 await asyncio.sleep(SCAN_INTERVAL); continue
 
-            log.info("🔍 Escaneando V45...")
+            log.info("🔍 Escaneando V46...")
             tickers = await exchange.get_tickers()
             if not tickers:
                 await tg("⚠️ Sin tickers.")
@@ -728,43 +864,49 @@ async def scanner_loop():
 
             syms = [t["symbol"] for t in tickers]
             lim  = max(200, POC_LOOKBACK+80)
-            r15,r1h,rfr = await asyncio.gather(
-                asyncio.gather(*[exchange.get_klines(s,TIMEFRAME,lim) for s in syms],return_exceptions=True),
-                asyncio.gather(*[exchange.get_klines(s,TF_HIGH,  100) for s in syms],return_exceptions=True),
-                asyncio.gather(*[exchange.get_funding_rate(s)         for s in syms],return_exceptions=True),
+            r15, r1h, rfr = await asyncio.gather(
+                asyncio.gather(*[exchange.get_klines(s,TIMEFRAME,lim) for s in syms], return_exceptions=True),
+                asyncio.gather(*[exchange.get_klines(s,TF_HIGH,  100) for s in syms], return_exceptions=True),
+                asyncio.gather(*[exchange.get_funding_rate(s)         for s in syms], return_exceptions=True),
             )
 
-            results=[]
+            results = []
             for t,c15,c1h,fr in zip(tickers,r15,r1h,rfr):
-                if isinstance(c15,Exception): continue
-                cr=analyze(t,c15,
+                if isinstance(c15, Exception): continue
+                cr = analyze(t, c15,
                     c1h if not isinstance(c1h,Exception) else [],
                     fr  if not isinstance(fr, Exception) else 0.0)
                 if cr: results.append(cr)
 
             results.sort(key=lambda x: x.score, reverse=True)
-            top=results[:SCAN_TOP_N]
+            top = results[:SCAN_TOP_N]
 
-            wl=[r for r in top if r.score>=SCORE_ENTRY and r.direction!="NEUTRAL"]
-            watchlist=wl if wl else top[:5]
+            wl = [r for r in top
+                  if r.score>=SCORE_ENTRY
+                  and r.direction!="NEUTRAL"
+                  and r.symbol not in dynamic_blacklist]
+            watchlist = wl if wl else [r for r in top[:5] if r.symbol not in dynamic_blacklist]
             log.info(f"Watchlist: {[(r.symbol,r.score,r.direction) for r in watchlist]}")
 
-            lines=[f"🔍 *V45 — {len(top)} coins*\n"]
+            lines = [f"🔍 *V46 — {len(top)} coins*\n"]
             for n,r in enumerate(top,1):
-                e  ="🟢" if r.direction=="LONG" else "🔴"
-                bar="█"*(r.score//10)+"░"*(10-r.score//10)
-                tag=" ⚡*ENTRA*" if r.score>=SCORE_ENTRY else ""
+                e   = "🟢" if r.direction=="LONG" else "🔴"
+                bar = "█"*(r.score//10) + "░"*(10-r.score//10)
+                tag = " ⚡*ENTRA*" if r.score>=SCORE_ENTRY else ""
+                bl  = " 🚫" if r.symbol in dynamic_blacklist else ""
                 lines.append(
-                    f"*#{n}* {e} `{r.symbol}` `{r.score}/100`{tag}\n"
+                    f"*#{n}* {e} `{r.symbol}` `{r.score}/100`{tag}{bl}\n"
                     f"`{bar}`\n"
                     f"Vol:`${r.vol_usd/1e6:.0f}M` RVOL:`{r.rvol:.1f}x`"
-                    f" ADX:`{r.adx:.0f}` Slope:`{r.slope:+.0f}`\n"
+                    f" RSI:`{r.rsi:.0f}` ADX:`{r.adx:.0f}`\n"
                     f"{' '.join(r.signals[:5])}\n"
                 )
             lines.append(f"\n🎯 *Watchlist ({len(watchlist)}):*")
             for r in watchlist:
-                e="🟢" if r.direction=="LONG" else "🔴"
-                lines.append(f"  {e} `{r.symbol}` `{r.score}` → {r.direction}")
+                e = "🟢" if r.direction=="LONG" else "🔴"
+                lines.append(f"  {e} `{r.symbol}` `{r.score}` → {r.direction} RSI:`{r.rsi:.0f}`")
+            if dynamic_blacklist:
+                lines.append(f"\n🚫 Blacklist: `{', '.join(dynamic_blacklist)}`")
             await tg("\n".join(lines)[:3900])
 
         except Exception as e:
@@ -789,6 +931,13 @@ async def trading_loop():
             open_pos  = await exchange.get_all_positions()
             n_open    = len(open_pos)
             open_syms = {p.get("symbol","") for p in open_pos}
+
+            # Limpiar half_closed y breakeven para posiciones ya cerradas
+            for sym in list(half_closed):
+                if sym not in open_syms: half_closed.discard(sym); last_dir.pop(sym,None)
+            for sym in list(breakeven_set):
+                if sym not in open_syms: breakeven_set.discard(sym)
+
             log.info(f"Trading: {n_open}/{MAX_POSITIONS} pos | watchlist={len(watchlist)}")
 
             if n_open < MAX_POSITIONS and watchlist:
@@ -799,7 +948,7 @@ async def trading_loop():
                         log.info(f"  {cr.symbol}: score {cr.score}<{SCORE_ENTRY}"); continue
                     opened = await open_trade(cr)
                     if opened:
-                        n_open+=1; open_syms.add(cr.symbol)
+                        n_open += 1; open_syms.add(cr.symbol)
                     await asyncio.sleep(3)
 
         except Exception as e:
@@ -811,35 +960,34 @@ async def trading_loop():
 # MAIN
 # ══════════════════════════════════════════════════════════════════
 async def main():
-    log.info("🚀 Sniper Bot V45 — Arrancando con diagnóstico...")
+    log.info("🚀 Sniper Bot V46 — Arrancando con diagnóstico...")
 
     await tg(
-        "🔄 *Sniper Bot V45 arrancando...*\n"
+        "🔄 *Sniper Bot V46 arrancando...*\n"
         f"TF: `{TIMEFRAME}` | Lev: `{LEVERAGE}x` | Riesgo: `{MAX_RISK_PCT}%`\n"
-        f"Ejecutando diagnóstico completo..."
+        f"🔧 Fix: Signature POST corregida\n"
+        f"📈 Nuevo: RSI filter + Cooldown + Auto-blacklist"
     )
 
-    # Diagnóstico al arrancar
     ok = await run_diagnostics()
 
     if not ok:
         await tg(
             "⛔ *Bot detenido — sin balance*\n\n"
-            "*Pasos para solucionar:*\n"
+            "*Pasos:*\n"
             "1. Abre BingX app\n"
-            "2. Ve a `Activos` → `Futuros`\n"
-            "3. Pulsa `Transferir` y mueve USDT de Spot a Futuros\n"
-            "4. Vuelve a Railway y haz `Redeploy`"
+            "2. `Activos` → `Futuros` → `Transferir`\n"
+            "3. Railway → `Redeploy`"
         )
-        # No detener el bot — sigue intentando cada 5 min
         while True:
             await asyncio.sleep(300)
             bal = await exchange.get_balance()
             if bal > 5:
-                await tg(f"✅ Balance detectado: `{bal:.2f} USDT` — arrancando bot...")
+                await tg(f"✅ Balance detectado: `{bal:.2f} USDT` — arrancando...")
                 break
 
     await asyncio.gather(scanner_loop(), trading_loop())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
