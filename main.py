@@ -1,5 +1,5 @@
 """
-Sniper Bot V47 — FIX SIGNATURE REAL + RENTABILIDAD
+Sniper Bot V48 — FIX SIGNATURE REAL + RENTABILIDAD
 ====================================================
 FIXES vs V46:
   [BUG CRÍTICO] _sign() usaba sorted(p.items()) — BingX NO quiere
@@ -98,7 +98,7 @@ USE_WHITELIST = os.getenv("USE_WHITELIST","true").lower() == "true"
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXCHANGE — FIRMA CORREGIDA (V47: sin sorted, con strip)
+# EXCHANGE — FIRMA CORREGIDA (V48: sin sorted, con strip)
 # ══════════════════════════════════════════════════════════════════
 class BingXClient:
     def __init__(self):
@@ -106,7 +106,7 @@ class BingXClient:
 
     def _sign(self, params: dict) -> str:
         """
-        FIX V47: NO sorted() — BingX firma con params en orden de inserción.
+        FIX V48: NO sorted() — BingX firma con params en orden de inserción.
         Todos los valores como string para urlencode consistente.
         """
         p = {k: str(v) for k, v in params.items() if k != "signature"}
@@ -144,7 +144,7 @@ class BingXClient:
 
     async def _post(self, path, params: dict) -> dict:
         """
-        V47: params como str, sin sorted, sin Content-Type.
+        V48: params como str, sin sorted, sin Content-Type.
         BingX swap V2 = params en URL query string.
         """
         p = {k: str(v) for k, v in params.items()}
@@ -170,45 +170,73 @@ class BingXClient:
     async def get_raw_balance(self) -> dict:
         return await self._get("/openApi/swap/v2/user/balance")
 
+    def _find_num(self, obj, keys, depth=0):
+        """Busca numéricamente el primer campo encontrado en obj."""
+        if depth > 6: return None
+        if isinstance(obj, dict):
+            for k in keys:
+                v = obj.get(k)
+                if v is not None:
+                    try:
+                        f = float(str(v).replace(",", ""))
+                        if f >= 0: return f
+                    except: pass
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    r = self._find_num(v, keys, depth+1)
+                    if r is not None: return r
+        if isinstance(obj, list):
+            for item in obj:
+                r = self._find_num(item, keys, depth+1)
+                if r is not None: return r
+        return None
+
     async def get_balance(self) -> float:
+        """Retorna availableMargin — lo que queda libre para nuevos trades."""
         try:
             d = await self._get("/openApi/swap/v2/user/balance")
             raw = d.get("data", d)
             log.info(f"[BALANCE RAW]: {str(raw)[:500]}")
-
-            def find_num(obj, keys, depth=0):
-                if depth > 6: return None
-                if isinstance(obj, dict):
-                    for k in keys:
-                        v = obj.get(k)
-                        if v is not None:
-                            try:
-                                f = float(str(v).replace(",",""))
-                                if f >= 0: return f
-                            except: pass
-                    for k, v in obj.items():
-                        if isinstance(v, (dict, list)):
-                            r = find_num(v, keys, depth+1)
-                            if r is not None: return r
-                if isinstance(obj, list):
-                    for item in obj:
-                        r = find_num(item, keys, depth+1)
-                        if r is not None: return r
-                return None
-
-            fields = [
-                "availableMargin","available","free","equity",
-                "availableBalance","crossAvailableBalance",
-                "walletBalance","balance","crossWalletBalance",
-            ]
-            bal = find_num(raw, fields)
-            if bal is not None and bal >= 0:
-                log.info(f"Balance OK: {bal:.4f} USDT")
-                return bal
+            # Prioridad: margen disponible para operar
+            avail = self._find_num(raw, [
+                "availableMargin", "available", "free",
+                "availableBalance", "crossAvailableBalance",
+            ])
+            if avail is not None and avail >= 0:
+                log.info(f"Available: {avail:.4f} USDT")
+                return avail
+            # Fallback: wallet total
+            total = self._find_num(raw, [
+                "walletBalance", "balance", "equity", "crossWalletBalance",
+            ])
+            if total is not None and total >= 0:
+                log.info(f"Wallet (fallback): {total:.4f} USDT")
+                return total
             log.error(f"Balance NO encontrado. Raw={str(raw)[:400]}")
             return 0.0
         except Exception as e:
             log.error(f"get_balance: {e}", exc_info=True)
+            return 0.0
+
+    async def get_equity(self) -> float:
+        """
+        Retorna el balance total de la cuenta (wallet balance).
+        DIFERENTE de availableMargin.
+        BingX raw: balance=190.87, equity=174.10, availableMargin=9.23
+        Usamos 'balance' (wallet) como referencia para límite diario.
+        """
+        try:
+            d = await self._get("/openApi/swap/v2/user/balance")
+            raw = d.get("data", d)
+            eq = self._find_num(raw, [
+                "balance", "walletBalance", "equity", "crossWalletBalance",
+            ])
+            if eq is not None and eq > 0:
+                log.info(f"Equity/WalletBalance: {eq:.4f} USDT")
+                return eq
+            return 0.0
+        except Exception as e:
+            log.error(f"get_equity: {e}")
             return 0.0
 
     async def get_klines(self, symbol, interval, limit=200) -> list:
@@ -470,7 +498,7 @@ def trend_4h(candles_4h) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# ANALYZE — V47 con filtro 4H y spread
+# ANALYZE — V48 con filtro 4H y spread
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class CoinResult:
@@ -558,7 +586,7 @@ def analyze(ticker, candles, candles_1h, candles_4h, funding) -> Optional[CoinRe
     rsi_long_ok  = rsi_now < RSI_OB
     rsi_short_ok = rsi_now > RSI_OS
 
-    # Condición entrada V47: incluye macro 4H como bonus/bloqueo
+    # Condición entrada V48: incluye macro 4H como bonus/bloqueo
     long_cond  = (lo_now < valley and cn < vwap_now and slope_now > SLOPE_MIN
                   and stc_up and adx_ok and dist_poc and cond_vol
                   and rsi_long_ok and macro != "BEAR")   # no LONG en tendencia bajista 4H
@@ -569,13 +597,13 @@ def analyze(ticker, candles, candles_1h, candles_4h, funding) -> Optional[CoinRe
     score = 0; signals = []; direction = "NEUTRAL"
 
     if long_cond:
-        direction = "LONG"; score = 85; signals = ["V47🟢"]
+        direction = "LONG"; score = 85; signals = ["V48🟢"]
         if htf_bull:            score += 8;  signals.append("1H🟢")
         if macro == "BULL":     score += 7;  signals.append("4H🟢")
         if e_fast[i] > e_slow[i]: score += 5; signals.append("EMA✅")
         if rsi_now < 50:        score += 5;  signals.append(f"RSI{rsi_now:.0f}✅")
     elif short_cond:
-        direction = "SHORT"; score = 85; signals = ["V47🔴"]
+        direction = "SHORT"; score = 85; signals = ["V48🔴"]
         if htf_bear:            score += 8;  signals.append("1H🔴")
         if macro == "BEAR":     score += 7;  signals.append("4H🔴")
         if e_fast[i] < e_slow[i]: score += 5; signals.append("EMA✅")
@@ -681,10 +709,10 @@ pause_until:      float             = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════
-# STARTUP DIAGNOSTIC — V47 muestra chars de API key para verificar
+# STARTUP DIAGNOSTIC — V48 muestra chars de API key para verificar
 # ══════════════════════════════════════════════════════════════════
 async def run_diagnostics():
-    lines = ["🔧 *DIAGNÓSTICO V47*\n━━━━━━━━━━━━━━━━━━━━━━\n"]
+    lines = ["🔧 *DIAGNÓSTICO V48*\n━━━━━━━━━━━━━━━━━━━━━━\n"]
 
     # Verificar key (primeros/últimos 4 chars)
     k_preview = f"{BINGX_API_KEY[:4]}...{BINGX_API_KEY[-4:]}" if len(BINGX_API_KEY) > 8 else "???"
@@ -708,8 +736,9 @@ async def run_diagnostics():
         return False
 
     balance = await exchange.get_balance()
-    if balance > 0:
-        lines.append(f"✅ *Balance:* `{balance:.4f} USDT`")
+    equity  = await exchange.get_equity()
+    if balance > 0 or equity > 0:
+        lines.append(f"✅ *Available:* `{balance:.4f} USDT` | *Equity:* `{equity:.4f} USDT`")
     else:
         lines.append("❌ *Balance = 0* — sin fondos o parsing fallido")
         lines.append("⚠️ Transfiere USDT a BingX *Futuros*")
@@ -744,7 +773,7 @@ async def run_diagnostics():
     except Exception as e:
         lines.append(f"❌ *Leverage ERROR:* `{e}`")
 
-    lines.append(f"\n⚙️ *Config V47:*")
+    lines.append(f"\n⚙️ *Config V48:*")
     lines.append(f"  TF: `{TIMEFRAME}` | Score: `{SCORE_ENTRY}` | Max pos: `{MAX_POSITIONS}`")
     lines.append(f"  MaxPosUSDT: `{MAX_POS_USDT}$` | Riesgo: `{MAX_RISK_PCT}%`")
     lines.append(f"  RVOL: `{RVOL_MIN}x` | SLOPE: `{SLOPE_MIN}` | ADX<`{ADX_MAX}`")
@@ -752,13 +781,13 @@ async def run_diagnostics():
     lines.append(f"  Blackout: `{BLACKOUT_START}-{BLACKOUT_END} UTC`")
     lines.append(f"  Límite pérd/día: `{DAILY_LOSS_LIMIT}%`")
 
-    lines.append(f"\n{'✅ Listo V47' if balance > 0 else '❌ Sin balance'}")
+    lines.append(f"\n{'✅ Listo V48' if balance > 0 else '❌ Sin balance'}")
     await tg("\n".join(lines))
     return balance > 0
 
 
 # ══════════════════════════════════════════════════════════════════
-# OPEN TRADE — V47 con pausa diaria
+# OPEN TRADE — V48 con pausa diaria
 # ══════════════════════════════════════════════════════════════════
 async def open_trade(cr: CoinResult) -> bool:
     sym = cr.symbol
@@ -814,7 +843,7 @@ async def open_trade(cr: CoinResult) -> bool:
         pos_value = cr.entry * qty
         emoji = "🟢" if cr.direction == "LONG" else "🔴"
         await tg(
-            f"{emoji} *{cr.direction} — V47*\n"
+            f"{emoji} *{cr.direction} — V48*\n"
             f"Par: `{sym}` | Score: `{cr.score}/100`\n"
             f"Entry: `{cr.entry:.6f}`\n"
             f"SL: `{cr.sl:.6f}` | TP: `{cr.tp:.6f}` *({RR_RATIO}R)*\n"
@@ -841,7 +870,7 @@ async def open_trade(cr: CoinResult) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════
-# MANAGE POSITIONS — V47 con pausa diaria y trailing info
+# MANAGE POSITIONS — V48 con pausa diaria y trailing info
 # ══════════════════════════════════════════════════════════════════
 async def manage_positions():
     global daily_loss_pct, pause_until
@@ -887,22 +916,26 @@ async def manage_positions():
             if pnl_pct < -4.0:
                 log.warning(f"⚠️ {sym} {direction} pnl={pnl_pct:+.2f}% — cerca SL")
 
-        # Control pérdida diaria
-        if daily_start_bal > 0 and total_unr < 0:
-            loss_pct = abs(total_unr) / daily_start_bal * 100
-            if loss_pct > DAILY_LOSS_LIMIT and pause_until < time.time():
-                pause_until = time.time() + 4 * 3600  # pausa 4h
-                await tg(
-                    f"🛑 *Límite pérdida diaria alcanzado* `{loss_pct:.1f}%`\n"
-                    f"Bot pausado 4 horas para proteger capital"
-                )
+        # Control pérdida diaria — comparar equity actual vs inicio del día
+        if daily_start_bal > 0:
+            cur_equity = await exchange.get_equity()
+            if cur_equity > 0:
+                loss_pct = (daily_start_bal - cur_equity) / daily_start_bal * 100
+                log.info(f"Daily PnL: start={daily_start_bal:.2f} now={cur_equity:.2f} loss={loss_pct:.2f}%")
+                if loss_pct > DAILY_LOSS_LIMIT and pause_until < time.time():
+                    pause_until = time.time() + 4 * 3600
+                    await tg(
+                        f"🛑 *Límite pérdida diaria: `{loss_pct:.1f}%`*\n"
+                        f"Equity: `{cur_equity:.2f}` → inicio: `{daily_start_bal:.2f}` USDT\n"
+                        f"Bot pausado 4 horas"
+                    )
 
     except Exception as e:
         log.error(f"manage_positions: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
-# SCANNER — V47 con 4H
+# SCANNER — V48 con 4H
 # ══════════════════════════════════════════════════════════════════
 async def scanner_loop():
     global watchlist, daily_start_bal
@@ -911,7 +944,7 @@ async def scanner_loop():
             if is_blackout():
                 await asyncio.sleep(SCAN_INTERVAL); continue
 
-            log.info("🔍 Escaneando V47...")
+            log.info("🔍 Escaneando V48...")
             tickers = await exchange.get_tickers()
             if not tickers:
                 await tg("⚠️ Sin tickers.")
@@ -946,11 +979,11 @@ async def scanner_loop():
             watchlist = wl if wl else [r for r in top[:5] if r.symbol not in dynamic_blacklist]
             log.info(f"Watchlist: {[(r.symbol, r.score, r.direction) for r in watchlist]}")
 
-            # Balance del día
+            # Balance total del día — usar equity, NO available margin
             if daily_start_bal == 0:
-                daily_start_bal = await exchange.get_balance()
+                daily_start_bal = await exchange.get_equity()
 
-            lines = [f"🔍 *V47 — {len(top)} coins*\n"]
+            lines = [f"🔍 *V48 — {len(top)} coins*\n"]
             for n, r in enumerate(top, 1):
                 e   = "🟢" if r.direction == "LONG" else "🔴"
                 bar = "█" * (r.score // 10) + "░" * (10 - r.score // 10)
@@ -1024,10 +1057,10 @@ async def trading_loop():
 # MAIN
 # ══════════════════════════════════════════════════════════════════
 async def main():
-    log.info("🚀 Sniper Bot V47 — Fix signature + 4H filter + risk control")
+    log.info("🚀 Sniper Bot V48 — Fix signature + 4H filter + risk control")
 
     await tg(
-        "🔄 *Sniper Bot V47 arrancando...*\n"
+        "🔄 *Sniper Bot V48 arrancando...*\n"
         f"TF: `{TIMEFRAME}` | Lev: `{LEVERAGE}x` | Riesgo: `{MAX_RISK_PCT}%`\n"
         f"🔧 Fix: Signature sin sorted() + .strip() en keys\n"
         f"📈 Nuevo: Filtro 4H + Límite pérd/día + Riesgo reducido"
@@ -1050,7 +1083,7 @@ async def main():
             try:
                 bal = await exchange.get_balance()
                 if bal > 5:
-                    await tg(f"✅ Balance detectado: `{bal:.2f} USDT` — arrancando V47...")
+                    await tg(f"✅ Balance detectado: `{bal:.2f} USDT` — arrancando V48...")
                     break
             except Exception as e:
                 log.error(f"Wait loop: {e}")
