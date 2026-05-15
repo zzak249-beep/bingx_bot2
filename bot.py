@@ -1,27 +1,15 @@
 """
-Sniper Bot V46 — FIXES + WINRATE MEJORADO
-==========================================
-FIXES vs V45:
-  [BUG CRÍTICO] Content-Type: application/json en POST causaba
-    "Signature verification failed" — BingX esperaba JSON body
-    pero los params iban como query string. SOLUCIONADO.
-  [BUG] hmac.new → hmac.new (ya era correcto, pero ahora con recvWindow)
-  [NUEVO] recvWindow=5000 en todos los requests para evitar timing errors
-  [NUEVO] Retry automático x3 en errores 5xx / timeout
-
-MEJORAS WINRATE:
-  [+] RSI(14) — filter: no LONG si RSI>65, no SHORT si RSI<35
-  [+] Funding rate filter — skip si funding < -0.05% (longs caros)
-  [+] Cooldown por símbolo — 30min entre intentos fallidos
-  [+] Confirmación de volumen 1H — RVOL en timeframe alto
-  [+] Half-close sube a +1.0% (antes 0.6%) para dejar correr más
-  [+] Trailing SL activo: si >1.5% profit, SL sube a breakeven
-  [+] Score mínimo más exigente en fallback path (score>=60)
-  [+] Blacklist dinámica de símbolos con >2 pérdidas consecutivas
+Sniper Bot V45 — ONE-WAY MODE (Compatible con cuentas BingX por defecto)
+=========================================================================
+FIX DEFINITIVO:
+  - positionSide = "BOTH" siempre (ONE-WAY mode, default BingX)
+  - side = "BUY" para abrir LONG o cerrar SHORT
+  - side = "SELL" para abrir SHORT o cerrar LONG
+  - No requiere activar Hedge Mode
+  - SL/TP en la misma orden (formato correcto ONE-WAY)
 """
 
 import asyncio, hashlib, hmac, logging, os, time, urllib.parse
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -35,38 +23,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("SniperBot")
 
-BINGX_API_KEY    = os.environ["BINGX_API_KEY"]
-BINGX_API_SECRET = os.environ["BINGX_API_SECRET"]
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-TIMEFRAME        = os.getenv("TIMEFRAME",            "15m")
-TF_HIGH          = os.getenv("TIMEFRAME_HIGH",       "1h")
-LEVERAGE         = int(os.getenv("LEVERAGE",         "5"))
-MAX_RISK_PCT     = float(os.getenv("MAX_RISK_PCT",   "1.0"))
-MAX_POS_USDT     = float(os.getenv("MAX_POS_USDT",   "50"))
-SCAN_TOP_N       = int(os.getenv("SCAN_TOP_N",       "10"))
-MIN_VOL_USDT     = float(os.getenv("MIN_VOL_USDT",   "10000000"))
-SCORE_ENTRY      = int(os.getenv("SCORE_ENTRY",      "55"))
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_MIN","5")) * 60
-MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",    "3"))
-BLACKOUT_START   = int(os.getenv("BLACKOUT_START_UTC","0"))
-BLACKOUT_END     = int(os.getenv("BLACKOUT_END_UTC",  "2"))
-SLOPE_MIN        = float(os.getenv("SLOPE_MIN",      "25.0"))   # bajado de 30
-POC_LOOKBACK     = int(os.getenv("POC_LOOKBACK",     "50"))
-ADX_MAX          = float(os.getenv("ADX_MAX",        "40.0"))   # subido de 35
-RVOL_MIN         = float(os.getenv("RVOL_MIN",       "1.3"))    # bajado de 1.5
-RR_RATIO         = float(os.getenv("RR_RATIO",       "2.5"))
-ATR_SL_MULT      = float(os.getenv("ATR_SL_MULT",   "1.2"))
-EMA_FAST         = int(os.getenv("EMA_FAST",         "7"))
-EMA_SLOW         = int(os.getenv("EMA_SLOW",         "17"))
-RSI_PERIOD       = int(os.getenv("RSI_PERIOD",       "14"))
-RSI_OB           = float(os.getenv("RSI_OB",         "65.0"))   # overbought
-RSI_OS           = float(os.getenv("RSI_OS",         "35.0"))   # oversold
-FUNDING_SKIP     = float(os.getenv("FUNDING_SKIP",   "0.0005")) # 0.05%
-SYMBOL_COOLDOWN  = int(os.getenv("SYMBOL_COOLDOWN",  "30"))     # minutos
-MAX_LOSSES       = int(os.getenv("MAX_LOSSES",       "2"))      # auto-blacklist
-BASE_URL         = "https://open-api.bingx.com"
-RECV_WINDOW      = 5000
+BINGX_API_KEY   = os.environ["BINGX_API_KEY"]
+BINGX_API_SECRET= os.environ["BINGX_API_SECRET"]
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID= os.environ["TELEGRAM_CHAT_ID"]
+TIMEFRAME       = os.getenv("TIMEFRAME",            "15m")
+TF_HIGH         = os.getenv("TIMEFRAME_HIGH",       "1h")
+LEVERAGE        = int(os.getenv("LEVERAGE",         "5"))
+MAX_RISK_PCT    = float(os.getenv("MAX_RISK_PCT",   "1.0"))
+MAX_POS_USDT    = float(os.getenv("MAX_POS_USDT",   "30"))
+SCAN_TOP_N      = int(os.getenv("SCAN_TOP_N",       "10"))
+MIN_VOL_USDT    = float(os.getenv("MIN_VOL_USDT",   "10000000"))
+SCORE_ENTRY     = int(os.getenv("SCORE_ENTRY",      "55"))
+SCAN_INTERVAL   = int(os.getenv("SCAN_INTERVAL_MIN","5")) * 60
+MAX_POSITIONS   = int(os.getenv("MAX_POSITIONS",    "5"))
+BLACKOUT_START  = int(os.getenv("BLACKOUT_START_UTC","0"))
+BLACKOUT_END    = int(os.getenv("BLACKOUT_END_UTC",  "2"))
+SLOPE_MIN       = float(os.getenv("SLOPE_MIN",      "25.0"))
+POC_LOOKBACK    = int(os.getenv("POC_LOOKBACK",     "50"))
+ADX_MAX         = float(os.getenv("ADX_MAX",        "35.0"))
+RVOL_MIN        = float(os.getenv("RVOL_MIN",       "1.3"))
+RR_RATIO        = float(os.getenv("RR_RATIO",       "2.5"))
+ATR_SL_MULT     = float(os.getenv("ATR_SL_MULT",   "1.2"))
+EMA_FAST        = int(os.getenv("EMA_FAST",         "7"))
+EMA_SLOW        = int(os.getenv("EMA_SLOW",         "17"))
+BASE_URL        = "https://open-api.bingx.com"
 
 BLACKLIST = {
     "USDC-USDT","BUSD-USDT","DAI-USDT","TUSD-USDT","FRAX-USDT",
@@ -88,123 +69,44 @@ USE_WHITELIST = os.getenv("USE_WHITELIST","true").lower() == "true"
 
 
 # ══════════════════════════════════════════════════════════════════
-# EXCHANGE — FIRMA CORREGIDA
+# EXCHANGE — ONE-WAY MODE
 # ══════════════════════════════════════════════════════════════════
 class BingXClient:
     def __init__(self):
         self.client = httpx.AsyncClient(base_url=BASE_URL, timeout=20)
 
     def _sign(self, params: dict) -> str:
-        """
-        BingX firma: HMAC-SHA256 del query string con params ordenados.
-        NO incluir 'signature' en el string a firmar.
-        """
-        p = {k: v for k, v in params.items() if k != "signature"}
-        q = urllib.parse.urlencode(sorted(p.items()))
-        return hmac.new(
-            BINGX_API_SECRET.encode(),
-            q.encode(),
-            hashlib.sha256
-        ).hexdigest()
+        q = urllib.parse.urlencode(sorted(params.items()))
+        return hmac.new(BINGX_API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
 
-    def _auth_headers(self):
-        """
-        Solo X-BX-APIKEY — SIN Content-Type para requests con params
-        en query string. Content-Type: application/json causaba
-        'signature mismatch' porque BingX esperaba body JSON.
-        """
-        return {"X-BX-APIKEY": BINGX_API_KEY}
+    def _h(self):
+        return {"X-BX-APIKEY": BINGX_API_KEY, "Content-Type": "application/json"}
 
     async def _get(self, path, params=None) -> dict:
         p = dict(params or {})
-        p["timestamp"]   = int(time.time() * 1000)
-        p["recvWindow"]  = RECV_WINDOW
-        p["signature"]   = self._sign(p)
-        for attempt in range(3):
-            try:
-                r = await self.client.get(path, params=p, headers=self._auth_headers())
-                r.raise_for_status()
-                d = r.json()
-                if d.get("code", 0) != 0:
-                    raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
-                return d
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                if attempt == 2: raise
-                await asyncio.sleep(1 * (attempt + 1))
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = self._sign(p)
+        r = await self.client.get(path, params=p, headers=self._h())
+        r.raise_for_status()
+        d = r.json()
+        if d.get("code", 0) != 0:
+            raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
+        return d
 
     async def _post(self, path, params: dict) -> dict:
-        """
-        FIX CRÍTICO: params van como query string (no body).
-        Encabezado: solo X-BX-APIKEY, sin Content-Type.
-        BingX swap V2 requiere params en URL, no en body JSON.
-        """
         p = dict(params)
-        p["timestamp"]   = int(time.time() * 1000)
-        p["recvWindow"]  = RECV_WINDOW
-        p["signature"]   = self._sign(p)
-        for attempt in range(3):
-            try:
-                r = await self.client.post(
-                    path,
-                    params=p,                   # ← query string
-                    headers=self._auth_headers() # ← sin Content-Type
-                )
-                r.raise_for_status()
-                d = r.json()
-                if d.get("code", 0) != 0:
-                    raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
-                return d
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                if attempt == 2: raise
-                await asyncio.sleep(1 * (attempt + 1))
-
-    async def get_raw_balance(self) -> dict:
-        return await self._get("/openApi/swap/v2/user/balance")
-
-    async def get_balance(self) -> float:
-        try:
-            d = await self._get("/openApi/swap/v2/user/balance")
-            raw = d.get("data", d)
-            log.info(f"[BALANCE RAW]: {str(raw)[:500]}")
-
-            def find_num(obj, keys, depth=0):
-                if depth > 6: return None
-                if isinstance(obj, dict):
-                    for k in keys:
-                        v = obj.get(k)
-                        if v is not None:
-                            try:
-                                f = float(str(v).replace(",",""))
-                                if f >= 0: return f
-                            except: pass
-                    for k, v in obj.items():
-                        if isinstance(v, (dict, list)):
-                            r = find_num(v, keys, depth+1)
-                            if r is not None: return r
-                if isinstance(obj, list):
-                    for item in obj:
-                        r = find_num(item, keys, depth+1)
-                        if r is not None: return r
-                return None
-
-            fields = [
-                "availableMargin","available","free","equity",
-                "availableBalance","crossAvailableBalance",
-                "walletBalance","balance","crossWalletBalance",
-            ]
-            bal = find_num(raw, fields)
-            if bal is not None and bal >= 0:
-                log.info(f"Balance OK: {bal:.4f} USDT")
-                return bal
-            log.error(f"Balance NO encontrado. Raw={str(raw)[:400]}")
-            return 0.0
-        except Exception as e:
-            log.error(f"get_balance: {e}", exc_info=True)
-            return 0.0
+        p["timestamp"] = int(time.time() * 1000)
+        p["signature"] = self._sign(p)
+        r = await self.client.post(path, params=p, headers=self._h())
+        r.raise_for_status()
+        d = r.json()
+        if d.get("code", 0) != 0:
+            raise RuntimeError(f"BingX {d['code']}: {d.get('msg')}")
+        return d
 
     async def get_klines(self, symbol, interval, limit=200) -> list:
         d = await self._get("/openApi/swap/v3/quote/klines",
-                            {"symbol":symbol,"interval":interval,"limit":limit})
+                            {"symbol": symbol, "interval": interval, "limit": limit})
         out = []
         for c in d["data"]:
             try:
@@ -212,14 +114,12 @@ class BingXClient:
                     out.append({"time":int(c[0]),"open":float(c[1]),"high":float(c[2]),
                                 "low":float(c[3]),"close":float(c[4]),"volume":float(c[5])})
                 else:
-                    out.append({
-                        "time":   int(c.get("time",   c.get("t",0))),
-                        "open":   float(c.get("open",  c.get("o",0))),
-                        "high":   float(c.get("high",  c.get("h",0))),
-                        "low":    float(c.get("low",   c.get("l",0))),
-                        "close":  float(c.get("close", c.get("c",0))),
-                        "volume": float(c.get("volume",c.get("v",c.get("quoteVolume",0))))
-                    })
+                    out.append({"time":  int(c.get("time",   c.get("t",0))),
+                                "open":  float(c.get("open",  c.get("o",0))),
+                                "high":  float(c.get("high",  c.get("h",0))),
+                                "low":   float(c.get("low",   c.get("l",0))),
+                                "close": float(c.get("close", c.get("c",0))),
+                                "volume":float(c.get("volume",c.get("v",c.get("quoteVolume",0))))})
             except: continue
         return out
 
@@ -254,18 +154,57 @@ class BingXClient:
             d = await self._get("/openApi/swap/v2/quote/premiumIndex",{"symbol":symbol})
             data = d.get("data",{})
             if isinstance(data,list): data = data[0] if data else {}
-            return float(data.get("lastFundingRate", data.get("fundingRate",0)))
+            return float(data.get("lastFundingRate",data.get("fundingRate",0)))
         except: return 0.0
+
+    async def get_balance(self) -> float:
+        try:
+            d = await self._get("/openApi/swap/v2/user/balance")
+            raw = d.get("data", d)
+            log.info(f"[BALANCE RAW]: {str(raw)[:400]}")
+
+            def find(obj, keys, depth=0):
+                if depth > 6: return None
+                if isinstance(obj, dict):
+                    for k in keys:
+                        v = obj.get(k)
+                        if v is not None:
+                            try:
+                                f = float(str(v).replace(",",""))
+                                if f >= 0: return f
+                            except: pass
+                    for k, v in obj.items():
+                        if isinstance(v, (dict,list)):
+                            r = find(v, keys, depth+1)
+                            if r is not None: return r
+                if isinstance(obj, list):
+                    for item in obj:
+                        r = find(item, keys, depth+1)
+                        if r is not None: return r
+                return None
+
+            bal = find(raw, ["availableMargin","available","free","equity",
+                             "availableBalance","crossAvailableBalance","walletBalance"])
+            if bal is not None and bal >= 0:
+                log.info(f"Balance: {bal:.4f} USDT")
+                return bal
+            log.error(f"Balance no encontrado. Raw={str(raw)[:300]}")
+            return 0.0
+        except Exception as e:
+            log.error(f"get_balance: {e}", exc_info=True)
+            return 0.0
 
     def _parse_pos(self, data) -> list:
         if data is None: return []
-        items = data if isinstance(data, list) else \
-                [data] if isinstance(data, dict) else []
-        return [p for p in items
-                if isinstance(p, dict)
-                and abs(float(p.get("positionAmt",
-                               p.get("positionAmount",
-                               p.get("size", 0))))) > 0]
+        items = data if isinstance(data,list) else [data] if isinstance(data,dict) else []
+        result = []
+        for p in items:
+            if not isinstance(p,dict): continue
+            try:
+                amt = float(p.get("positionAmt",p.get("positionAmount",p.get("size",0))))
+                if abs(amt) > 0: result.append(p)
+            except: continue
+        return result
 
     async def get_position(self, symbol) -> Optional[dict]:
         try:
@@ -285,49 +224,78 @@ class BingXClient:
             return []
 
     async def set_leverage(self, symbol, leverage) -> bool:
-        ok = True
-        for side in ("LONG","SHORT"):
-            try:
-                await self._post("/openApi/swap/v2/trade/leverage",
-                                 {"symbol":symbol,"side":side,"leverage":str(leverage)})
-            except Exception as e:
-                log.warning(f"Leverage {symbol} {side}: {e}")
-                ok = False
-        return ok
+        # ONE-WAY: solo un lado
+        try:
+            await self._post("/openApi/swap/v2/trade/leverage",
+                             {"symbol":symbol,"side":"LONG","leverage":str(leverage)})
+            log.info(f"Leverage {symbol} {leverage}x OK")
+            return True
+        except Exception as e:
+            log.warning(f"Leverage {symbol}: {e}")
+            return False
 
-    async def place_order(self, symbol, side, position_side, qty,
-                          stop_loss=None, take_profit=None,
-                          reduce_only=False) -> dict:
+    async def open_long(self, symbol, qty, sl, tp) -> dict:
+        """ONE-WAY LONG: side=BUY, positionSide=BOTH — SIN SL/TP inline."""
         p = {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": position_side,
-            "type": "MARKET",
-            "quantity": str(qty),
+            "symbol":       symbol,
+            "side":         "BUY",
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(qty),
         }
-        if reduce_only: p["reduceOnly"] = "true"
-        if stop_loss:   p["stopLoss"]   = str(round(stop_loss,   8))
-        if take_profit: p["takeProfit"] = str(round(take_profit, 8))
-        log.info(f"ORDER → {p}")
+        log.info(f"OPEN LONG {symbol} qty={qty} sl={sl:.6f} tp={tp:.6f}")
         r = await self._post("/openApi/swap/v2/trade/order", p)
-        log.info(f"ORDER RESULT → {r}")
+        log.info(f"RESULT → {r}")
         return r
 
-    async def close_position(self, symbol, pos) -> dict:
-        amt = float(pos.get("positionAmt", pos.get("size",0)))
-        return await self.place_order(symbol,
-            "SELL" if amt>0 else "BUY",
-            "LONG" if amt>0 else "SHORT",
-            abs(amt), reduce_only=True)
+    async def open_short(self, symbol, qty, sl, tp) -> dict:
+        """ONE-WAY SHORT: side=SELL, positionSide=BOTH — SIN SL/TP inline."""
+        p = {
+            "symbol":       symbol,
+            "side":         "SELL",
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(qty),
+        }
+        log.info(f"OPEN SHORT {symbol} qty={qty} sl={sl:.6f} tp={tp:.6f}")
+        r = await self._post("/openApi/swap/v2/trade/order", p)
+        log.info(f"RESULT → {r}")
+        return r
 
-    async def close_half(self, symbol, pos):
-        amt  = float(pos.get("positionAmt", pos.get("size",0)))
-        half = round(abs(amt)/2, 3)
-        if half < 0.001: return
-        return await self.place_order(symbol,
-            "SELL" if amt>0 else "BUY",
-            "LONG" if amt>0 else "SHORT",
-            half, reduce_only=True)
+    async def close_all(self, symbol) -> dict:
+        """Cierra toda la posición ONE-WAY."""
+        pos = await self.get_position(symbol)
+        if not pos: return {}
+        amt = float(pos.get("positionAmt", pos.get("size", 0)))
+        if amt == 0: return {}
+        # Si long (amt>0) → SELL para cerrar; si short (amt<0) → BUY para cerrar
+        close_side = "SELL" if amt > 0 else "BUY"
+        p = {
+            "symbol":       symbol,
+            "side":         close_side,
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(abs(amt)),
+            "reduceOnly":   "true",
+        }
+        log.info(f"CLOSE {symbol} side={close_side} qty={abs(amt)}")
+        return await self._post("/openApi/swap/v2/trade/order", p)
+
+    async def close_half(self, symbol, pos) -> dict:
+        amt  = float(pos.get("positionAmt", pos.get("size", 0)))
+        half = round(abs(amt) / 2, 3)
+        if half < 0.001: return {}
+        close_side = "SELL" if amt > 0 else "BUY"
+        p = {
+            "symbol":       symbol,
+            "side":         close_side,
+            "positionSide": "BOTH",
+            "type":         "MARKET",
+            "quantity":     str(half),
+            "reduceOnly":   "true",
+        }
+        log.info(f"CLOSE HALF {symbol} side={close_side} qty={half}")
+        return await self._post("/openApi/swap/v2/trade/order", p)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -348,9 +316,9 @@ async def tg(text: str):
 # INDICATORS
 # ══════════════════════════════════════════════════════════════════
 def ema(v, p):
-    v = np.asarray(v, float); k = 2/(p+1)
+    v = np.asarray(v,float); k = 2/(p+1)
     r = np.zeros(len(v)); r[0] = v[0]
-    for i in range(1, len(v)): r[i] = v[i]*k + r[i-1]*(1-k)
+    for i in range(1,len(v)): r[i] = v[i]*k + r[i-1]*(1-k)
     return r
 
 def hma(v, p):
@@ -360,98 +328,80 @@ def sma(v, p):
     return np.convolve(np.asarray(v,float), np.ones(p)/p, mode="same")
 
 def stoch_s(src, p):
-    src = np.asarray(src, float); r = np.zeros(len(src))
-    for i in range(p-1, len(src)):
+    src = np.asarray(src,float); r = np.zeros(len(src))
+    for i in range(p-1,len(src)):
         w = src[i-p+1:i+1]; lo,hi = w.min(),w.max()
         r[i] = (src[i]-lo)/(hi-lo+1e-10)
     return r
 
-def stc_v45(c):
-    macd = ema(c,23) - ema(c,50)
-    return ema(stoch_s(macd, 10), 3)
+def stc_ind(c):
+    return ema(stoch_s(ema(c,23)-ema(c,50), 10), 3)
 
-def calc_rsi(closes, period=14):
-    """RSI clásico — filtra entradas en zonas extremas."""
-    c = np.asarray(closes, float)
-    deltas = np.diff(c)
-    gains  = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_g  = np.zeros(len(c)); avg_l = np.zeros(len(c))
-    avg_g[period] = np.mean(gains[:period])
-    avg_l[period] = np.mean(losses[:period])
-    for i in range(period+1, len(c)):
-        avg_g[i] = (avg_g[i-1]*(period-1) + gains[i-1])  / period
-        avg_l[i] = (avg_l[i-1]*(period-1) + losses[i-1]) / period
-    rs  = avg_g / (avg_l + 1e-10)
-    rsi = 100 - 100/(1+rs)
-    rsi[:period] = 50  # neutral para índices sin datos
-    return rsi
-
-def calc_atr(h, l, c, p=14):
-    h,l,c = map(lambda x: np.asarray(x,float), [h,l,c])
-    tr = np.maximum(h-l, np.maximum(np.abs(h-np.roll(c,1)), np.abs(l-np.roll(c,1))))
-    r = np.zeros(len(tr)); r[0] = tr[0]
-    for i in range(1, len(tr)): r[i] = (r[i-1]*(p-1)+tr[i])/p
+def calc_atr(h,l,c,p=14):
+    h,l,c = map(lambda x:np.asarray(x,float),[h,l,c])
+    tr = np.maximum(h-l,np.maximum(np.abs(h-np.roll(c,1)),np.abs(l-np.roll(c,1))))
+    r = np.zeros(len(tr)); r[0]=tr[0]
+    for i in range(1,len(tr)): r[i]=(r[i-1]*(p-1)+tr[i])/p
     return r
 
-def calc_vwap(h, l, c, v):
-    tp = (np.asarray(h,float)+np.asarray(l,float)+np.asarray(c,float))/3
+def calc_vwap(h,l,c,v):
+    tp=(np.asarray(h,float)+np.asarray(l,float)+np.asarray(c,float))/3
     return np.cumsum(tp*np.asarray(v,float))/(np.cumsum(np.asarray(v,float))+1e-10)
 
-def calc_poc(closes, volumes, lookback):
-    n = min(lookback, len(closes))
-    v = np.asarray(volumes[-n:], float)
-    return float(np.asarray(closes[-n:], float)[int(np.argmax(v))])
+def calc_poc(closes,volumes,lookback):
+    n=min(lookback,len(closes))
+    v=np.asarray(volumes[-n:],float)
+    return float(np.asarray(closes[-n:],float)[int(np.argmax(v))])
 
-def calc_adx(h, l, c, p=14):
-    h,l,c = map(lambda x: np.asarray(x,float), [h,l,c])
-    ph,pl,pc = np.roll(h,1),np.roll(l,1),np.roll(c,1)
-    tr  = np.maximum(h-l, np.maximum(np.abs(h-pc), np.abs(l-pc)))
-    dmp = np.where((h-ph)>(pl-l), np.maximum(h-ph,0), 0).astype(float)
-    dmm = np.where((pl-l)>(h-ph), np.maximum(pl-l,0), 0).astype(float)
-    atr_w=np.zeros(len(tr)); dp_w=np.zeros(len(tr)); dm_w=np.zeros(len(tr))
-    atr_w[p]=np.sum(tr[1:p+1]); dp_w[p]=np.sum(dmp[1:p+1]); dm_w[p]=np.sum(dmm[1:p+1])
+def calc_adx(h,l,c,p=14):
+    h,l,c=map(lambda x:np.asarray(x,float),[h,l,c])
+    ph,pl,pc=np.roll(h,1),np.roll(l,1),np.roll(c,1)
+    tr=np.maximum(h-l,np.maximum(np.abs(h-pc),np.abs(l-pc)))
+    dmp=np.where((h-ph)>(pl-l),np.maximum(h-ph,0),0).astype(float)
+    dmm=np.where((pl-l)>(h-ph),np.maximum(pl-l,0),0).astype(float)
+    aw=np.zeros(len(tr)); dp=np.zeros(len(tr)); dm=np.zeros(len(tr))
+    if p<len(tr):
+        aw[p]=np.sum(tr[1:p+1]); dp[p]=np.sum(dmp[1:p+1]); dm[p]=np.sum(dmm[1:p+1])
     for i in range(p+1,len(tr)):
-        atr_w[i]=atr_w[i-1]-atr_w[i-1]/p+tr[i]
-        dp_w[i] =dp_w[i-1] -dp_w[i-1]/p +dmp[i]
-        dm_w[i] =dm_w[i-1] -dm_w[i-1]/p +dmm[i]
-    dip=100*dp_w/(atr_w+1e-10); dim=100*dm_w/(atr_w+1e-10)
+        aw[i]=aw[i-1]-aw[i-1]/p+tr[i]
+        dp[i]=dp[i-1]-dp[i-1]/p+dmp[i]
+        dm[i]=dm[i-1]-dm[i-1]/p+dmm[i]
+    dip=100*dp/(aw+1e-10); dim=100*dm/(aw+1e-10)
     dx=100*np.abs(dip-dim)/(dip+dim+1e-10)
     adx=np.zeros(len(dx))
-    if 2*p < len(dx): adx[2*p]=np.mean(dx[p:2*p+1])
+    if 2*p<len(dx): adx[2*p]=np.mean(dx[p:2*p+1])
     for i in range(2*p+1,len(dx)): adx[i]=(adx[i-1]*(p-1)+dx[i])/p
     return adx
 
-def calc_magic_slope(closes, p=7):
-    e7   = ema(closes, p)
-    atr7 = calc_atr(closes, closes, closes, p)
-    s    = np.zeros(len(e7))
-    for i in range(1, len(e7)): s[i] = ((e7[i]-e7[i-1])/(atr7[i]+1e-10))*100
+def calc_slope(closes,p=7):
+    e=ema(closes,p); a=calc_atr(closes,closes,closes,p)
+    s=np.zeros(len(e))
+    for i in range(1,len(e)): s[i]=((e[i]-e[i-1])/(a[i]+1e-10))*100
     return s
 
-def calc_rvol(volumes, p=50):
-    v = np.asarray(volumes, float)
+def calc_rvol(volumes,p=50):
+    v=np.asarray(volumes,float)
     return v/(sma(v,p)+1e-10)
 
-def pivot_hi(h, n):
+def pivot_hi(h,n):
     h=np.asarray(h,float); r=np.full(len(h),np.nan)
     for i in range(n,len(h)-n):
         if h[i]==h[i-n:i+n+1].max(): r[i]=h[i]
     return r
 
-def pivot_lo(l, n):
+def pivot_lo(l,n):
     l=np.asarray(l,float); r=np.full(len(l),np.nan)
     for i in range(n,len(l)-n):
         if l[i]==l[i-n:i+n+1].min(): r[i]=l[i]
     return r
 
 def vol24h(candles):
-    last = candles[-96:] if len(candles)>=96 else candles
+    last=candles[-96:] if len(candles)>=96 else candles
     return sum(c["close"]*c["volume"] for c in last)
 
 
 # ══════════════════════════════════════════════════════════════════
-# ANALYZE — con filtros RSI y funding
+# ANALYZE
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class CoinResult:
@@ -470,12 +420,10 @@ class CoinResult:
     slope:      float = 0.0
     adx:        float = 0.0
     rvol:       float = 0.0
-    rsi:        float = 50.0
 
 def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
     sym = ticker["symbol"]
-    min_len = max(80, POC_LOOKBACK+10)
-    if len(candles) < min_len: return None
+    if len(candles) < 80: return None
 
     closes  = np.array([c["close"]  for c in candles], float)
     highs   = np.array([c["high"]   for c in candles], float)
@@ -486,108 +434,87 @@ def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
     vusd = vol24h(candles)
     if vusd < MIN_VOL_USDT: return None
 
-    atr_arr   = calc_atr(highs, lows, closes)
-    atr_now   = float(atr_arr[-1])
-    vwap_now  = float(calc_vwap(highs, lows, closes, volumes)[-1])
-    poc       = calc_poc(closes, volumes, POC_LOOKBACK)
-    stc_arr   = stc_v45(closes)
-    adx_arr   = calc_adx(highs, lows, closes)
-    adx_now   = float(adx_arr[-1])
-    slope_arr = calc_magic_slope(closes, EMA_FAST)
-    slope_now = float(slope_arr[-1])
-    rvol_arr  = calc_rvol(volumes, 50)
-    rvol_now  = float(rvol_arr[-1])
-    rsi_arr   = calc_rsi(closes, RSI_PERIOD)
-    rsi_now   = float(rsi_arr[-1])
-    e_fast    = ema(closes, EMA_FAST)
-    e_slow    = ema(closes, EMA_SLOW)
-    h50       = hma(closes, 50)
+    atr_arr  = calc_atr(highs,lows,closes)
+    atr_now  = float(atr_arr[-1])
+    vwap_now = float(calc_vwap(highs,lows,closes,volumes)[-1])
+    poc      = calc_poc(closes,volumes,POC_LOOKBACK)
+    stc_arr  = stc_ind(closes)
+    adx_arr  = calc_adx(highs,lows,closes)
+    adx_now  = float(adx_arr[-1])
+    slp_arr  = calc_slope(closes,EMA_FAST)
+    slp_now  = float(slp_arr[-1])
+    rvol_arr = calc_rvol(volumes,50)
+    rvol_now = float(rvol_arr[-1])
+    e_fast   = ema(closes,EMA_FAST)
+    e_slow   = ema(closes,EMA_SLOW)
+    h50      = hma(closes,50)
 
-    ph_v = pivot_hi(highs,4); pl_v = pivot_lo(lows,4)
-    vph  = ph_v[~np.isnan(ph_v)]; vpl = pl_v[~np.isnan(pl_v)]
+    ph_v=pivot_hi(highs,4); pl_v=pivot_lo(lows,4)
+    vph=ph_v[~np.isnan(ph_v)]; vpl=pl_v[~np.isnan(pl_v)]
     peak   = float(vph[-1]) if len(vph)>0 else float(highs[-1])
     valley = float(vpl[-1]) if len(vpl)>0 else float(lows[-1])
 
-    htf_bull = htf_bear = False
-    if len(candles_1h) >= 20:
-        c1      = np.array([c["close"] for c in candles_1h],float)
-        e7_1    = ema(c1,EMA_FAST); e17_1 = ema(c1,EMA_SLOW); h50_1 = hma(c1,50)
-        htf_bull = bool(c1[-1]>h50_1[-1] and e7_1[-1]>e17_1[-1])
-        htf_bear = bool(c1[-1]<h50_1[-1] and e7_1[-1]<e17_1[-1])
+    htf_bull=htf_bear=False
+    if len(candles_1h)>=20:
+        c1=np.array([c["close"] for c in candles_1h],float)
+        e7_1=ema(c1,EMA_FAST); e17_1=ema(c1,EMA_SLOW); h50_1=hma(c1,50)
+        htf_bull=bool(c1[-1]>h50_1[-1] and e7_1[-1]>e17_1[-1])
+        htf_bear=bool(c1[-1]<h50_1[-1] and e7_1[-1]<e17_1[-1])
 
-    i = -1
-    cn = float(closes[i]); hi_now = float(highs[i]); lo_now = float(lows[i])
+    i=-1; cn=float(closes[i]); hi=float(highs[i]); lo=float(lows[i])
 
-    dist_poc   = abs(cn-poc) > (atr_now*1.5)
-    cond_vol   = rvol_now > RVOL_MIN
-    stc_up     = stc_arr[i] > stc_arr[i-1]
-    stc_down   = stc_arr[i] < stc_arr[i-1]
-    adx_ok     = adx_now < ADX_MAX
+    dist_poc = abs(cn-poc)>(atr_now*1.5)
+    cond_vol = rvol_now>RVOL_MIN
+    stc_up   = stc_arr[i]>stc_arr[i-1]
+    stc_down = stc_arr[i]<stc_arr[i-1]
+    adx_ok   = adx_now<ADX_MAX
 
-    # RSI filters — mejoran winrate evitando entradas en extremos
-    rsi_long_ok  = rsi_now < RSI_OB   # no LONG si sobrecomprado
-    rsi_short_ok = rsi_now > RSI_OS   # no SHORT si sobrevendido
-
-    long_cond  = (lo_now<valley and cn<vwap_now and slope_now>SLOPE_MIN
-                  and stc_up and adx_ok and dist_poc and cond_vol
-                  and rsi_long_ok)   # ← nuevo: RSI filter
-    short_cond = (hi_now>peak and cn>vwap_now and slope_now<-SLOPE_MIN
-                  and stc_down and adx_ok and dist_poc and cond_vol
-                  and rsi_short_ok)  # ← nuevo: RSI filter
+    long_cond  = (lo<valley and cn<vwap_now and slp_now>SLOPE_MIN
+                  and stc_up and adx_ok and dist_poc and cond_vol)
+    short_cond = (hi>peak and cn>vwap_now and slp_now<-SLOPE_MIN
+                  and stc_down and adx_ok and dist_poc and cond_vol)
 
     score=0; signals=[]; direction="NEUTRAL"
+    hull_bull=cn>float(h50[-1]); hull_bear=not hull_bull
 
     if long_cond:
-        direction="LONG"; score=85; signals=["V46🟢"]
-        if htf_bull: score+=10; signals.append("1H🟢")
-        if e_fast[i]>e_slow[i]: score+=5; signals.append("EMA✅")
-        if rsi_now < 50: score+=5; signals.append(f"RSI{rsi_now:.0f}✅")
+        direction="LONG"; score=85; signals=["V45🟢"]
+        if htf_bull:              score+=10; signals.append("1H🟢")
+        if e_fast[i]>e_slow[i]:  score+=5;  signals.append("EMA✅")
     elif short_cond:
-        direction="SHORT"; score=85; signals=["V46🔴"]
-        if htf_bear: score+=10; signals.append("1H🔴")
-        if e_fast[i]<e_slow[i]: score+=5; signals.append("EMA✅")
-        if rsi_now > 50: score+=5; signals.append(f"RSI{rsi_now:.0f}✅")
+        direction="SHORT"; score=85; signals=["V45🔴"]
+        if htf_bear:              score+=10; signals.append("1H🔴")
+        if e_fast[i]<e_slow[i]:  score+=5;  signals.append("EMA✅")
     else:
-        hull_bull = cn>float(h50[-1]); hull_bear = not hull_bull
-        direction = "LONG" if hull_bull else "SHORT"
-        if hull_bull or hull_bear:    score+=20; signals.append("Hull✅")
-        if e_fast[i]>e_slow[i] and hull_bull: score+=15; signals.append("EMA✅")
-        if e_fast[i]<e_slow[i] and hull_bear: score+=15; signals.append("EMA✅")
-        if cond_vol:                  score+=15; signals.append(f"RVOL{rvol_now:.1f}✅")
-        else:                         signals.append(f"RVOL{rvol_now:.1f}·")
-        if stc_up and hull_bull:      score+=12; signals.append("STC✅")
-        if stc_down and hull_bear:    score+=12; signals.append("STC✅")
-        if adx_ok:                    score+=8;  signals.append(f"ADX{adx_now:.0f}✅")
-        else:                         signals.append(f"ADX{adx_now:.0f}⚠️")
-        if dist_poc:                  score+=8;  signals.append("POC✅")
+        direction="LONG" if hull_bull else "SHORT"
+        if hull_bull or hull_bear:           score+=20; signals.append("Hull✅")
+        if (hull_bull and e_fast[i]>e_slow[i]) or (hull_bear and e_fast[i]<e_slow[i]):
+            score+=15; signals.append("EMA✅")
+        if cond_vol:  score+=15; signals.append(f"RVOL{rvol_now:.1f}✅")
+        else:         signals.append(f"RVOL{rvol_now:.1f}·")
+        if (stc_up and hull_bull) or (stc_down and hull_bear):
+            score+=12; signals.append("STC✅")
+        if adx_ok:    score+=8;  signals.append(f"ADX{adx_now:.0f}✅")
+        else:         signals.append(f"ADX{adx_now:.0f}⚠️")
+        if dist_poc:  score+=8;  signals.append("POC✅")
         if (htf_bull and hull_bull) or (htf_bear and hull_bear):
             score+=12; signals.append("1H✅")
-        # Filtro RSI en fallback — descuenta si RSI extremo
-        if hull_bull  and not rsi_long_ok:  score -= 20; signals.append(f"RSI{rsi_now:.0f}⚠️")
-        if hull_bear  and not rsi_short_ok: score -= 20; signals.append(f"RSI{rsi_now:.0f}⚠️")
-        score = min(score, 84)
+        score=min(score,84)
 
-    # Funding rate descuenta score
-    if direction=="LONG"  and funding < -FUNDING_SKIP:
-        score -= 10; signals.append(f"Fund{funding*100:.3f}%⚠️")
-    if direction=="SHORT" and funding > FUNDING_SKIP:
-        score -= 10; signals.append(f"Fund{funding*100:.3f}%⚠️")
+    signals+=[f"Slp{slp_now:+.0f}",f"R{rvol_now:.1f}",f"ADX{adx_now:.0f}"]
+    score=min(max(score,0),100)
 
-    signals += [f"Slope{slope_now:+.0f}", f"RVOL{rvol_now:.1f}", f"ADX{adx_now:.0f}",
-                f"RSI{rsi_now:.0f}"]
-    score = min(max(score,0), 100)
-
-    log.info(
-        f"{sym}: score={score} dir={direction} long={long_cond} short={short_cond} "
-        f"slope={slope_now:.1f} adx={adx_now:.1f} rvol={rvol_now:.2f} "
-        f"rsi={rsi_now:.1f} poc={dist_poc}"
-    )
+    log.info(f"{sym}: score={score} dir={direction} "
+             f"long={long_cond} short={short_cond} "
+             f"slp={slp_now:.1f} adx={adx_now:.1f} "
+             f"rvol={rvol_now:.2f} poc={dist_poc} vwap_ok="
+             f"{cn<vwap_now if direction=='LONG' else cn>vwap_now}")
 
     if long_cond:
-        sl=lo_now-atr_now*ATR_SL_MULT; risk=abs(cn-sl)
+        sl=lo-atr_now*ATR_SL_MULT; risk=abs(cn-sl)
         tp=cn+risk*RR_RATIO; tp_half=cn+risk
     elif short_cond:
-        sl=hi_now+atr_now*ATR_SL_MULT; risk=abs(sl-cn)
+        sl=hi+atr_now*ATR_SL_MULT; risk=abs(sl-cn)
         tp=cn-risk*RR_RATIO; tp_half=cn-risk
     else:
         sl_d=atr_now*ATR_SL_MULT
@@ -600,248 +527,231 @@ def analyze(ticker, candles, candles_1h, funding) -> Optional[CoinResult]:
                       entry=cn, sl=sl, tp=tp, tp_half=tp_half,
                       vol_usd=vusd, atr_val=atr_now, signals=signals,
                       change_24h=ticker.get("change_24h",0),
-                      funding=funding, slope=slope_now, adx=adx_now,
-                      rvol=rvol_now, rsi=rsi_now)
+                      funding=funding, slope=slp_now, adx=adx_now, rvol=rvol_now)
 
 
 # ══════════════════════════════════════════════════════════════════
-# CALC QTY
+# RISK
 # ══════════════════════════════════════════════════════════════════
 def calc_qty(balance, entry, sl) -> float:
-    dist = abs(entry-sl)
-    if dist < 1e-10: return 0.0
-    qty_risk = (balance*MAX_RISK_PCT/100)/dist
-    qty_max  = MAX_POS_USDT/max(entry,1e-10)
-    qty = min(qty_risk, qty_max)
+    dist=abs(entry-sl)
+    if dist<1e-10: return 0.0
+    qty_risk=(balance*MAX_RISK_PCT/100)/dist
+    qty_max=MAX_POS_USDT/max(entry,1e-10)
+    qty=min(qty_risk,qty_max)
     if   entry>=1000: qty=round(qty,4)
     elif entry>=100:  qty=round(qty,3)
     elif entry>=10:   qty=round(qty,2)
     elif entry>=1:    qty=round(qty,1)
     else:             qty=round(qty,0)
     qty=max(qty,0.001)
-    log.info(f"qty: bal={balance:.2f} entry={entry:.6f} dist={dist:.8f} "
-             f"risk={qty_risk:.4f} max={qty_max:.4f} final={qty}")
+    log.info(f"qty: bal={balance:.2f} entry={entry:.4f} dist={dist:.6f} → {qty}")
     return qty
 
 def is_blackout():
-    return BLACKOUT_START <= datetime.now(timezone.utc).hour < BLACKOUT_END
+    return BLACKOUT_START<=datetime.now(timezone.utc).hour<BLACKOUT_END
 
 
 # ══════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════
-exchange      = BingXClient()
-watchlist:    list[CoinResult]   = []
-last_dir:     dict[str,str]      = {}
-half_closed:  set[str]           = set()
-breakeven_set:set[str]           = set()
-# Cooldown: guarda timestamp del último intento fallido
-cooldown_ts:  dict[str,float]    = {}
-# Pérdidas consecutivas por símbolo
-consec_losses:dict[str,int]      = defaultdict(int)
-dynamic_blacklist: set[str]      = set()
+exchange     = BingXClient()
+watchlist:   list[CoinResult] = []
+last_dir:    dict[str,str]    = {}
+half_closed: set[str]         = set()
+trade_sl:    dict[str,float]  = {}   # sl por symbol
+trade_tp:    dict[str,float]  = {}   # tp por symbol
 
 
 # ══════════════════════════════════════════════════════════════════
-# STARTUP DIAGNOSTIC
+# DIAGNOSTICS
 # ══════════════════════════════════════════════════════════════════
 async def run_diagnostics():
-    lines = ["🔧 *DIAGNÓSTICO V46*\n━━━━━━━━━━━━━━━━━━━━━━\n"]
-
+    lines=["🔧 *DIAGNÓSTICO V45 ONE-WAY*\n━━━━━━━━━━━━━━━━━━━━\n"]
     try:
-        raw = await exchange.get_raw_balance()
-        lines.append("✅ *API Key:* conexión OK")
-        lines.append(f"📦 *Balance RAW:*\n`{str(raw)[:300]}`\n")
+        d=await exchange._get("/openApi/swap/v2/user/balance")
+        lines.append("✅ *API Key:* OK")
+        raw=d.get("data",{})
+        lines.append(f"📦 *RAW:* `{str(raw)[:200]}`\n")
     except Exception as e:
-        lines.append(f"❌ *API Key ERROR:* `{e}`")
-        await tg("\n".join(lines))
-        return False
+        lines.append(f"❌ *API Error:* `{e}`")
+        await tg("\n".join(lines)); return False
 
-    balance = await exchange.get_balance()
-    if balance > 0:
-        lines.append(f"✅ *Balance:* `{balance:.4f} USDT`")
-    else:
-        lines.append("❌ *Balance = 0* — parsing fallido o cuenta vacía")
-        lines.append("⚠️ Asegúrate de tener fondos en BingX *Futuros*")
+    balance=await exchange.get_balance()
+    if balance>0: lines.append(f"✅ *Balance:* `{balance:.4f} USDT`")
+    else:         lines.append("❌ *Balance=0* — transfiere a BingX Futuros")
 
     try:
-        positions = await exchange.get_all_positions()
-        n = len(positions)
-        icon = "🔴" if n >= MAX_POSITIONS else "✅"
-        lines.append(f"{icon} *Posiciones abiertas:* `{n}/{MAX_POSITIONS}`")
-        if n >= MAX_POSITIONS:
-            lines.append(f"⛔ *BLOQUEADO — {n} pos >= MAX={MAX_POSITIONS}*")
+        positions=await exchange.get_all_positions()
+        n=len(positions)
+        icon="🔴" if n>=MAX_POSITIONS else "✅"
+        lines.append(f"{icon} *Posiciones:* `{n}/{MAX_POSITIONS}`")
+        if n>=MAX_POSITIONS: lines.append("⛔ BLOQUEADO — sube MAX_POSITIONS")
+        total_unr=0.0
         for pos in positions:
-            sym = pos.get("symbol","?")
-            amt = float(pos.get("positionAmt", pos.get("size",0)))
-            avg = float(pos.get("avgPrice",    pos.get("entryPrice",0)))
-            cur = float(pos.get("markPrice",   pos.get("currentPrice",0)))
-            unr = float(pos.get("unrealizedProfit", pos.get("unRealizedProfit",0)))
-            direction = "LONG" if amt>0 else "SHORT"
-            pnl_pct = ((cur-avg)/avg*100) if amt>0 else ((avg-cur)/avg*100) if avg>0 else 0
-            e2 = "🟢" if unr>=0 else "🔴"
-            lines.append(f"  {e2} {sym} {direction} {pnl_pct:+.1f}% ({unr:+.2f}$)")
+            sym=pos.get("symbol","?")
+            amt=float(pos.get("positionAmt",0))
+            avg=float(pos.get("avgPrice",pos.get("entryPrice",0)))
+            cur=float(pos.get("markPrice",pos.get("currentPrice",0)))
+            unr=float(pos.get("unrealizedProfit",pos.get("unRealizedProfit",0)))
+            total_unr+=unr
+            direction="LONG" if amt>0 else "SHORT"
+            pnl=((cur-avg)/avg*100) if amt>0 else ((avg-cur)/avg*100)
+            e2="🟢" if unr>=0 else "🔴"
+            lines.append(f"  {e2} `{sym}` {direction} {pnl:+.1f}% ({unr:+.2f}$)")
+        if positions: lines.append(f"  PnL total: `{total_unr:+.2f} USDT`")
     except Exception as e:
-        lines.append(f"❌ *Posiciones ERROR:* `{e}`")
+        lines.append(f"❌ *Posiciones:* `{e}`")
 
     try:
-        k = await exchange.get_klines("BTC-USDT", "15m", 10)
-        lines.append(f"✅ *Klines BTC:* `{len(k)} velas` precio=`{k[-1]['close']:.2f}`")
+        k=await exchange.get_klines("BTC-USDT","15m",5)
+        lines.append(f"✅ *Klines BTC:* `{k[-1]['close']:.0f}`")
     except Exception as e:
-        lines.append(f"❌ *Klines ERROR:* `{e}`")
+        lines.append(f"❌ *Klines:* `{e}`")
 
-    # Test leverage — ahora debería funcionar con el fix
     try:
-        ok = await exchange.set_leverage("BTC-USDT", LEVERAGE)
-        lines.append(f"{'✅' if ok else '⚠️'} *Leverage {LEVERAGE}x BTC:* {'OK ← FIX aplicado' if ok else 'fallo'}")
+        ok=await exchange.set_leverage("BTC-USDT",LEVERAGE)
+        lines.append(f"{'✅' if ok else '⚠️'} *Leverage {LEVERAGE}x*")
     except Exception as e:
-        lines.append(f"❌ *Leverage ERROR:* `{e}`")
+        lines.append(f"❌ *Leverage:* `{e}`")
 
-    lines.append(f"\n⚙️ *Config V46:*")
-    lines.append(f"  TF: `{TIMEFRAME}` | Score: `{SCORE_ENTRY}` | Max pos: `{MAX_POSITIONS}`")
-    lines.append(f"  MaxPosUSDT: `{MAX_POS_USDT}` | Riesgo: `{MAX_RISK_PCT}%`")
-    lines.append(f"  RVOL_MIN: `{RVOL_MIN}` | SLOPE_MIN: `{SLOPE_MIN}`")
-    lines.append(f"  ADX_MAX: `{ADX_MAX}` | RR: `{RR_RATIO}R`")
-    lines.append(f"  RSI OB/OS: `{RSI_OB}/{RSI_OS}` | Cooldown: `{SYMBOL_COOLDOWN}min`")
-    lines.append(f"  Funding skip: `>{FUNDING_SKIP*100:.3f}%`")
+    lines.append(f"\n⚙️ TF:`{TIMEFRAME}` Score:`{SCORE_ENTRY}` MaxPos:`{MAX_POSITIONS}`")
+    lines.append(f"MaxUSDT:`{MAX_POS_USDT}` Riesgo:`{MAX_RISK_PCT}%` Lev:`{LEVERAGE}x`")
+    lines.append(f"RVOL≥`{RVOL_MIN}` Slope≥`±{SLOPE_MIN}` ADX<`{ADX_MAX}` TP=`{RR_RATIO}R`")
+    lines.append(f"*Modo: ONE-WAY (positionSide=BOTH)*")
 
-    lines.append(f"\n{'✅ Bot listo para operar' if balance>0 else '❌ Sin balance — no puede abrir trades'}")
+    if balance>0:
+        try:
+            k=await exchange.get_klines("BTC-USDT","15m",5)
+            entry=k[-1]["close"]
+            qty_sim=calc_qty(balance,entry,entry-entry*0.01)
+            lines.append(f"\n📐 Sim BTC entry=`{entry:.0f}` → qty=`{qty_sim}`")
+        except: pass
+
+    lines.append(f"\n{'✅ *Listo para operar*' if balance>0 else '❌ *Sin balance*'}")
     await tg("\n".join(lines))
-    return balance > 0
+    return balance>0
 
 
 # ══════════════════════════════════════════════════════════════════
-# OPEN TRADE — con cooldown y auto-blacklist
+# OPEN TRADE
 # ══════════════════════════════════════════════════════════════════
 async def open_trade(cr: CoinResult) -> bool:
-    sym = cr.symbol
+    sym=cr.symbol
     try:
         log.info(f"⚡ INTENTANDO {cr.direction} {sym} score={cr.score}")
 
-        # Blacklist dinámica
-        if sym in dynamic_blacklist:
-            log.info(f"  {sym}: en blacklist dinámica"); return False
-
-        # Cooldown por símbolo
-        if sym in cooldown_ts:
-            elapsed = (time.time() - cooldown_ts[sym]) / 60
-            if elapsed < SYMBOL_COOLDOWN:
-                log.info(f"  {sym}: cooldown {elapsed:.0f}/{SYMBOL_COOLDOWN}min")
-                return False
-
-        if last_dir.get(sym) == cr.direction:
+        if last_dir.get(sym)==cr.direction:
             log.info(f"  {sym}: señal ya activa"); return False
 
-        pos = await exchange.get_position(sym)
+        pos=await exchange.get_position(sym)
         if pos:
-            log.info(f"  {sym}: posición ya abierta"); return False
+            log.info(f"  {sym}: ya tiene posición"); return False
 
-        balance = await exchange.get_balance()
-        log.info(f"  {sym}: balance={balance:.4f} USDT")
-        if balance < 5:
-            await tg(
-                f"⚠️ *Balance insuficiente: `{balance:.4f} USDT`*\n"
-                "Transfiere USDT de Spot a Futuros en BingX → Redeploy"
-            )
-            return False
+        balance=await exchange.get_balance()
+        if balance<5:
+            await tg(f"⚠️ Balance bajo: `{balance:.2f} USDT`"); return False
 
-        # Funding rate check
-        if cr.direction == "LONG"  and cr.funding < -FUNDING_SKIP:
-            log.info(f"  {sym}: funding muy negativo {cr.funding:.5f} — skip LONG")
-            return False
-        if cr.direction == "SHORT" and cr.funding > FUNDING_SKIP:
-            log.info(f"  {sym}: funding muy positivo {cr.funding:.5f} — skip SHORT")
-            return False
-
-        qty = calc_qty(balance, cr.entry, cr.sl)
-        if qty <= 0:
+        qty=calc_qty(balance,cr.entry,cr.sl)
+        if qty<=0:
             log.warning(f"  {sym}: qty=0"); return False
 
-        await exchange.set_leverage(sym, LEVERAGE)
-        side = "BUY" if cr.direction=="LONG" else "SELL"
-        await exchange.place_order(
-            symbol=sym, side=side,
-            position_side=cr.direction, qty=qty,
-            stop_loss=cr.sl, take_profit=cr.tp,
-        )
+        await exchange.set_leverage(sym,LEVERAGE)
 
-        risk_usd  = abs(cr.entry-cr.sl)*qty
-        pos_value = cr.entry*qty
-        emoji = "🟢" if cr.direction=="LONG" else "🔴"
+        # ONE-WAY MODE — la clave del fix
+        if cr.direction=="LONG":
+            await exchange.open_long(sym, qty, cr.sl, cr.tp)
+        else:
+            await exchange.open_short(sym, qty, cr.sl, cr.tp)
+
+        risk_usd=abs(cr.entry-cr.sl)*qty
+        pos_value=cr.entry*qty
+        emoji="🟢" if cr.direction=="LONG" else "🔴"
         await tg(
-            f"{emoji} *{cr.direction} — V46*\n"
-            f"Par: `{sym}` | Score: `{cr.score}/100`\n"
-            f"Entry: `{cr.entry:.6f}`\n"
-            f"SL: `{cr.sl:.6f}` | TP: `{cr.tp:.6f}` *({RR_RATIO}R)*\n"
-            f"Qty: `{qty}` | Valor: `≈{pos_value:.2f}$`\n"
+            f"{emoji} *{cr.direction} ABIERTO — V45*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Par:    `{sym}`\n"
+            f"Entry:  `{cr.entry:.6f}`\n"
+            f"SL:     `{cr.sl:.6f}`\n"
+            f"TP:     `{cr.tp:.6f}` *({RR_RATIO}R)*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Qty:    `{qty}` | Lev:`{LEVERAGE}x`\n"
+            f"Valor:  `≈{pos_value:.2f} USDT`\n"
             f"Riesgo: `≈{risk_usd:.2f} USDT`\n"
-            f"RSI:`{cr.rsi:.0f}` Slope:`{cr.slope:+.0f}` "
-            f"ADX:`{cr.adx:.0f}` RVOL:`{cr.rvol:.2f}x`\n"
+            f"Score:  `{cr.score}/100`\n"
+            f"Slp:`{cr.slope:+.0f}` ADX:`{cr.adx:.0f}` RVOL:`{cr.rvol:.1f}x`\n"
             f"{' '.join(cr.signals[:6])}"
         )
-        last_dir[sym] = cr.direction
-        # Resetear cooldown y pérdidas al abrir exitosamente
-        cooldown_ts.pop(sym, None)
-        log.info(f"✅ TRADE ABIERTO {cr.direction} {sym} qty={qty}")
+        last_dir[sym]=cr.direction
+        trade_sl[sym]=cr.sl
+        trade_tp[sym]=cr.tp
+        log.info(f"✅ TRADE ABIERTO {cr.direction} {sym} qty={qty} val={pos_value:.2f}$ sl={cr.sl:.6f} tp={cr.tp:.6f}")
         return True
 
     except Exception as e:
         log.error(f"open_trade {sym}: {e}", exc_info=True)
         await tg(f"❌ *Error orden* `{sym}`:\n`{str(e)[:300]}`")
-        # Registrar cooldown en caso de error
-        cooldown_ts[sym] = time.time()
-        consec_losses[sym] += 1
-        if consec_losses[sym] >= MAX_LOSSES:
-            dynamic_blacklist.add(sym)
-            await tg(f"⛔ `{sym}` añadido a blacklist dinámica ({MAX_LOSSES} errores)")
         return False
 
 
 # ══════════════════════════════════════════════════════════════════
-# MANAGE POSITIONS — half-close mejorado + breakeven
+# MANAGE POSITIONS
 # ══════════════════════════════════════════════════════════════════
 async def manage_positions():
     try:
-        positions = await exchange.get_all_positions()
+        positions=await exchange.get_all_positions()
         if not positions: return
         for pos in positions:
-            sym = pos.get("symbol","")
-            amt = float(pos.get("positionAmt", pos.get("size",0)))
-            avg = float(pos.get("avgPrice",    pos.get("entryPrice",0)))
-            cur = float(pos.get("markPrice",   pos.get("currentPrice",0)))
-            unr = float(pos.get("unrealizedProfit", pos.get("unRealizedProfit",0)))
+            sym=pos.get("symbol","")
+            amt=float(pos.get("positionAmt",pos.get("size",0)))
+            avg=float(pos.get("avgPrice",   pos.get("entryPrice",0)))
+            cur=float(pos.get("markPrice",  pos.get("currentPrice",0)))
+            unr=float(pos.get("unrealizedProfit",pos.get("unRealizedProfit",0)))
             if avg<=0 or cur<=0: continue
-            is_long  = amt>0
-            pnl_pct  = ((cur-avg)/avg*100) if is_long else ((avg-cur)/avg*100)
-            direction= "LONG" if is_long else "SHORT"
-            log.info(f"POS {sym} {direction} pnl={pnl_pct:+.2f}%")
+            is_long=amt>0
+            pnl_pct=((cur-avg)/avg*100) if is_long else ((avg-cur)/avg*100)
+            direction="LONG" if is_long else "SHORT"
+            sl=trade_sl.get(sym,0)
+            tp=trade_tp.get(sym,0)
+            log.info(f"POS {sym} {direction} cur={cur:.6f} sl={sl:.6f} tp={tp:.6f} pnl={pnl_pct:+.2f}% unreal={unr:+.2f}")
 
-            # Half-close en +1.0% (subido de 0.6% para dejar correr)
-            if sym not in half_closed and pnl_pct >= 1.0:
+            # Cerrar por SL manual
+            if sl>0 and ((is_long and cur<=sl) or (not is_long and cur>=sl)):
                 try:
-                    await exchange.close_half(sym, pos)
+                    await exchange.close_all(sym)
+                    emoji="🛑"
+                    await tg(f"{emoji} *SL TOCADO* `{sym}` {direction}\n"
+                             f"Precio: `{cur:.6f}` | SL: `{sl:.6f}`\n"
+                             f"PnL: `{pnl_pct:+.2f}%` | `{unr:+.2f} USDT`")
+                    trade_sl.pop(sym,None); trade_tp.pop(sym,None)
+                    last_dir[sym]="NONE"; half_closed.discard(sym)
+                    continue
+                except Exception as e:
+                    log.error(f"SL close {sym}: {e}")
+
+            # Cerrar por TP manual
+            if tp>0 and ((is_long and cur>=tp) or (not is_long and cur<=tp)):
+                try:
+                    await exchange.close_all(sym)
+                    await tg(f"🎯 *TP ALCANZADO* `{sym}` {direction}\n"
+                             f"Precio: `{cur:.6f}` | TP: `{tp:.6f}`\n"
+                             f"PnL: `+{pnl_pct:+.2f}%` | `+{unr:+.2f} USDT` 🎉")
+                    trade_sl.pop(sym,None); trade_tp.pop(sym,None)
+                    last_dir[sym]="NONE"; half_closed.discard(sym)
+                    continue
+                except Exception as e:
+                    log.error(f"TP close {sym}: {e}")
+
+            # Cierre parcial al 50% cuando llegue al 1R
+            if sym not in half_closed and pnl_pct>=0.6:
+                try:
+                    await exchange.close_half(sym,pos)
                     half_closed.add(sym)
-                    await tg(
-                        f"🔒 *Cierre 50%* `{sym}` {direction}\n"
-                        f"PnL: `+{pnl_pct:.2f}%` | `+{unr:.2f} USDT`"
-                    )
+                    await tg(f"🔒 *Cierre 50%* `{sym}` {direction}\n"
+                             f"PnL: `+{pnl_pct:.2f}%` | `+{unr:.2f} USDT`\n"
+                             f"Resto hasta TP `{tp:.6f}`")
                 except Exception as e:
                     log.error(f"close_half {sym}: {e}")
-
-            # Breakeven SL: si profit >= 1.5%, SL sube a entry
-            # (BingX no permite mover SL via API directamente, se logra
-            #  cerrando y reabriendo; aquí solo lo registramos para info)
-            if sym not in breakeven_set and pnl_pct >= 1.5:
-                breakeven_set.add(sym)
-                await tg(
-                    f"🛡️ *Breakeven activo* `{sym}` {direction}\n"
-                    f"PnL: `+{pnl_pct:.2f}%` — SL en entry recomendado"
-                )
-
-            # Pérdida < -3% → advertencia
-            if pnl_pct < -3.0:
-                log.warning(f"⚠️ {sym} {direction} pnl={pnl_pct:+.2f}% — SL próximo")
-
     except Exception as e:
         log.error(f"manage_positions: {e}")
 
@@ -856,61 +766,55 @@ async def scanner_loop():
             if is_blackout():
                 await asyncio.sleep(SCAN_INTERVAL); continue
 
-            log.info("🔍 Escaneando V46...")
-            tickers = await exchange.get_tickers()
+            log.info("🔍 Escaneando V45 ONE-WAY...")
+            tickers=await exchange.get_tickers()
             if not tickers:
                 await tg("⚠️ Sin tickers.")
                 await asyncio.sleep(SCAN_INTERVAL); continue
 
-            syms = [t["symbol"] for t in tickers]
-            lim  = max(200, POC_LOOKBACK+80)
-            r15, r1h, rfr = await asyncio.gather(
-                asyncio.gather(*[exchange.get_klines(s,TIMEFRAME,lim) for s in syms], return_exceptions=True),
-                asyncio.gather(*[exchange.get_klines(s,TF_HIGH,  100) for s in syms], return_exceptions=True),
-                asyncio.gather(*[exchange.get_funding_rate(s)         for s in syms], return_exceptions=True),
+            syms=[t["symbol"] for t in tickers]
+            lim=max(200,POC_LOOKBACK+80)
+            r15,r1h,rfr=await asyncio.gather(
+                asyncio.gather(*[exchange.get_klines(s,TIMEFRAME,lim) for s in syms],return_exceptions=True),
+                asyncio.gather(*[exchange.get_klines(s,TF_HIGH,  100) for s in syms],return_exceptions=True),
+                asyncio.gather(*[exchange.get_funding_rate(s)         for s in syms],return_exceptions=True),
             )
 
-            results = []
+            results=[]
             for t,c15,c1h,fr in zip(tickers,r15,r1h,rfr):
-                if isinstance(c15, Exception): continue
-                cr = analyze(t, c15,
+                if isinstance(c15,Exception): continue
+                cr=analyze(t,c15,
                     c1h if not isinstance(c1h,Exception) else [],
                     fr  if not isinstance(fr, Exception) else 0.0)
                 if cr: results.append(cr)
 
-            results.sort(key=lambda x: x.score, reverse=True)
-            top = results[:SCAN_TOP_N]
+            results.sort(key=lambda x:x.score,reverse=True)
+            top=results[:SCAN_TOP_N]
 
-            wl = [r for r in top
-                  if r.score>=SCORE_ENTRY
-                  and r.direction!="NEUTRAL"
-                  and r.symbol not in dynamic_blacklist]
-            watchlist = wl if wl else [r for r in top[:5] if r.symbol not in dynamic_blacklist]
+            wl=[r for r in top if r.score>=SCORE_ENTRY and r.direction!="NEUTRAL"]
+            watchlist=wl if wl else top[:5]
             log.info(f"Watchlist: {[(r.symbol,r.score,r.direction) for r in watchlist]}")
 
-            lines = [f"🔍 *V46 — {len(top)} coins*\n"]
+            lines=[f"🔍 *V45 ONE-WAY — {len(top)} coins*\n"]
             for n,r in enumerate(top,1):
-                e   = "🟢" if r.direction=="LONG" else "🔴"
-                bar = "█"*(r.score//10) + "░"*(10-r.score//10)
-                tag = " ⚡*ENTRA*" if r.score>=SCORE_ENTRY else ""
-                bl  = " 🚫" if r.symbol in dynamic_blacklist else ""
+                e="🟢" if r.direction=="LONG" else "🔴"
+                bar="█"*(r.score//10)+"░"*(10-r.score//10)
+                tag=" ⚡*ENTRA*" if r.score>=SCORE_ENTRY else ""
                 lines.append(
-                    f"*#{n}* {e} `{r.symbol}` `{r.score}/100`{tag}{bl}\n"
+                    f"*#{n}* {e} `{r.symbol}` `{r.score}/100`{tag}\n"
                     f"`{bar}`\n"
                     f"Vol:`${r.vol_usd/1e6:.0f}M` RVOL:`{r.rvol:.1f}x`"
-                    f" RSI:`{r.rsi:.0f}` ADX:`{r.adx:.0f}`\n"
+                    f" ADX:`{r.adx:.0f}` Slp:`{r.slope:+.0f}`\n"
                     f"{' '.join(r.signals[:5])}\n"
                 )
             lines.append(f"\n🎯 *Watchlist ({len(watchlist)}):*")
             for r in watchlist:
-                e = "🟢" if r.direction=="LONG" else "🔴"
-                lines.append(f"  {e} `{r.symbol}` `{r.score}` → {r.direction} RSI:`{r.rsi:.0f}`")
-            if dynamic_blacklist:
-                lines.append(f"\n🚫 Blacklist: `{', '.join(dynamic_blacklist)}`")
+                e="🟢" if r.direction=="LONG" else "🔴"
+                lines.append(f"  {e} `{r.symbol}` `{r.score}` → {r.direction}")
             await tg("\n".join(lines)[:3900])
 
         except Exception as e:
-            log.error(f"Scanner: {e}", exc_info=True)
+            log.error(f"Scanner: {e}",exc_info=True)
             await tg(f"⚠️ *Error escáner:* `{str(e)[:200]}`")
 
         await asyncio.sleep(SCAN_INTERVAL)
@@ -920,6 +824,7 @@ async def scanner_loop():
 # TRADING LOOP
 # ══════════════════════════════════════════════════════════════════
 async def trading_loop():
+    log.info("Trading: esperando primer escaneo (50s)...")
     await asyncio.sleep(50)
     while True:
         try:
@@ -928,31 +833,24 @@ async def trading_loop():
 
             await manage_positions()
 
-            open_pos  = await exchange.get_all_positions()
-            n_open    = len(open_pos)
-            open_syms = {p.get("symbol","") for p in open_pos}
-
-            # Limpiar half_closed y breakeven para posiciones ya cerradas
-            for sym in list(half_closed):
-                if sym not in open_syms: half_closed.discard(sym); last_dir.pop(sym,None)
-            for sym in list(breakeven_set):
-                if sym not in open_syms: breakeven_set.discard(sym)
-
+            open_pos=await exchange.get_all_positions()
+            n_open=len(open_pos)
+            open_syms={p.get("symbol","") for p in open_pos}
             log.info(f"Trading: {n_open}/{MAX_POSITIONS} pos | watchlist={len(watchlist)}")
 
-            if n_open < MAX_POSITIONS and watchlist:
+            if n_open<MAX_POSITIONS and watchlist:
                 for cr in list(watchlist):
-                    if n_open >= MAX_POSITIONS: break
+                    if n_open>=MAX_POSITIONS: break
                     if cr.symbol in open_syms: continue
-                    if cr.score < SCORE_ENTRY:
-                        log.info(f"  {cr.symbol}: score {cr.score}<{SCORE_ENTRY}"); continue
-                    opened = await open_trade(cr)
+                    if cr.score<SCORE_ENTRY:
+                        log.info(f"  {cr.symbol}: {cr.score}<{SCORE_ENTRY}"); continue
+                    opened=await open_trade(cr)
                     if opened:
-                        n_open += 1; open_syms.add(cr.symbol)
+                        n_open+=1; open_syms.add(cr.symbol)
                     await asyncio.sleep(3)
 
         except Exception as e:
-            log.error(f"Trading loop: {e}", exc_info=True)
+            log.error(f"Trading loop: {e}",exc_info=True)
         await asyncio.sleep(60)
 
 
@@ -960,34 +858,20 @@ async def trading_loop():
 # MAIN
 # ══════════════════════════════════════════════════════════════════
 async def main():
-    log.info("🚀 Sniper Bot V46 — Arrancando con diagnóstico...")
+    log.info("🚀 Sniper Bot V45 ONE-WAY MODE — Arrancando...")
+    await tg(f"🔄 *V45 ONE-WAY arrancando...*\nTF:`{TIMEFRAME}` Lev:`{LEVERAGE}x`")
 
-    await tg(
-        "🔄 *Sniper Bot V46 arrancando...*\n"
-        f"TF: `{TIMEFRAME}` | Lev: `{LEVERAGE}x` | Riesgo: `{MAX_RISK_PCT}%`\n"
-        f"🔧 Fix: Signature POST corregida\n"
-        f"📈 Nuevo: RSI filter + Cooldown + Auto-blacklist"
-    )
-
-    ok = await run_diagnostics()
-
+    ok=await run_diagnostics()
     if not ok:
-        await tg(
-            "⛔ *Bot detenido — sin balance*\n\n"
-            "*Pasos:*\n"
-            "1. Abre BingX app\n"
-            "2. `Activos` → `Futuros` → `Transferir`\n"
-            "3. Railway → `Redeploy`"
-        )
+        await tg("⛔ Sin balance en Futuros\n1. BingX → Activos → Futuros → Transferir\n2. Railway → Redeploy")
         while True:
             await asyncio.sleep(300)
-            bal = await exchange.get_balance()
-            if bal > 5:
-                await tg(f"✅ Balance detectado: `{bal:.2f} USDT` — arrancando...")
+            bal=await exchange.get_balance()
+            if bal>5:
+                await tg(f"✅ Balance: `{bal:.2f} USDT` — arrancando!")
                 break
 
     await asyncio.gather(scanner_loop(), trading_loop())
-
 
 if __name__ == "__main__":
     asyncio.run(main())
