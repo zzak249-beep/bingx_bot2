@@ -1,178 +1,189 @@
 """
-Strategy: Sniper Apex V26.1 — Multi-Coin Ready
-Añade watchlist dinámica actualizada por el escáner.
+EMA Strategy — cruces EMA1/EMA2 con filtro HTF EMA3
+Indicadores: EMA, RSI, ADX, ATR
 """
-
 import logging
-import os
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
+import pandas as pd
 
-from .exchange import BingXClient
-from .risk_manager import RiskManager
-from .telegram_bot import TelegramNotifier
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger("SniperStrategy")
-LEVERAGE = int(os.getenv("LEVERAGE", "5"))
-
-def ema(values: np.ndarray, period: int) -> np.ndarray:
-    k = 2 / (period + 1)
-    result = np.zeros_like(values)
-    result[0] = values[0]
-    for i in range(1, len(values)):
-        result[i] = values[i] * k + result[i - 1] * (1 - k)
-    return result
-
-def hma(values: np.ndarray, period: int) -> np.ndarray:
-    half = ema(values, period // 2)
-    full = ema(values, period)
-    return ema(2 * half - full, int(np.sqrt(period)))
-
-def sma(values: np.ndarray, period: int) -> np.ndarray:
-    return np.convolve(values, np.ones(period) / period, mode="same")
-
-def stoch_series(src: np.ndarray, period: int) -> np.ndarray:
-    result = np.zeros_like(src)
-    for i in range(period - 1, len(src)):
-        window = src[i - period + 1 : i + 1]
-        lo, hi = window.min(), window.max()
-        result[i] = (src[i] - lo) / (hi - lo + 1e-10)
-    return result
-
-def stc(close: np.ndarray, stc_len=10, fast=23, slow=50) -> np.ndarray:
-    macd = ema(close, fast) - ema(close, slow)
-    return stoch_series(stoch_series(macd, stc_len), stc_len)
-
-def pivot_high(highs: np.ndarray, n: int) -> np.ndarray:
-    result = np.full_like(highs, np.nan)
-    for i in range(n, len(highs) - n):
-        if highs[i] == highs[i - n : i + n + 1].max():
-            result[i] = highs[i]
-    return result
-
-def pivot_low(lows: np.ndarray, n: int) -> np.ndarray:
-    result = np.full_like(lows, np.nan)
-    for i in range(n, len(lows) - n):
-        if lows[i] == lows[i - n : i + n + 1].min():
-            result[i] = lows[i]
-    return result
 
 @dataclass
 class Signal:
-    direction: str
-    entry: float
-    sl: float
-    tp: float
-    atr: float
-    score: int = 0
-    winrate_note: str = ""
+    action:     str       # LONG | SHORT | HOLD
+    price:      float
+    ema1:       float
+    ema2:       float
+    ema3:       float
+    rsi:        float
+    adx:        float
+    atr:        float
+    atr_pct:    float
+    volume_ok:  bool
+    reason:     str
+    timestamp:  str
+    score:      float
 
-class SniperStrategy:
-    def __init__(self, exchange: BingXClient, risk: RiskManager, telegram: TelegramNotifier):
-        self.exchange = exchange
-        self.risk = risk
-        self.telegram = telegram
-        self._last_signal = {}
-        self.watchlist = []
 
-    def update_watchlist(self, coins: list):
-        self.watchlist = coins
-        log.info(f"Watchlist: {[c.symbol for c in coins]}")
+def _ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-    def _compute_signals(self, candles: list) -> Signal:
-        closes  = np.array([c["close"]  for c in candles], dtype=float)
-        highs   = np.array([c["high"]   for c in candles], dtype=float)
-        lows    = np.array([c["low"]    for c in candles], dtype=float)
-        volumes = np.array([c["volume"] for c in candles], dtype=float)
 
-        e7, e17 = ema(closes, 7), ema(closes, 17)
-        e2, e4, e20 = ema(closes, 2), ema(closes, 4), ema(closes, 20)
-        hull50 = hma(closes, 50)
-        stc_vals = stc(closes)
-        vol_ma = sma(volumes, 20)
-        inst_vol = volumes[-1] > vol_ma[-1] * 1.5
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_l = loss.ewm(com=period - 1, adjust=False).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
 
-        ph, pl = pivot_high(highs, 5), pivot_low(lows, 5)
-        valid_ph, valid_pl = ph[~np.isnan(ph)], pl[~np.isnan(pl)]
-        peak   = float(valid_ph[-1]) if len(valid_ph) > 0 else highs[-1]
-        valley = float(valid_pl[-1]) if len(valid_pl) > 0 else lows[-1]
 
-        tr = np.maximum(highs - lows,
-             np.abs(highs - np.roll(closes, 1)),
-             np.abs(lows  - np.roll(closes, 1)))
-        atr14 = float(np.mean(tr[-14:]))
-        i = -1
-        entry = closes[i]
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean()
 
-        apex_long = (
-            e7[i-1] < e17[i-1] and e7[i] > e17[i]
-            and closes[i] > peak and inst_vol
-            and closes[i] > hull50[i]
-            and stc_vals[i] > stc_vals[i-1]
-            and (e7[i] - e7[i-1]) > 0
+
+def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_high = high.shift(1)
+    prev_low  = low.shift(1)
+    prev_close = close.shift(1)
+
+    up_move   = high - prev_high
+    down_move = prev_low - low
+    plus_dm   = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm  = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_s  = tr.ewm(com=period - 1, adjust=False).mean()
+    plus_s = pd.Series(plus_dm,  index=df.index).ewm(com=period - 1, adjust=False).mean()
+    minus_s= pd.Series(minus_dm, index=df.index).ewm(com=period - 1, adjust=False).mean()
+
+    dip  = 100 * plus_s  / atr_s.replace(0, np.nan)
+    dim  = 100 * minus_s / atr_s.replace(0, np.nan)
+    dx   = 100 * (dip - dim).abs() / (dip + dim).replace(0, np.nan)
+    return dx.ewm(com=period - 1, adjust=False).mean()
+
+
+class EMAStrategy:
+    def __init__(self, ema1_len=2, ema2_len=4, ema3_len=20, score_min=30.0,
+                 rsi_period=14, adx_period=14, atr_period=14):
+        self.ema1_len   = ema1_len
+        self.ema2_len   = ema2_len
+        self.ema3_len   = ema3_len
+        self.score_min  = score_min
+        self.rsi_period = rsi_period
+        self.adx_period = adx_period
+        self.atr_period = atr_period
+
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Añade columnas de indicadores al DataFrame."""
+        df = df.copy()
+        df["ema1"] = _ema(df["close"], self.ema1_len)
+        df["ema2"] = _ema(df["close"], self.ema2_len)
+        df["ema3"] = _ema(df["close"], self.ema3_len)
+        df["rsi"]  = _rsi(df["close"], self.rsi_period)
+        df["adx"]  = _adx(df, self.adx_period)
+        df["atr"]  = _atr(df, self.atr_period)
+        return df
+
+    def get_latest_signal(self, df: pd.DataFrame,
+                          htf_df: Optional[pd.DataFrame] = None) -> Signal:
+        df = self.compute(df)
+        i  = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        price   = float(i["close"])
+        ema1    = float(i["ema1"])
+        ema2    = float(i["ema2"])
+        ema3    = float(i["ema3"])
+        rsi     = float(i["rsi"])
+        adx     = float(i["adx"])
+        atr     = float(i["atr"])
+        atr_pct = (atr / price * 100) if price > 0 else 0
+
+        # Cruce EMA1/EMA2
+        cross_up   = (prev["ema1"] <= prev["ema2"]) and (ema1 > ema2)
+        cross_down = (prev["ema1"] >= prev["ema2"]) and (ema1 < ema2)
+
+        # HTF bias
+        htf_bull = htf_bear = False
+        if htf_df is not None and len(htf_df) >= self.ema3_len:
+            htf_ema1 = float(_ema(htf_df["close"], self.ema1_len).iloc[-1])
+            htf_ema2 = float(_ema(htf_df["close"], self.ema2_len).iloc[-1])
+            htf_ema3 = float(_ema(htf_df["close"], self.ema3_len).iloc[-1])
+            htf_price = float(htf_df["close"].iloc[-1])
+            htf_bull = htf_price > htf_ema3 and htf_ema1 > htf_ema2
+            htf_bear = htf_price < htf_ema3 and htf_ema1 < htf_ema2
+
+        # Scoring
+        score   = 0.0
+        reasons = []
+
+        if cross_up:
+            score += 35; reasons.append("EMA cruce↑")
+        elif ema1 > ema2:
+            score += 15; reasons.append("EMA alcista")
+
+        if cross_down:
+            score += 35; reasons.append("EMA cruce↓")
+        elif ema1 < ema2:
+            score += 15; reasons.append("EMA bajista")
+
+        if price > ema3:
+            score += 10; reasons.append("P>EMA3")
+        elif price < ema3:
+            score += 10; reasons.append("P<EMA3")
+
+        if 40 < rsi < 65:
+            score += 15; reasons.append(f"RSI{rsi:.0f}")
+        if adx > 20:
+            score += 10; reasons.append(f"ADX{adx:.0f}")
+
+        if htf_bull and ema1 > ema2:
+            score += 15; reasons.append("HTF🟢")
+        elif htf_bear and ema1 < ema2:
+            score += 15; reasons.append("HTF🔴")
+
+        # Dirección
+        if ema1 > ema2 and price > ema3:
+            action = "LONG"
+        elif ema1 < ema2 and price < ema3:
+            action = "SHORT"
+        else:
+            action = "HOLD"
+
+        if score < self.score_min:
+            action = "HOLD"
+
+        return Signal(
+            action    = action,
+            price     = price,
+            ema1      = ema1,
+            ema2      = ema2,
+            ema3      = ema3,
+            rsi       = rsi,
+            adx       = adx,
+            atr       = atr,
+            atr_pct   = atr_pct,
+            volume_ok = True,
+            reason    = " | ".join(reasons) if reasons else "Sin señal",
+            timestamp = str(i["timestamp"]),
+            score     = round(score, 1),
         )
-        apex_short = (
-            e7[i-1] > e17[i-1] and e7[i] < e17[i]
-            and closes[i] < valley and inst_vol
-            and closes[i] < hull50[i]
-            and stc_vals[i] < stc_vals[i-1]
-            and (e7[i] - e7[i-1]) < 0
-        )
-        ca_long = (closes[i] < e20[i] and closes[i-1] >= e20[i-1]) or (
-            (closes[i]-closes[i-1])<0 and (e2[i]-e2[i-1])<0
-            and closes[i-1]>=e2[i-1] and closes[i]<e2[i] and (e4[i]-e4[i-1])>0)
-        ca_short = (closes[i] > e20[i] and closes[i-1] <= e20[i-1]) or (
-            (closes[i]-closes[i-1])>0 and (e2[i]-e2[i-1])>0
-            and closes[i-1]<=e2[i-1] and closes[i]>e2[i] and (e4[i]-e4[i-1])<0)
-
-        if apex_long and ca_long:
-            sl = valley
-            return Signal("LONG", entry, sl, entry + abs(entry-sl)*3, atr14, score=100)
-        if apex_short and ca_short:
-            sl = peak
-            return Signal("SHORT", entry, sl, entry - abs(sl-entry)*3, atr14, score=100)
-        if apex_long:
-            sl = valley
-            return Signal("LONG", entry, sl, entry + abs(entry-sl)*3, atr14, score=70, winrate_note="⚠️ Sin confirm CA")
-        if apex_short:
-            sl = peak
-            return Signal("SHORT", entry, sl, entry - abs(sl-entry)*3, atr14, score=70, winrate_note="⚠️ Sin confirm CA")
-        return Signal("NONE", entry, 0, 0, atr14)
-
-    async def run_cycle(self, symbol: str, interval: str):
-        candles  = await self.exchange.get_klines(symbol, interval, limit=200)
-        signal   = self._compute_signals(candles)
-        position = await self.exchange.get_position(symbol)
-        has_position = position and abs(float(position.get("positionAmt", 0))) > 0
-
-        if has_position and signal.direction != "NONE":
-            pos_side = "LONG" if float(position["positionAmt"]) > 0 else "SHORT"
-            if pos_side != signal.direction:
-                await self.exchange.close_position(symbol, position)
-                await self.telegram.send(f"🔄 *Cierre* {pos_side} `{symbol}` @ `{signal.entry:.4f}`")
-                has_position = False
-
-        if not has_position and signal.direction != "NONE":
-            if self._last_signal.get(symbol) == signal.direction:
-                return
-            balance = await self.exchange.get_balance()
-            qty = self.risk.calc_qty(balance, signal.entry, signal.sl)
-            if qty <= 0:
-                return
-            await self.exchange.set_leverage(symbol, LEVERAGE)
-            side = "BUY" if signal.direction == "LONG" else "SELL"
-            await self.exchange.place_order(
-                symbol=symbol, side=side, position_side=signal.direction,
-                qty=qty, stop_loss=round(signal.sl, 4), take_profit=round(signal.tp, 4),
-            )
-            emoji = "🟢" if signal.direction == "LONG" else "🔴"
-            await self.telegram.send(
-                f"{emoji} *{signal.direction}* `{symbol}`\n"
-                f"Entry: `{signal.entry:.4f}`\n"
-                f"SL: `{signal.sl:.4f}`  TP: `{signal.tp:.4f}` (3R)\n"
-                f"Qty: `{qty}`  Score: `{signal.score}/100`\n{signal.winrate_note}"
-            )
-            self._last_signal[symbol] = signal.direction
-        elif signal.direction == "NONE":
-            self._last_signal[symbol] = "NONE"

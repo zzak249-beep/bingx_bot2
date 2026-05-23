@@ -1,136 +1,76 @@
-# 🎯 Sniper Bot V26.1 — Institutional Apex
+# Sniper Bot V45 — BINGXBOT2 ZESTY
 
-Bot de trading automático para **BingX Futures** que combina lo mejor de dos estrategias institucionales con notificaciones por **Telegram**, listo para desplegar en **Railway** con un clic.
+Bot de trading automatizado para BingX Futuros en **ONE-WAY Mode** (default BingX).
 
----
+## Archivo único
 
-## 📐 Estrategia
+Todo el bot está en `main.py` — BingXClient, indicadores, scanner, risk y loops.
 
-Fusiona **Sniper Apex V26.1** + **EMA Slope ChartArt** para señales de alta probabilidad:
+## Setup Railway
 
-| Indicador | Rol |
-|-----------|-----|
-| EMA 7 / 17 | Cruce principal de tendencia |
-| EMA 2 / 4 / 20 | Confirmación de slope (ChartArt) |
-| Hull MA 50 | Filtro de tendencia macro |
-| STC (10, 23, 50) | Momentum / divergencias |
-| Volumen >1.5× SMA20 | Detección de volumen institucional |
-| Pivot High/Low 5 | Niveles de liquidez (SL y rotura) |
-
-**Reglas de entrada:**
-- **LONG**: EMA7 cruza EMA17 ↑ + cierre sobre pivot high + vol. institucional + precio > Hull + STC subiendo + slope positivo + confirmación ChartArt.
-- **SHORT**: Condiciones inversas.
-
-**Gestión de riesgo 1:3** — SL en el último pivot, TP = riesgo × 3.
-
----
-
-## 🗂️ Estructura
+1. Sube este directorio a un repositorio GitHub
+2. Crea un nuevo servicio en Railway conectado al repo
+3. En **Variables**, añade todas las del `env.example`:
 
 ```
-sniper-bot/
-├── main.py              # Punto de entrada
-├── railway.toml         # Config Railway
-├── requirements.txt
-├── .env.example         # Plantilla de variables
-└── src/
-    ├── bot.py           # Bucle principal
-    ├── exchange.py      # Cliente BingX REST
-    ├── strategy.py      # Lógica de señales
-    ├── risk_manager.py  # Cálculo de tamaño y drawdown
-    └── telegram_bot.py  # Notificaciones
+BINGX_API_KEY=...
+BINGX_API_SECRET=...
+TELEGRAM_TOKEN=...
+TELEGRAM_CHAT_ID=...
 ```
 
----
+4. Railway arranca con `python main.py`
 
-## 🚀 Deploy en Railway (recomendado)
+## Variables de entorno
 
-### 1. Fork + Push a GitHub
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `LEVERAGE` | `5` | Apalancamiento |
+| `MAX_RISK_PCT` | `0.5` | % balance por trade |
+| `MAX_POS_USDT` | `25` | Tamaño máximo posición USDT |
+| `MAX_POSITIONS` | `9` | Posiciones simultáneas máx |
+| `TIMEFRAME` | `15m` | Timeframe principal |
+| `TIMEFRAME_HIGH` | `1h` | Timeframe confirmación |
+| `SCORE_ENTRY` | `55` | Score mínimo para abrir |
+| `MIN_VOL_USDT` | `50000000` | Volumen mínimo 24h |
+| `SCAN_INTERVAL_MIN` | `5` | Intervalo escaneo (minutos) |
+| `RVOL_MIN` | `1.3` | Volumen relativo mínimo |
+| `SLOPE_MIN` | `25` | Pendiente EMA mínima |
+| `ADX_MAX` | `35` | ADX máximo permitido |
+| `RR_RATIO` | `2.0` | Ratio riesgo/recompensa |
+| `ATR_SL_MULT` | `1.2` | Multiplicador ATR para SL |
+| `POC_LOOKBACK` | `50` | Velas para calcular POC |
+| `USE_WHITELIST` | `true` | Usar lista de pares permitidos |
+| `BLACKOUT_START_UTC` | `0` | Hora inicio blackout (UTC) |
+| `BLACKOUT_END_UTC` | `2` | Hora fin blackout (UTC) |
 
-```bash
-git clone https://github.com/tu-usuario/sniper-bot.git
-cd sniper-bot
-# (edita lo que necesites)
-git add . && git commit -m "init" && git push
-```
+## Lógica de entrada (V45)
 
-### 2. Crear proyecto en Railway
+Condición **LONG** (todas deben cumplirse):
+- Precio tocó mínimo reciente (`low < valley`)
+- Precio por debajo del VWAP
+- Pendiente EMA > `SLOPE_MIN`
+- STC subiendo
+- ADX < `ADX_MAX`
+- Precio alejado del POC > 1.5×ATR
+- Volumen relativo > `RVOL_MIN`
 
-1. Ve a [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**
-2. Selecciona tu repositorio `sniper-bot`
-3. Railway detecta `railway.toml` automáticamente
+Condición **SHORT**: espejo inverso.
 
-### 3. Añadir variables de entorno
+Score base 85 + confirmación HTF (1h) +10 + EMA cross +5.
 
-En Railway → tu proyecto → **Variables** → añade:
+## Requisitos BingX
 
-```
-BINGX_API_KEY        = tu_key
-BINGX_API_SECRET     = tu_secret
-TELEGRAM_TOKEN       = tu_token
-TELEGRAM_CHAT_ID     = tu_chat_id
-SYMBOL               = BTC-USDT
-TIMEFRAME            = 15m
-LEVERAGE             = 5
-MAX_RISK_PCT         = 1.0
-```
+- Cuenta en **ONE-WAY mode** (modo por defecto de BingX)
+- Balance mínimo recomendado: **$50 USDT** en Futuros
+- API Key con permisos de **lectura + trading de futuros**
 
-### 4. Deploy
+## Fixes incluidos (vs versión original)
 
-Haz clic en **Deploy** — Railway instalará dependencias y ejecutará `python main.py` automáticamente.
-
----
-
-## 🤖 Configurar Telegram Bot
-
-1. Habla con [@BotFather](https://t.me/BotFather) → `/newbot` → copia el **TOKEN**
-2. Añade el bot a tu grupo o inicia conversación con él
-3. Obtén el **CHAT_ID**:
-   - Abre `https://api.telegram.org/bot<TOKEN>/getUpdates` en el navegador
-   - Envía un mensaje al bot, recarga la URL y busca `"chat":{"id":...}`
-
----
-
-## 🔑 Crear API Key en BingX
-
-1. [BingX](https://bingx.com) → Perfil → **API Management** → **Create API**
-2. Permisos necesarios: ✅ **Trade** (NO habilites retiros)
-3. Whitelist IP: añade la IP de tu servidor Railway (recomendado)
-4. Copia `API Key` y `Secret Key`
-
----
-
-## ⚠️ Advertencias
-
-- **Dinero real**: este bot opera con capital real. Empieza con `MAX_RISK_PCT=0.5` (0.5% por trade).
-- **Testnet primero**: BingX tiene entorno demo; crea una cuenta demo y prueba antes de usar real.
-- **Drawdown**: el bot no tiene stop global por defecto. Monitorea manualmente o añade lógica en `risk_manager.py`.
-- **Deslizamiento**: en mercados ilíquidos el fill puede diferir del precio calculado.
-
----
-
-## 📊 Mensajes de Telegram que recibirás
-
-```
-🟢 LONG ABIERTO
-Par: BTC-USDT
-Entry: 67234.5000
-SL: 66800.0000
-TP: 68537.5000 (3R)
-Qty: 0.007
-ATR: 145.2300
-
-🔴 SHORT ABIERTO
-...
-
-🔄 Cierre posición LONG
-BTC-USDT @ 67100.0000
-
-⚠️ Error bot: [descripción]
-```
-
----
-
-## 📝 Licencia
-
-MIT — úsalo bajo tu responsabilidad. El autor no se hace responsable de pérdidas.
+- ✅ `calc_qty`: aplica `LEVERAGE` correctamente (qty era 5× menor)
+- ✅ `calc_qty`: valida notional real antes de devolver qty (evita qty inviable)
+- ✅ `place_sl_tp()`: SL y TP colocados como órdenes reales en BingX
+  - Antes solo se gestionaban en Python con polling cada 60s
+  - Ahora son órdenes `STOP_MARKET` y `TAKE_PROFIT_MARKET` reales
+- ✅ `half_closed`: se limpia automáticamente cuando la posición ya no existe
+- ✅ Gestión manual de SL/TP en Python como **backup** por si falla la orden
