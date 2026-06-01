@@ -1,1 +1,1 @@
-# Sniper Bot V26.1
+# QF×JP Bot v3.4

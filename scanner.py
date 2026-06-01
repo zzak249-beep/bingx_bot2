@@ -1,156 +1,119 @@
 """
-Scanner — busca las mejores señales entre múltiples pares
+Multi-Symbol Scanner
+Scans all USDT perpetual pairs concurrently
+Filters by volume, applies full QF engine, ranks by score
 """
+
+import asyncio
 import logging
-import time
-from dataclasses import dataclass
-from typing import List, Optional
+import numpy as np
+from typing import Optional
+from src.engine import QFEngine, MarketData, SignalResult, Signal
 
-import pandas as pd
-
-from strategy import EMAStrategy
-
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("scanner")
 
 
-@dataclass
-class SymbolScore:
-    symbol:    str
-    signal:    str      # LONG | SHORT
-    price:     float
-    ema1:      float
-    ema2:      float
-    ema3:      float
-    rsi:       float
-    adx:       float
-    atr_pct:   float
-    atr:       float
-    reason:    str
-    score:     float    # puntuación del scanner (volumen, ADX…)
-    sig_score: float    # puntuación de la señal strategy
+async def fetch_symbol_data(exchange, symbol: str, cfg: dict) -> Optional[MarketData]:
+    """Fetch 3m + 15m + 1h klines for a symbol"""
+    try:
+        limit = cfg.get("kline_limit", 250)
+        # Concurrent fetch
+        k3m_task  = exchange.get_klines(symbol, "3m",  limit)
+        k15m_task = exchange.get_klines(symbol, "15m", 100)
+        k1h_task  = exchange.get_klines(symbol, "1h",  100)
 
+        k3m, k15m, k1h = await asyncio.gather(k3m_task, k15m_task, k1h_task)
 
-# Universo por defecto si USE_WHITELIST está desactivado
-DEFAULT_SYMBOLS = [
-    "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
-    "DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","LINK-USDT",
-    "MATIC-USDT","UNI-USDT","ATOM-USDT","LTC-USDT","ARB-USDT",
-    "OP-USDT","INJ-USDT","SUI-USDT","AAVE-USDT","PEPE-USDT",
-]
-
-
-class MultiSymbolScanner:
-    def __init__(self, bingx_client, interval: str, htf_interval: str,
-                 top_n: int = 3, min_volume: float = 1_000_000,
-                 score_min: float = 30.0):
-        self.bingx        = bingx_client
-        self.interval     = interval
-        self.htf_interval = htf_interval
-        self.top_n        = top_n
-        self.min_volume   = min_volume
-        self.score_min    = score_min
-        self.strategy     = EMAStrategy()
-        self._cache: List[SymbolScore] = []
-        self._cache_ts: float = 0
-        self._cache_ttl: float = 60.0   # segundos
-
-    def _get_symbols(self) -> List[str]:
-        try:
-            return self.bingx.get_all_symbols()
-        except Exception as e:
-            logger.warning(f"get_all_symbols: {e} — usando DEFAULT_SYMBOLS")
-            return DEFAULT_SYMBOLS
-
-    def _get_df(self, symbol: str, interval: str, limit: int = 150) -> Optional[pd.DataFrame]:
-        try:
-            raw = self.bingx.get_klines(symbol, interval, limit=limit)
-            if not raw or len(raw) < 30:
-                return None
-            df = pd.DataFrame(raw)
-            df = df.rename(columns={"timestamp": "timestamp"})
-            df = df.astype({c: "float64" for c in ["open","high","low","close","volume"]})
-            df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms", utc=True)
-            return df.sort_values("timestamp").reset_index(drop=True)
-        except Exception as e:
-            logger.debug(f"klines {symbol}: {e}")
+        if len(k3m) < 60:
             return None
 
-    def _score_symbol(self, symbol: str) -> Optional[SymbolScore]:
-        df = self._get_df(symbol, self.interval)
-        if df is None:
+        def parse(klines):
+            arr = np.array([[float(k["open"]), float(k["high"]),
+                             float(k["low"]),  float(k["close"]),
+                             float(k["volume"])] for k in klines])
+            return arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
+
+        o3, h3, l3, c3, v3   = parse(k3m)
+        o15, h15, l15, c15, v15 = parse(k15m) if k15m else (None,)*5
+        o1h, h1h, l1h, c1h, v1h = parse(k1h)  if k1h  else (None,)*5
+
+        # Volume filter: skip low-volume symbols
+        avg_vol_usdt = float(np.mean(c3[-20:] * v3[-20:]))
+        min_vol = cfg.get("min_volume_usdt", 500_000)
+        if avg_vol_usdt < min_vol:
             return None
 
-        # Filtro de volumen
-        vol = float((df["close"] * df["volume"]).tail(96).sum())
-        if vol < self.min_volume:
-            return None
-
-        htf_df = self._get_df(symbol, self.htf_interval, limit=60)
-        sig    = self.strategy.get_latest_signal(df, htf_df)
-
-        if sig.action == "HOLD":
-            return None
-        if sig.score < self.score_min:
-            return None
-
-        # Puntuación scanner (adicional al score de la señal)
-        scanner_score = sig.score
-        if sig.adx > 25:
-            scanner_score += 5
-        if vol > self.min_volume * 3:
-            scanner_score += 5
-
-        return SymbolScore(
-            symbol    = symbol,
-            signal    = sig.action,
-            price     = sig.price,
-            ema1      = sig.ema1,
-            ema2      = sig.ema2,
-            ema3      = sig.ema3,
-            rsi       = sig.rsi,
-            adx       = sig.adx,
-            atr_pct   = sig.atr_pct,
-            atr       = sig.atr,
-            reason    = sig.reason,
-            score     = round(scanner_score, 1),
-            sig_score = sig.score,
+        return MarketData(
+            symbol=symbol,
+            closes=c3, highs=h3, lows=l3, opens=o3, volumes=v3,
+            closes_15m=c15, closes_1h=c1h,
+            highs_15m=h15, lows_15m=l15,
+            highs_1h=h1h, lows_1h=l1h,
         )
+    except Exception as e:
+        logger.debug(f"Fetch error {symbol}: {e}")
+        return None
 
-    def scan(self, force: bool = False) -> List[SymbolScore]:
-        now = time.time()
-        if not force and self._cache and (now - self._cache_ts) < self._cache_ttl:
-            return self._cache
 
-        symbols = self._get_symbols()
-        results: List[SymbolScore] = []
+class Scanner:
+    def __init__(self, exchange, engine: QFEngine, config: dict):
+        self.exchange = exchange
+        self.engine   = engine
+        self.cfg      = config
+        self._symbols: list = []
+        self._symbol_refresh = 0
 
-        for sym in symbols:
-            try:
-                r = self._score_symbol(sym)
-                if r:
-                    results.append(r)
-            except Exception as e:
-                logger.debug(f"scan {sym}: {e}")
+    async def refresh_symbols(self):
+        """Refresh symbol list every N scans"""
+        symbols = await self.exchange.get_all_symbols()
+        # Blacklist filter
+        blacklist = set(self.cfg.get("blacklist", []))
+        self._symbols = [s for s in symbols if s not in blacklist]
+        logger.info(f"Symbols loaded: {len(self._symbols)}")
 
-        results.sort(key=lambda x: x.score, reverse=True)
-        self._cache    = results
-        self._cache_ts = now
-        logger.info(f"Scan completo: {len(results)} señales de {len(symbols)} pares")
+    async def scan_all(self) -> list[SignalResult]:
+        """
+        Scan all symbols, return list of SignalResults sorted by score.
+        Uses semaphore to limit concurrent requests.
+        """
+        self._symbol_refresh += 1
+        if self._symbol_refresh % 20 == 1 or not self._symbols:
+            await self.refresh_symbols()
+
+        sem = asyncio.Semaphore(self.cfg.get("max_concurrent", 15))
+        results = []
+
+        async def process(symbol: str):
+            async with sem:
+                md = await fetch_symbol_data(self.exchange, symbol, self.cfg)
+                if md is None:
+                    return
+                try:
+                    result = self.engine.analyze(md)
+                    results.append(result)
+                except Exception as e:
+                    logger.debug(f"Engine error {symbol}: {e}")
+
+        await asyncio.gather(*[process(s) for s in self._symbols])
+
+        # Sort: active signals first, then by max score
+        def sort_key(r: SignalResult):
+            has_signal = r.signal not in (Signal.NONE,)
+            score = max(r.score_long, r.score_short)
+            return (has_signal, score)
+
+        results.sort(key=sort_key, reverse=True)
+        logger.info(f"Scan complete: {len(results)} results, "
+                    f"{sum(1 for r in results if r.signal not in (Signal.NONE, Signal.PRE_LONG, Signal.PRE_SHORT))} signals")
         return results
 
-    def best_symbol(self) -> Optional[SymbolScore]:
-        results = self.scan()
-        return results[0] if results else None
-
-    def format_report(self, results: List[SymbolScore]) -> str:
-        if not results:
-            return "🔍 Sin señales activas"
-        lines = [f"🔍 <b>Top {len(results)} señales</b>\n"]
-        for i, r in enumerate(results, 1):
-            emoji = "🟢" if r.signal == "LONG" else "🔴"
-            lines.append(
-                f"<b>#{i}</b> {emoji} <code>{r.symbol}</code> — Score: <code>{r.score}</code>\n"
-                f"  Precio: <code>{r.price:.6f}</code> | RSI: <code>{r.rsi:.0f}</code> | ADX: <code>{r.adx:.0f}</code>\n"
-                f"  ATR: <code>{r.atr_pct:.2f}%</code> | {r.reason}"
-            )
-        return "\n".join(lines)
+    def get_actionable(self, results: list[SignalResult]) -> list[SignalResult]:
+        """Filter only signals worth trading (excludes NONE and pre-alerts)"""
+        min_score = self.cfg.get("min_score_trade", 55)
+        min_rr    = self.cfg.get("min_rr", 1.3)
+        return [
+            r for r in results
+            if r.signal not in (Signal.NONE,)
+            and max(r.score_long, r.score_short) >= min_score
+            and (r.rr1_long >= min_rr or r.rr1_short >= min_rr)
+        ]
