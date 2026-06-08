@@ -1,182 +1,181 @@
 """
-BingX Exchange Connector
-Handles: market data, order execution, position management
+GUA-USDT Bot v2 — BingX Exchange Client
+HMAC-SHA256 · One-Way mode · Sin positionSide.
 """
 
-import asyncio
-import hashlib
-import hmac
-import time
-import logging
-import aiohttp
-from typing import Optional
+from __future__ import annotations
+import asyncio, hashlib, hmac, json, logging, time
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
-logger = logging.getLogger("bingx")
+import aiohttp
+import config
 
-BASE_URL = "https://open-api.bingx.com"
+log = logging.getLogger("exchange")
 
 
-def _sign(params: dict, secret: str) -> str:
+def _sign(params: Dict[str, Any], secret: str) -> str:
     query = urlencode(sorted(params.items()))
     return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
+def _ts() -> int:
+    return int(time.time() * 1000)
+
 
 class BingXClient:
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
-        self.api_key    = api_key
-        self.api_secret = api_secret
-        self.base_url   = "https://open-api-vst.bingx.com" if testnet else BASE_URL
+
+    def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
 
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"X-BX-APIKEY": self.api_key}
+                headers={"X-BX-APIKEY": config.BINGX_API_KEY,
+                         "Content-Type": "application/json"}
             )
         return self._session
 
-    async def _request(self, method: str, path: str, params: dict = None, signed: bool = False) -> dict:
-        session = await self._get_session()
-        params  = params or {}
-
-        if signed:
-            params["timestamp"] = int(time.time() * 1000)
-            params["signature"] = _sign(params, self.api_secret)
-
-        url = self.base_url + path
-        try:
-            if method == "GET":
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    return await r.json()
-            else:
-                async with session.post(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    return await r.json()
-        except Exception as e:
-            logger.error(f"BingX request error {path}: {e}")
-            return {"code": -1, "msg": str(e)}
-
-    # ── MARKET DATA ──────────────────────────────────────────────────
-
-    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list:
-        """
-        interval: 1m, 3m, 5m, 15m, 1h, 4h, 1d
-        Returns list of [timestamp, open, high, low, close, volume]
-        """
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        data = await self._request("GET", "/openApi/swap/v3/quote/klines", params)
-        if data.get("code") != 0:
-            logger.error(f"Klines error {symbol} {interval}: {data}")
-            return []
-        return data.get("data", [])
-
-    async def get_all_symbols(self) -> list:
-        """Returns list of perpetual swap symbols (USDT pairs only)"""
-        data = await self._request("GET", "/openApi/swap/v2/quote/contracts")
-        if data.get("code") != 0:
-            return []
-        symbols = []
-        for item in data.get("data", []):
-            sym = item.get("symbol", "")
-            if sym.endswith("-USDT") and item.get("status") == 1:
-                symbols.append(sym)
-        return symbols
-
-    async def get_ticker(self, symbol: str) -> dict:
-        params = {"symbol": symbol}
-        data = await self._request("GET", "/openApi/swap/v2/quote/ticker", params)
-        return data.get("data", {})
-
-    async def get_account_balance(self) -> float:
-        data = await self._request("GET", "/openApi/swap/v2/user/balance", signed=True)
-        if data.get("code") != 0:
-            return 0.0
-        for asset in data.get("data", {}).get("balance", []):
-            if asset.get("asset") == "USDT":
-                return float(asset.get("balance", 0))
-        return 0.0
-
-    async def get_positions(self) -> list:
-        data = await self._request("GET", "/openApi/swap/v2/user/positions", signed=True)
-        if data.get("code") != 0:
-            return []
-        return [p for p in data.get("data", []) if float(p.get("positionAmt", 0)) != 0]
-
-    # ── ORDER MANAGEMENT ─────────────────────────────────────────────
-
-    async def place_order(self, symbol: str, side: str, quantity: float,
-                          order_type: str = "MARKET",
-                          position_side: str = "LONG",
-                          stop_loss: float = None,
-                          take_profit: float = None) -> dict:
-        """
-        side: BUY / SELL
-        position_side: LONG / SHORT
-        """
-        params = {
-            "symbol":       symbol,
-            "side":         side,
-            "positionSide": position_side,
-            "type":         order_type,
-            "quantity":     str(round(quantity, 4)),
-        }
-
-        data = await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
-        order_id = data.get("data", {}).get("order", {}).get("orderId")
-
-        # Place SL/TP as separate orders
-        if order_id and stop_loss:
-            await self._place_sl(symbol, side, position_side, quantity, stop_loss)
-        if order_id and take_profit:
-            await self._place_tp(symbol, side, position_side, quantity, take_profit)
-
-        return data
-
-    async def _place_sl(self, symbol, side, pos_side, qty, sl_price):
-        close_side = "SELL" if side == "BUY" else "BUY"
-        params = {
-            "symbol":       symbol,
-            "side":         close_side,
-            "positionSide": pos_side,
-            "type":         "STOP_MARKET",
-            "quantity":     str(round(qty, 4)),
-            "stopPrice":    str(round(sl_price, 6)),
-            "closePosition": "true",
-        }
-        return await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
-
-    async def _place_tp(self, symbol, side, pos_side, qty, tp_price):
-        close_side = "SELL" if side == "BUY" else "BUY"
-        params = {
-            "symbol":        symbol,
-            "side":          close_side,
-            "positionSide":  pos_side,
-            "type":          "TAKE_PROFIT_MARKET",
-            "quantity":      str(round(qty, 4)),
-            "stopPrice":     str(round(tp_price, 6)),
-            "closePosition": "true",
-        }
-        return await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
-
-    async def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
-        side = "SELL" if position_side == "LONG" else "BUY"
-        params = {
-            "symbol":       symbol,
-            "side":         side,
-            "positionSide": position_side,
-            "type":         "MARKET",
-            "quantity":     str(round(quantity, 4)),
-        }
-        return await self._request("POST", "/openApi/swap/v2/trade/order", params, signed=True)
-
-    async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> dict:
-        params = {"symbol": symbol, "side": side, "leverage": leverage}
-        return await self._request("POST", "/openApi/swap/v2/trade/leverage", params, signed=True)
-
-    async def cancel_all_orders(self, symbol: str) -> dict:
-        params = {"symbol": symbol}
-        return await self._request("DELETE", "/openApi/swap/v2/trade/allOpenOrders", params, signed=True)
-
-    async def close(self):
+    async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+    # ── Requests ───────────────────────────────────────────────────────────────
+
+    async def _get(self, path: str, params: Dict) -> Dict:
+        params["timestamp"] = _ts()
+        params["signature"] = _sign(params, config.BINGX_SECRET)
+        s = await self._sess()
+        async with s.get(config.BASE_URL + path, params=params) as r:
+            data = json.loads(await r.text())
+        if data.get("code") != 0:
+            raise RuntimeError(f"GET {path}: {data}")
+        return data
+
+    async def _get_pub(self, path: str, params: Dict) -> Dict:
+        s = await self._sess()
+        async with s.get(config.BASE_URL + path, params=params) as r:
+            data = json.loads(await r.text())
+        if data.get("code") != 0:
+            raise RuntimeError(f"GET_PUB {path}: {data}")
+        return data
+
+    async def _post(self, path: str, params: Dict) -> Dict:
+        params["timestamp"] = _ts()
+        sig = _sign(params, config.BINGX_SECRET)
+        s   = await self._sess()
+        async with s.post(config.BASE_URL + path + f"?signature={sig}",
+                          json=params) as r:
+            data = json.loads(await r.text())
+        if data.get("code") != 0:
+            raise RuntimeError(f"POST {path}: {data}")
+        return data
+
+    async def _delete(self, path: str, params: Dict) -> Dict:
+        params["timestamp"] = _ts()
+        params["signature"] = _sign(params, config.BINGX_SECRET)
+        s = await self._sess()
+        async with s.delete(config.BASE_URL + path, params=params) as r:
+            data = json.loads(await r.text())
+        if data.get("code") != 0:
+            raise RuntimeError(f"DELETE {path}: {data}")
+        return data
+
+    # ── Klines ─────────────────────────────────────────────────────────────────
+
+    async def get_klines(self, symbol: str, interval: str, limit: int = 150) -> List[Dict]:
+        data = await self._get_pub(
+            "/openApi/swap/v3/quote/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit},
+        )
+        return [
+            {"time": int(r[0]), "open": float(r[1]), "high": float(r[2]),
+             "low":  float(r[3]), "close": float(r[4]), "volume": float(r[5])}
+            for r in data.get("data", [])
+        ]
+
+    # ── Balance ────────────────────────────────────────────────────────────────
+
+    async def get_balance(self) -> float:
+        data = await self._get("/openApi/swap/v2/user/balance", {"currency": "USDT"})
+        for asset in data.get("data", {}).get("balance", []):
+            if asset.get("asset") == "USDT":
+                return float(asset.get("availableMargin", 0))
+        bal = data.get("data", {}).get("balance", {})
+        if isinstance(bal, dict):
+            return float(bal.get("availableMargin", 0))
+        return 0.0
+
+    # ── Posiciones ─────────────────────────────────────────────────────────────
+
+    async def get_positions(self, symbol: str) -> List[Dict]:
+        data = await self._get("/openApi/swap/v2/user/positions", {"symbol": symbol})
+        return [p for p in data.get("data", []) if abs(float(p.get("positionAmt", 0))) > 0]
+
+    # ── Leverage ───────────────────────────────────────────────────────────────
+
+    async def set_leverage(self, symbol: str, leverage: int) -> None:
+        for side in ("LONG", "SHORT"):
+            await self._post("/openApi/swap/v2/trade/leverage",
+                             {"symbol": symbol, "side": side, "leverage": leverage})
+        log.info("Leverage %sx en %s", leverage, symbol)
+
+    # ── Precio ─────────────────────────────────────────────────────────────────
+
+    async def get_price(self, symbol: str) -> float:
+        data = await self._get_pub("/openApi/swap/v2/quote/price", {"symbol": symbol})
+        return float(data.get("data", {}).get("price", 0))
+
+    # ── Órdenes ────────────────────────────────────────────────────────────────
+
+    async def place_market_order(self, symbol: str, side: str,
+                                  quantity: float, reduce_only: bool = False) -> Dict:
+        params: Dict[str, Any] = {
+            "symbol":   symbol,
+            "side":     side,
+            "type":     "MARKET",
+            "quantity": round(quantity, 4),
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        return await self._post("/openApi/swap/v2/trade/order", params)
+
+    async def cancel_all_orders(self, symbol: str) -> None:
+        try:
+            await self._delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
+        except Exception as e:
+            log.warning("cancel_all_orders: %s", e)
+
+    # ── Datos de mercado ───────────────────────────────────────────────────────
+
+    async def get_funding_rate(self, symbol: str) -> float:
+        try:
+            data = await self._get_pub("/openApi/swap/v2/quote/fundingRate",
+                                        {"symbol": symbol})
+            return float(data.get("data", {}).get("fundingRate", 0))
+        except Exception:
+            return 0.0
+
+    async def get_open_interest(self, symbol: str) -> float:
+        try:
+            data = await self._get_pub("/openApi/swap/v2/quote/openInterest",
+                                        {"symbol": symbol})
+            return float(data.get("data", {}).get("openInterest", 0))
+        except Exception:
+            return 0.0
+
+    async def get_order_book_imbalance(self, symbol: str, depth: int = 20) -> float:
+        """
+        Imbalance del order book: (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        Positivo → presión compradora · Negativo → presión vendedora
+        """
+        try:
+            data = await self._get_pub("/openApi/swap/v2/quote/depth",
+                                        {"symbol": symbol, "limit": depth})
+            bids = data.get("data", {}).get("bids", [])
+            asks = data.get("data", {}).get("asks", [])
+            bid_vol = sum(float(b[1]) for b in bids)
+            ask_vol = sum(float(a[1]) for a in asks)
+            total   = bid_vol + ask_vol
+            return (bid_vol - ask_vol) / total if total > 0 else 0.0
+        except Exception:
+            return 0.0
