@@ -1,0 +1,33 @@
+# ═══════════════════════════════════════════════════
+#  GUA Bot v2 — Variables Railway (Multi-Par)
+# ═══════════════════════════════════════════════════
+
+BINGX_API_KEY=tu_api_key
+BINGX_SECRET=tu_secret
+TELEGRAM_TOKEN=123456789:ABC...
+TELEGRAM_CHAT_ID=-100123456789
+
+# ── MODO ────────────────────────────────────────────
+MODE=LIVE
+
+# ── TRADE FIJO ──────────────────────────────────────
+TRADE_USDT=10
+LEVERAGE=5
+
+# ── PARES (opcional, ya tiene 12 por defecto) ───────
+# SYMBOLS=GUA-USDT,SOL-USDT,ETH-USDT,BNB-USDT,DOGE-USDT,XRP-USDT,SUI-USDT,AVAX-USDT,LINK-USDT,WIF-USDT,PEPE-USDT,BTC-USDT
+
+# ── SEÑAL ────────────────────────────────────────────
+SCORE_THR=0.55
+SESSION_FILTER=false
+OB_IMBALANCE_THR=0.60
+
+# ── ATR ─────────────────────────────────────────────
+ATR_SL_MULT=1.5
+ATR_TP1_MULT=2.0
+ATR_TP2_MULT=4.0
+ATR_TRAIL_MULT=1.0
+ATR_HIGHVOL_MULT=2.0
+
+# ── RAILWAY ──────────────────────────────────────────
+PORT=8080
