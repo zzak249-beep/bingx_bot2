@@ -1,13 +1,7 @@
 """
-QF×JP Bot v6.3.3 — BingX Client
-FIRMA: parseParam oficial BingX + recvWindow=5000 (fix clock drift Railway)
-  sorted(params) + recvWindow + &timestamp=xxx → HMAC → &signature=xxx
-
-FIXES:
-  [FIX] recvWindow=5000 en todos los requests firmados → elimina "firma inválida"
-  [FIX] .strip() en API_KEY y SECRET_KEY → elimina whitespace/newlines Railway
-  [FIX] place_stop_market_order: closePosition=false + qty explícita (hedge mode)
-  [FIX] open_trade: logging individual de fallos en SL/TP1/TP2
+QF×JP Bot v6.3.2 — BingX Client
+FIRMA: parseParam oficial BingX
+  sorted(params) + &timestamp=xxx al final → HMAC → &signature=xxx
 """
 import hmac
 import hashlib
@@ -24,7 +18,8 @@ import config as C
 log = logging.getLogger("bingx")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIRMA — protocolo oficial BingX (parseParam) + recvWindow
+# FIRMA — protocolo oficial BingX (función parseParam)
+# Ref: https://bingx-api.github.io/docs/#/swapV2/authentication.html
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ts() -> str:
@@ -32,25 +27,24 @@ def _ts() -> str:
 
 def _build_signed_qs(params: dict) -> str:
     """
-    Construye el query string firmado:
-      1. sorted(params) + recvWindow=5000
-      2. "key=val&key=val&recvWindow=5000"
-      3. "&timestamp=xxx" al final del payload firmado
-      4. HMAC-SHA256 del payload
-      5. "&signature=xxx" appended
+    Construye el query string firmado exactamente como parseParam oficial:
 
-    recvWindow=5000 da tolerancia al clock drift de Railway (~1-3s).
+        sorted_params_string + &timestamp=xxx + &signature=HMAC(todo_eso)
+
+    Pasos:
+      1. sorted(params.keys()) — sin timestamp
+      2. "key=val&key=val" — concatenación simple (NO urlencode)
+      3. "&timestamp=xxx"  — siempre al final del payload firmado
+      4. HMAC-SHA256 del payload completo
+      5. "&signature=xxx"  — appended a la URL
     """
-    p = dict(params)
-    p["recvWindow"] = "5000"
-
-    sorted_keys = sorted(p.keys())
-    parts       = ["%s=%s" % (k, p[k]) for k in sorted_keys]
+    sorted_keys = sorted(params.keys())
+    parts       = ["%s=%s" % (k, params[k]) for k in sorted_keys]
     base        = "&".join(parts)
     ts          = _ts()
-    payload     = base + "&timestamp=" + ts
+    payload     = (base + "&timestamp=" + ts) if base else ("timestamp=" + ts)
     signature   = hmac.new(
-        C.BINGX_SECRET_KEY.strip().encode("utf-8"),
+        C.BINGX_SECRET_KEY.encode("utf-8"),
         payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
@@ -69,12 +63,12 @@ class BingXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._precision_map: dict[str, int]   = {}
         self._min_qty_map:   dict[str, float] = {}
-        log.info("BingXClient v6.3.3 iniciado — firma: parseParam+recvWindow")
+        log.info("BingXClient v6.3.3 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"X-BX-APIKEY": C.BINGX_API_KEY.strip()},
+                headers={"X-BX-APIKEY": C.BINGX_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=15),
             )
         return self._session
@@ -95,8 +89,11 @@ class BingXClient:
                     url = "%s%s?%s" % (self.BASE, path, urlencode(base))
                 else:
                     url = "%s%s" % (self.BASE, path)
-                async with session.get(url) as r:
-                    return await r.json(content_type=None)
+                async with session.get(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
+                    data = await r.json(content_type=None)
+                    if signed and data.get("code") == 100001:
+                        log.error("GET %s firma inválida — url=%s", path, url[:120])
+                    return data
             except Exception as e:
                 if attempt == 2:
                     log.error("GET %s error: %s", path, e)
@@ -110,7 +107,7 @@ class BingXClient:
             try:
                 qs  = _build_signed_qs(params)
                 url = "%s%s?%s" % (self.BASE, path, qs)
-                async with session.post(url) as r:
+                async with session.post(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -125,7 +122,7 @@ class BingXClient:
             try:
                 qs  = _build_signed_qs(params)
                 url = "%s%s?%s" % (self.BASE, path, qs)
-                async with session.delete(url) as r:
+                async with session.delete(url, headers={"X-BX-APIKEY": C.BINGX_API_KEY}) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -255,36 +252,64 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
+        """
+        Retorna availableMargin USDT.
+        Si availableMargin=0 pero hay equity (posiciones abiertas),
+        usa equity como proxy del capital real disponible.
+        """
+        # Intentar v3 primero, luego v2 como fallback
         data = await self._get(
             "/openApi/swap/v3/user/balance",
             {"currency": "USDT"},
             signed=True,
         )
+        if data.get("code", -1) != 0:
+            log.warning("get_balance v3 falló (code=%s) → probando v2", data.get("code"))
+            data = await self._get(
+                "/openApi/swap/v2/user/balance",
+                {"currency": "USDT"},
+                signed=True,
+            )
         raw = data.get("data", {})
+        log.info("get_balance: code=%s data=%s", data.get("code"), str(raw)[:300])
+
+        def _extract(d: dict) -> float:
+            avail  = float(d.get("availableMargin", 0) or 0)
+            equity = float(d.get("equity",          0) or 0)
+            # Si availableMargin=0 pero hay equity → posiciones abiertas
+            # devolver equity para que kelly_position_size pueda calcular
+            if avail > 0:
+                return avail
+            if equity > 0:
+                log.debug("availableMargin=0, usando equity=%.4f", equity)
+                return equity
+            return 0.0
+
         if isinstance(raw, list):
             for a in raw:
                 if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                    return float(a.get("availableMargin", 0) or 0)
+                    return _extract(a)
             for a in raw:
-                v = (a or {}).get("availableMargin")
-                if v is not None:
-                    return float(v or 0)
+                if isinstance(a, dict) and ("availableMargin" in a or "equity" in a):
+                    return _extract(a)
             return 0.0
+
         if isinstance(raw, dict):
             bal = raw.get("balance", raw)
             if isinstance(bal, list):
                 for a in bal:
                     if isinstance(a, dict) and a.get("asset", "") == "USDT":
-                        return float(a.get("availableMargin", 0) or 0)
+                        return _extract(a)
             if isinstance(bal, dict):
-                return float(bal.get("availableMargin", 0) or 0)
+                return _extract(bal)
+
         log.warning("get_balance: formato inesperado %s", str(data)[:200])
         return 0.0
 
     # ── Posiciones ────────────────────────────────────────────────────────────
 
     async def get_open_positions(self) -> list[dict]:
-        data = await self._get("/openApi/swap/v2/user/positions", {}, signed=True)
+        data = await self._get("/openApi/swap/v2/user/positions", None, signed=True)
         positions = data.get("data", [])
         if not isinstance(positions, list):
             return []
@@ -301,14 +326,19 @@ class BingXClient:
     # ── Apalancamiento ────────────────────────────────────────────────────────
 
     async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
-        data = await self._post(
-            "/openApi/swap/v2/trade/leverage",
-            {"symbol": symbol, "side": side, "leverage": leverage},
-        )
-        ok = data.get("code", -1) == 0
-        if not ok:
-            log.warning("[%s] set_leverage code=%s — continuando", symbol, data.get("code"))
-        return ok
+        """Establece leverage para ambos lados para evitar el bug de 4x del historial."""
+        ok_long = ok_short = True
+        for s in ["LONG", "SHORT"]:
+            data = await self._post(
+                "/openApi/swap/v2/trade/leverage",
+                {"symbol": symbol, "side": s, "leverage": leverage},
+            )
+            ok = data.get("code", -1) == 0
+            if not ok:
+                log.warning("[%s] set_leverage %s code=%s — continuando", symbol, s, data.get("code"))
+            if s == "LONG":  ok_long  = ok
+            else:            ok_short = ok
+        return ok_long and ok_short
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
 
@@ -331,26 +361,23 @@ class BingXClient:
 
     async def place_stop_market_order(
         self, symbol: str, side: str, quantity: float, stop_price: float,
-        position_side: str = "LONG",
+        position_side: str = "LONG", close_position: bool = True,
         order_type: str = "STOP_MARKET",
     ) -> dict:
-        """
-        Coloca SL o TP con closePosition=false + qty explícita.
-        Hedge mode ISOLATED requiere esto — closePosition=true causa error 109400.
-        """
         qty = self._round_qty(symbol, quantity)
-        if qty <= 0:
-            log.warning("[%s] %s qty=0 tras redondeo (orig=%.6f) → skip",
-                        symbol, order_type, quantity)
-            return {"code": -1, "msg": "qty_zero_after_round"}
+        if stop_price <= 0:
+            log.warning("[%s] place_stop: stopPrice inválido (%.8f) — skip", symbol, stop_price)
+            return {"code": -1, "msg": "invalid_stop_price"}
+        # BingX requiere quantity > 0 incluso con closePosition=true en algunos pares
+        qty_str = str(qty) if qty > 0 else "0"
         params = {
             "symbol":        symbol,
             "side":          side,
             "positionSide":  position_side,
             "type":          order_type,
             "stopPrice":     str(round(stop_price, 8)),
-            "closePosition": "false",
-            "quantity":      str(qty),
+            "closePosition": "true" if close_position else "false",
+            "quantity":      qty_str,
             "workingType":   "MARK_PRICE",
             "priceProtect":  "true",
         }
@@ -367,6 +394,36 @@ class BingXClient:
             "/openApi/swap/v2/trade/allOpenOrders",
             {"symbol": symbol},
         )
+
+    async def get_order_book(self, symbol: str, limit: int = 5) -> dict:
+        """
+        Order Book Depth — para calcular Order Book Imbalance.
+        bids[i] = [price, qty], asks[i] = [price, qty]
+        OBI = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        > 0 → presión compradora, < 0 → presión vendedora
+        """
+        data = await self._get(
+            "/openApi/swap/v2/quote/depth",
+            {"symbol": symbol, "limit": limit},
+        )
+        return data.get("data", {})
+
+    async def get_funding_rate(self, symbol: str) -> float:
+        """
+        Funding rate actual. Positivo → longs pagan (SHORT favorecido).
+        Negativo → shorts pagan (LONG favorecido).
+        """
+        data = await self._get(
+            "/openApi/swap/v2/quote/premiumIndex",
+            {"symbol": symbol},
+        )
+        d = data.get("data", {})
+        if isinstance(d, list) and d:
+            d = d[0]
+        try:
+            return float(d.get("lastFundingRate", 0) or 0)
+        except Exception:
+            return 0.0
 
     async def close_position_market(
         self, symbol: str, quantity: float, position_side: str,
@@ -406,33 +463,17 @@ class BingXClient:
 
         await asyncio.sleep(0.5)
 
-        sl_resp = await self.place_stop_market_order(
+        results["sl"] = await self.place_stop_market_order(
             symbol, side_close, qty, sl_price, direction,
-            order_type="STOP_MARKET",
+            close_position=True, order_type="STOP_MARKET",
         )
-        results["sl"] = sl_resp
-        if sl_resp.get("code", -1) != 0:
-            log.error("[%s] SL failed (code=%s): %s",
-                      symbol, sl_resp.get("code"), sl_resp.get("msg"))
-
         qty_half = self._round_qty(symbol, qty / 2)
-
-        tp1_resp = await self.place_stop_market_order(
+        results["tp1"] = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
-            order_type="TAKE_PROFIT_MARKET",
+            close_position=False, order_type="TAKE_PROFIT_MARKET",
         )
-        results["tp1"] = tp1_resp
-        if tp1_resp.get("code", -1) != 0:
-            log.error("[%s] TP1 failed (code=%s): %s",
-                      symbol, tp1_resp.get("code"), tp1_resp.get("msg"))
-
-        tp2_resp = await self.place_stop_market_order(
+        results["tp2"] = await self.place_stop_market_order(
             symbol, side_close, qty_half, tp2_price, direction,
-            order_type="TAKE_PROFIT_MARKET",
+            close_position=False, order_type="TAKE_PROFIT_MARKET",
         )
-        results["tp2"] = tp2_resp
-        if tp2_resp.get("code", -1) != 0:
-            log.error("[%s] TP2 failed (code=%s): %s",
-                      symbol, tp2_resp.get("code"), tp2_resp.get("msg"))
-
         return results

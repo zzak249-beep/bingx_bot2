@@ -1,9 +1,5 @@
 """
-QF×JP Bot v6.3.1 — Scanner
-FIX BALANCE: get_balance() se llama UNA vez por iteración, no 549 veces.
-  Antes: 549 llamadas API/ciclo → rate limit → balance=0 → qty=0 → skip
-  Ahora: 1 llamada/ciclo → balance correcto → trades abren
-FIX TELEGRAM: notify_signal eliminado en LIVE mode → sin spam 429
+QF×JP Bot v6.4 — Scanner
 """
 import asyncio
 import logging
@@ -23,32 +19,43 @@ _cb_blacklist: dict[str, float] = {}
 CB_COOLDOWN = 600
 
 
-async def _fetch_klines_all(client: BingXClient, symbol: str) -> tuple[list, list, list, list]:
+async def _fetch_klines_all(client, symbol):
+    """Descarga klines + order book + funding en paralelo."""
     results = await asyncio.gather(
-        client.get_klines(symbol, C.TIMEFRAME, 200),
-        client.get_klines(symbol, C.HTF_TIMEFRAME, 100),
+        client.get_klines(symbol, C.TIMEFRAME,      200),
+        client.get_klines(symbol, C.HTF_TIMEFRAME,  100),
         client.get_klines(symbol, C.HTF2_TIMEFRAME, 100),
         client.get_klines(symbol, C.HTF5_TIMEFRAME, 100),
+        client.get_order_book(symbol, 10),   # OBI — sin firma, ultra rápido
+        client.get_funding_rate(symbol),     # Funding bias
         return_exceptions=True,
     )
-    def _safe(r, default):
-        return r if isinstance(r, list) else default
-    return (
-        _safe(results[0], []),
-        _safe(results[1], []),
-        _safe(results[2], []),
-        _safe(results[3], []),
-    )
+    def _s(r, t=list): return r if isinstance(r, t) else ([] if t==list else (r if isinstance(r,(int,float)) else 0.0))
+    k3m = _s(results[0])
+    k15m = _s(results[1])
+    k1h  = _s(results[2])
+    k4h  = _s(results[3])
+    ob   = results[4] if isinstance(results[4], dict) else {}
+    fr   = results[5] if isinstance(results[5], float) else 0.0
+    return k3m, k15m, k1h, k4h, ob, fr
+
+def _calc_obi(order_book: dict) -> float:
+    """
+    Order Book Imbalance: (bid_vol - ask_vol) / (bid_vol + ask_vol)
+    Rango: -1 (presión vendedora total) a +1 (presión compradora total)
+    """
+    try:
+        bids = order_book.get("bids", [])
+        asks = order_book.get("asks", [])
+        bid_vol = sum(float(b[1]) for b in bids[:5] if len(b)>=2)
+        ask_vol = sum(float(a[1]) for a in asks[:5] if len(a)>=2)
+        total = bid_vol + ask_vol
+        return (bid_vol - ask_vol) / total if total > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
-async def _process_symbol(
-    symbol: str,
-    client: BingXClient,
-    risk: RiskManager,
-    pos_mgr: PositionManager,
-    balance: float,
-) -> Optional[Signal]:
-
+async def _process_symbol(symbol, client, risk, pos_mgr):
     if pos_mgr.is_trading(symbol):
         return None
 
@@ -57,16 +64,31 @@ async def _process_symbol(
         return None
 
     try:
-        k3m, k15m, k1h, k4h = await _fetch_klines_all(client, symbol)
+        k3m, k15m, k1h, k4h, ob, fr = await _fetch_klines_all(client, symbol)
     except Exception as e:
-        log.debug("[%s] fetch_klines error: %s", symbol, e)
+        log.debug("[%s] fetch error: %s", symbol, e)
         return None
 
     if len(k3m) < 60:
         return None
 
+    obi = _calc_obi(ob)
+
     try:
-        sig = analyze(symbol, k3m, k15m, k1h, k4h)
+        sig = analyze(symbol, k3m, k15m, k1h, k4h, funding_rate=fr)
+        # Ajustar score con OBI directamente en el signal
+        if sig.direction != "NONE" and abs(obi) > 0.1:
+            from indicators import composite_score, score_to_tier
+            import config as C
+            boost = 0.0
+            if sig.direction == "SHORT" and obi < -0.1:
+                boost = abs(obi) * 5   # presión vendedora confirma SHORT
+            elif sig.direction == "LONG" and obi > 0.1:
+                boost = obi * 5        # presión compradora confirma LONG
+            if boost > 0:
+                sig.score = min(sig.score + boost, 100.0)
+                sig.tier  = score_to_tier(sig.score)
+                log.debug("[%s] OBI boost +%.1f → score=%.1f tier=%s", symbol, boost, sig.score, sig.tier)
     except Exception as e:
         log.warning("[%s] analyze error: %s", symbol, e)
         return None
@@ -84,35 +106,42 @@ async def _process_symbol(
 
     log.info("[%s] Señal %s tier=%s score=%.1f", symbol, sig.direction, sig.tier, sig.score)
 
-    # SIGNAL mode
     if C.MODE == "SIGNAL":
         await tg.notify_signal(sig)
         return sig
 
-    # LIVE mode
+    # ── LIVE ─────────────────────────────────────────────────────────────────
     can, reason = await risk.can_trade()
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
 
-    if balance <= 0:
-        log.warning("[%s] balance=0 → skip", symbol)
+    try:
+        balance = await client.get_balance()
+    except Exception as e:
+        log.error("[%s] get_balance error: %s", symbol, e)
         return None
+
+    if balance < 5.0:
+        log.warning("get_balance=%.4f — usando CAPITAL fallback=%.2f USDT", balance, C.CAPITAL)
+        balance = C.CAPITAL
+
+    log.info("Balance activo: %.4f USDT", balance)
 
     qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
     if qty <= 0:
-        log.warning("[%s] qty=0 (bal=%.4f entry=%.6f sl=%.6f) → skip",
-                    symbol, balance, sig.entry, sig.sl)
+        log.warning("[%s] qty=0, skip", symbol)
         return None
+
+    notional = qty * sig.entry
+    log.info("[%s] qty=%s notional=%.2f USDT (price=%s)", symbol, qty, notional, sig.entry)
+
+    await tg.notify_signal(sig)
 
     try:
         results = await client.open_trade(
-            symbol=symbol,
-            direction=sig.direction,
-            quantity=qty,
-            sl_price=sig.sl,
-            tp1_price=sig.tp1,
-            tp2_price=sig.tp2,
+            symbol=symbol, direction=sig.direction, quantity=qty,
+            sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
         )
     except Exception as e:
         log.error("[%s] open_trade error: %s", symbol, e)
@@ -122,6 +151,7 @@ async def _process_symbol(
     entry_resp = results.get("entry", {})
     if entry_resp.get("code", -1) != 0:
         log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
+        await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
         return None
 
     order_id = str(
@@ -130,26 +160,16 @@ async def _process_symbol(
     )
 
     trade = OpenTrade(
-        symbol=symbol,
-        direction=sig.direction,
-        entry=sig.entry,
-        sl=sig.sl,
-        tp1=sig.tp1,
-        tp2=sig.tp2,
-        qty=qty,
-        atr=sig.atr,
-        order_id=order_id,
+        symbol=symbol, direction=sig.direction,
+        entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
+        qty=qty, atr=sig.atr, order_id=order_id,
     )
     await pos_mgr.register_trade(trade)
     await tg.notify_trade_opened(sig, qty, order_id)
     return sig
 
 
-async def scan_loop(
-    client: BingXClient,
-    risk: RiskManager,
-    pos_mgr: PositionManager,
-):
+async def scan_loop(client: BingXClient, risk: RiskManager, pos_mgr: PositionManager):
     log.info("Scanner iniciado. Modo: %s | Interval: %ds | TOP_N: %s",
              C.MODE, C.SCAN_INTERVAL,
              C.TOP_N_SYMBOLS if C.TOP_N_SYMBOLS > 0 else "TODAS")
@@ -161,28 +181,15 @@ async def scan_loop(
         start = time.time()
         iteration += 1
 
-        # Balance UNA vez por ciclo (no por símbolo)
-        try:
-            balance = await client.get_balance()
-            if balance <= 0:
-                log.warning("Balance=0 iter %d — reintentando", iteration)
-                await asyncio.sleep(5)
-                balance = await client.get_balance()
-        except Exception as e:
-            log.error("get_balance error iter %d: %s", iteration, e)
-            balance = 0.0
-
-        log.info("Balance activo: %.4f USDT", balance)
-
-        # Refrescar símbolos cada 10 iteraciones
+        # Refrescar lista de símbolos
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
-                new_symbols = await client.get_all_symbols()
-                if new_symbols:
-                    symbols = new_symbols
+                new = await client.get_all_symbols()
+                if new:
+                    symbols = new
                     log.info("Símbolos activos: %d", len(symbols))
                 else:
-                    log.warning("get_all_symbols vacío (iter=%d)", iteration)
+                    log.warning("get_all_symbols devolvió lista vacía (iter=%d)", iteration)
             except Exception as e:
                 log.error("get_all_symbols error: %s", e)
                 if not symbols:
@@ -193,32 +200,33 @@ async def scan_loop(
             await asyncio.sleep(10)
             continue
 
-        # Status Telegram cada 20 iteraciones
+        # Status periódico
         if iteration % 20 == 0:
             try:
+                balance = await client.get_balance()
                 await tg.notify_status(risk.status(), balance, len(symbols))
             except Exception as e:
                 log.warning("status notify error: %s", e)
 
-        # Procesar en batches con balance compartido
-        BATCH_SIZE    = 10
+        # Procesar en batches
+        BATCH = 20   # era 10 — más símbolos en paralelo
         signals_found = 0
-
-        for i in range(0, len(symbols), BATCH_SIZE):
-            batch   = symbols[i: i + BATCH_SIZE]
-            tasks   = [
-                _process_symbol(sym, client, risk, pos_mgr, balance)
-                for sym in batch
-            ]
-            res = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in res:
+        for i in range(0, len(symbols), BATCH):
+            batch = symbols[i : i + BATCH]
+            results = await asyncio.gather(
+                *[_process_symbol(s, client, risk, pos_mgr) for s in batch],
+                return_exceptions=True,
+            )
+            for r in results:
                 if isinstance(r, Signal) and r.direction != "NONE":
                     signals_found += 1
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)   # era 0.5 — 2.5x más rápido
 
         elapsed = time.time() - start
         log.info("Iteración %d | %d símbolos | %d señales | %.1fs",
                  iteration, len(symbols), signals_found, elapsed)
+        if signals_found == 0 and iteration <= 3:
+            log.info("Sin señales — revisa: REQUIRE_TL_BREAK=%s HTF_MIN_ALIGNED=%s MIN_SCORE=%.0f",
+                     C.REQUIRE_TL_BREAK, C.HTF_MIN_ALIGNED, C.MIN_SCORE)
 
-        wait = max(0.0, C.SCAN_INTERVAL - elapsed)
-        await asyncio.sleep(wait)
+        await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
