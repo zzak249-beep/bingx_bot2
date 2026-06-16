@@ -1,9 +1,9 @@
 """
-QF×JP Bot v7.0 — Config TRAILING STOP + ANTI-LIQUIDACIÓN
-Cambios vs v6.5:
-  - BREAKEVEN_ATR_MULT 1.5→1.0: activa trailing antes (más margen de trailing)
-  - TRAIL_DISTANCE_ATR 1.5: SL sigue el peak a 1.5 ATR de distancia
-  - Resto sin cambios (todos los caps anti-liquidación conservados)
+QF×JP Bot v7.1 — Config TRAILING STOP + ANTI-LIQUIDACIÓN + INDICADORES v3.6
+Cambios vs v7.0:
+  - Añadidas constantes faltantes para indicators.py v3.6 (Pine Sync):
+      CVD_ROLL_WINDOW, EQL_LEN, EQL_TOL, OBP2_DIST, PRE_SCORE
+  - Sin estas constantes el bot crasheaba con AttributeError en cada análisis
 """
 import os
 from dotenv import load_dotenv
@@ -47,15 +47,10 @@ MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
 # IMPORTANTE: estas 3 son las que más probablemente estén bloqueando TODAS
-# las señales (ver diagnóstico de scanner.py v7.2 — Telegram cada 5 iter
-# cuando hay 0 señales). Se pueden cambiar en Railway → Variables sin
-# redeploy de código:
-#   REQUIRE_TL_BREAK=false   → quita el requisito de ruptura exacta de
-#                              trendline (gatillo muy puntual, solo dispara
-#                              en la vela exacta del cruce)
-#   HTF_MIN_ALIGNED=1        → solo exige 1 de 3 timeframes alineado en vez
-#                              de 2 de 3 (mucho más permisivo)
-#   MIN_TIER=STD             → acepta score>=58 en vez de >=65 (FUEL)
+# las señales. Se pueden cambiar en Railway → Variables sin redeploy:
+#   REQUIRE_TL_BREAK=false   → quita el requisito de ruptura exacta de trendline
+#   HTF_MIN_ALIGNED=1        → solo exige 1 de 3 timeframes alineado
+#   MIN_TIER=STD             → acepta score>=58 en vez de >=65
 REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
 HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)
 
@@ -96,15 +91,7 @@ CB_BARS     = _int("CB_BARS",       10)
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
 
 # ── Trailing Stop Dinámico ────────────────────────────────────────────────────
-# BREAKEVEN_ATR_MULT: umbral de ACTIVACIÓN del trailing (antes era solo BE)
-#   Era 1.5 → ahora 1.0: activa antes para tener más recorrido de trailing
-#   Ejemplo: ATR=0.01, entry=1.0 → activa cuando mark >= 1.010
 BREAKEVEN_ATR_MULT = _float("BREAKEVEN_ATR_MULT", 1.0)
-
-# TRAIL_DISTANCE_ATR: distancia del SL al peak del precio (en múltiplos de ATR)
-#   El SL sigue el precio manteniendo esta distancia desde el mejor precio visto
-#   Ejemplo: ATR=0.01, peak=1.040 → SL @ 1.040 - 1.5*0.01 = 1.025
-#   Configurable en Railway si el mercado es más/menos volátil
 TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
@@ -115,3 +102,23 @@ MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
 
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── Indicadores v3.6 (Pine Sync) — NUEVO en v7.1 ─────────────────────────────
+# CRÍTICO: estas 5 constantes son requeridas por indicators.py v3.6.
+# Sin ellas el bot lanza AttributeError en cada llamada a analyze() y no
+# produce ninguna señal (analyze_error=126 en los logs de Railway).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# CVD rolling window (barras). Pine v3.6 usa 60 (bajado de 100).
+CVD_ROLL_WINDOW = _int("CVD_ROLL_WINDOW", 60)
+
+# Equal Highs / Equal Lows detector [EQH/EQL]
+EQL_LEN = _int("EQL_LEN",     20)    # lookback en barras
+EQL_TOL = _float("EQL_TOL", 0.15)   # tolerancia en múltiplos de ATR
+
+# Order Block Premium approach distance [OBP2]
+OBP2_DIST = _float("OBP2_DIST", 1.5)  # distancia al OB en ATR
+
+# Pre-señal anticipatoria [PRE] — score mínimo antes de STD (58)
+PRE_SCORE = _float("PRE_SCORE", 45.0)
