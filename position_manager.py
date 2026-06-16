@@ -60,6 +60,17 @@ def _extract_order_id(resp: dict) -> str:
     return ""
 
 
+def _is_position_closed_error(resp: dict) -> bool:
+    """
+    BingX error 109420: 'position not exist' — la posición ya fue cerrada
+    externamente (SL/TP disparado) pero el tracker interno aún no lo sabe.
+    Detectar esto permite auto-limpiar el trade en vez de seguir reintentando.
+    También captura 110025 (order would trigger immediately) como señal de cierre.
+    """
+    code = resp.get("code", 0) if isinstance(resp, dict) else 0
+    return code in (109420, 110025)
+
+
 def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
     """
     Valida que el precio de SL sea aceptable para BingX antes de enviarlo.
@@ -395,6 +406,18 @@ class PositionManager:
                     )
                     return
 
+                # FIX v7.3: 109420 en el BE path = posición ya cerrada
+                if _is_position_closed_error(resp):
+                    log.info("[%s] Trail BE: posición ya cerrada (109420) — "
+                             "limpiando tracker", symbol)
+                    pnl = self._calc_pnl(trade, mark)
+                    await tg.notify_trade_closed(
+                        symbol, trade.direction, trade.entry,
+                        mark, trade.qty, "sl_tp_auto(trail_detect)", pnl,
+                    )
+                    await self.remove_trade(symbol, pnl)
+                    return
+
                 # ── SL en breakeven falló: fallback a offset de mark ──────────
                 log.warning("[%s] BE @ entry falló: %s — probando SL offset", symbol, resp)
 
@@ -445,6 +468,19 @@ class PositionManager:
                         f"🎯 *TRAIL ACTIVADO* (emergencia) — `{symbol}`\n"
                         f"SL @ `{em_sl:.6f}` | Mark: `{mark:.6f}`"
                     )
+                elif _is_position_closed_error(em_resp):
+                    # FIX v7.3: BingX 109420 = posición ya cerrada externamente
+                    # El SL/TP original se disparó antes de que llegáramos aquí.
+                    # Auto-limpiar el trade del tracker — el monitor lo habría
+                    # detectado en el siguiente ciclo de todas formas.
+                    log.info("[%s] Trail activation: posición ya cerrada (109420) — "
+                             "limpiando tracker", symbol)
+                    pnl = self._calc_pnl(trade, mark)
+                    await tg.notify_trade_closed(
+                        symbol, trade.direction, trade.entry,
+                        mark, trade.qty, "sl_tp_auto(trail_detect)", pnl,
+                    )
+                    await self.remove_trade(symbol, pnl)
                 else:
                     log.error("[%s] Trail activation: SL emergencia FALLIDO: %s — "
                               "posición sin protección, monitorizar manual", symbol, em_resp)
@@ -588,6 +624,17 @@ class PositionManager:
                     )
 
             else:
+                # FIX v7.3: detectar 109420 = posición ya cerrada
+                if _is_position_closed_error(resp):
+                    log.info("[%s] Trail update: posición ya cerrada (109420) — "
+                             "limpiando tracker", symbol)
+                    pnl = self._calc_pnl(trade, fresh_mark)
+                    await tg.notify_trade_closed(
+                        symbol, trade.direction, trade.entry,
+                        fresh_mark, trade.qty, "sl_tp_auto(trail_detect)", pnl,
+                    )
+                    await self.remove_trade(symbol, pnl)
+                    return
                 # Fallo al actualizar trail — no es crítico, el SL viejo sigue activo
                 trade.peak_price     = new_peak   # guardar peak, reintentar próximo ciclo
                 trade.last_failed_sl = new_sl     # FIX v7.1: recordar para anti-spam
