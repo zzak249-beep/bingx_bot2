@@ -115,3 +115,17 @@ MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
 
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
+
+# ── Indicadores v3.6 (Pine Sync) ─────────────────────────────────────────────
+# CVD rolling window (barras). Más bajo = más reactivo en 3m
+CVD_ROLL_WINDOW = _int("CVD_ROLL_WINDOW", 60)
+
+# Equal Highs/Lows detector
+EQL_LEN = _int("EQL_LEN", 20)          # lookback barras
+EQL_TOL = _float("EQL_TOL", 0.15)      # tolerancia en múltiplos de ATR
+
+# Order Block Premium approach distance (OBP2)
+OBP2_DIST = _float("OBP2_DIST", 1.5)   # distancia al OB en ATR para "approach"
+
+# Pre-señal anticipatoria: score mínimo antes de STD (< MIN_SCORE)
+PRE_SCORE = _float("PRE_SCORE", 45.0)
