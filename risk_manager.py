@@ -146,6 +146,18 @@ class RiskManager:
         if entry <= 0 or sl <= 0 or abs(entry - sl) < 1e-12:
             return 0.0
 
+        # ── MODO NOTIONAL FIJO ────────────────────────────────────────────────
+        # Cuando FIXED_NOTIONAL_USDT > 0 se ignora Kelly por completo.
+        # qty = FIXED_NOTIONAL_USDT / entry → posición siempre del mismo tamaño.
+        # Respeta MAX_NOTIONAL_USDT como cap de seguridad.
+        if C.FIXED_NOTIONAL_USDT > 0:
+            target = min(C.FIXED_NOTIONAL_USDT, C.MAX_NOTIONAL_USDT)
+            qty    = target / entry
+            log.info("[sizing] FIJO %.1f USDT | %s score=%.1f qty=%.6f notional=%.2f USDT",
+                     target, tier, score, qty, qty * entry)
+            return max(0.0, qty)
+
+        # ── MODO KELLY (FIXED_NOTIONAL_USDT=0) ───────────────────────────────
         w = C.KELLY_WIN_RATE
         r = C.KELLY_RR
         kelly = max(0.0, (w * r - (1 - w)) / r) * C.KELLY_FRACTION
@@ -157,7 +169,6 @@ class RiskManager:
         qty       = (risk_usdt * C.LEVERAGE) / (sl_dist * entry) if sl_dist * entry > 0 else 0.0
 
         # ── CAP DURO ANTI-LIQUIDACIÓN ─────────────────────────────────────────
-        # ILV -43%, ADA -52%, PI -35% → posiciones demasiado grandes
         notional = qty * entry
         cap = C.MAX_NOTIONAL_USDT
         if notional > cap:

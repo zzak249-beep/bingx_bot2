@@ -683,6 +683,8 @@ class PositionManager:
                     )
 
             else:
+                code = resp.get("code", -1) if isinstance(resp, dict) else -1
+
                 # FIX v7.3: detectar 109420 = posición ya cerrada
                 if _is_position_closed_error(resp):
                     log.info("[%s] Trail update: posición ya cerrada (109420) — "
@@ -694,9 +696,43 @@ class PositionManager:
                     )
                     await self.remove_trade(symbol, pnl)
                     return
-                # Fallo al actualizar trail — no es crítico, el SL viejo sigue activo
-                trade.peak_price     = new_peak   # guardar peak, reintentar próximo ciclo
-                trade.last_failed_sl = new_sl     # FIX v7.1: recordar para anti-spam
+
+                # FIX v7.3: 110406 = 'Position SL order already exists'
+                # BingX rechaza el nuevo SL porque el anterior sigue activo.
+                # Solución: cancelar el SL viejo y reintentar inmediatamente.
+                if code == 110406:
+                    log.info("[%s] Trail update: SL duplicado (110406) — "
+                             "cancelando viejo y reintentando", symbol)
+                    try:
+                        if trade.trail_order_id:
+                            await self.client.cancel_order(symbol, trade.trail_order_id)
+                            await asyncio.sleep(0.15)
+                        resp2 = await self.client.place_stop_market_order(
+                            symbol, side_close, trade.qty, new_sl,
+                            trade.direction, order_type="STOP_MARKET",
+                        )
+                        if resp2.get("code", -1) == 0:
+                            new_oid2             = _extract_order_id(resp2)
+                            trade.peak_price     = new_peak
+                            trade.trail_sl       = new_sl
+                            trade.trail_order_id = new_oid2
+                            trade.sl             = new_sl
+                            trade.last_failed_sl = 0.0
+                            log.info("[%s] Trail (retry 110406) OK @ %.6f oid=%s",
+                                     symbol, new_sl, new_oid2)
+                        else:
+                            log.warning("[%s] Trail retry 110406 falló: %s", symbol, resp2)
+                            trade.peak_price     = new_peak
+                            trade.last_failed_sl = new_sl
+                    except Exception as e2:
+                        log.warning("[%s] Trail retry 110406 error: %s", symbol, e2)
+                        trade.peak_price     = new_peak
+                        trade.last_failed_sl = new_sl
+                    return
+
+                # Fallo genérico — el SL viejo sigue activo, reintentar próximo ciclo
+                trade.peak_price     = new_peak
+                trade.last_failed_sl = new_sl
                 log.warning("[%s] Trail update falló new_sl=%.6f: %s",
                             symbol, new_sl, resp)
 

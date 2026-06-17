@@ -100,6 +100,12 @@ DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)
 # ── Notional máximo por trade ─────────────────────────────────────────────────
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
 
+# ── Notional FIJO por trade ───────────────────────────────────────────────
+# FIXED_NOTIONAL_USDT > 0 → ignora Kelly y usa siempre este valor en USDT
+# Ejemplo: 20 USDT notional, entry=0.80 → qty=25 monedas, margen=2 USDT (10x)
+# Pon a 0 para volver al sizing Kelly automático.
+FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 20.0)
+
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
 
