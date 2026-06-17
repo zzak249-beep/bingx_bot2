@@ -21,13 +21,17 @@ def _list(k, d):
     return [x.strip() for x in r.split(",") if x.strip()] if r else []
 
 # ── BingX ─────────────────────────────────────────────────────────────────────
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+# FIX: .strip() — un espacio/salto de línea invisible al copiar-pegar la
+# clave en Railway rompe la firma HMAC en EL 100% de las llamadas (balance,
+# set_leverage, entrada...) con error 100001 "signature mismatch", porque
+# el secret usado para firmar ya no es exactamente el secret real de BingX.
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "").strip()
 BINGX_BASE_URL   = "https://open-api.bingx.com"
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # ── Modo ──────────────────────────────────────────────────────────────────────
 MODE = os.getenv("MODE", "SIGNAL").upper()
@@ -99,12 +103,6 @@ DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)
 
 # ── Notional máximo por trade ─────────────────────────────────────────────────
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
-
-# ── Notional FIJO por trade ───────────────────────────────────────────────
-# FIXED_NOTIONAL_USDT > 0 → ignora Kelly y usa siempre este valor en USDT
-# Ejemplo: 20 USDT notional, entry=0.80 → qty=25 monedas, margen=2 USDT (10x)
-# Pon a 0 para volver al sizing Kelly automático.
-FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 20.0)
 
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
