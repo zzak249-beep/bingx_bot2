@@ -1,26 +1,9 @@
 """
-QF×JP Bot v7.4 — BingX Client (MERGED v6.4 + v7.2)
-═══════════════════════════════════════════════════════════════════════════════
-Toma lo mejor de v6.4 y v7.2:
+QF×JP Bot v6.4 — BingX Client
+FIRMA: parseParam oficial BingX
+  sorted(params) + &timestamp=xxx al final → HMAC-SHA256 → &signature=xxx
 
-  DE v6.4:
-    ✅ Retry HTTP (3 intentos con backoff) — evita fallos por red
-    ✅ cancel_order con DELETE (v7.2 usaba POST incorrectamente → sin efecto)
-    ✅ cancel_all_orders con DELETE (v7.2 usaba POST → error silencioso)
-    ✅ Firma parseParam BingX oficial (sorted + timestamp al final)
-
-  DE v7.2:
-    ✅ .strip() en API key y secret (fix error 100001 "Signature verification")
-    ✅ _get_real_position_side() — Hedge/One-Way auto-detección
-    ✅ _extract_executed_qty() — qty real de BingX (fix error 110424)
-    ✅ _safe_qty_for_sl() — qty segura para SL/TP
-    ✅ sleep 1.2s post-entrada (fix race condition de posición)
-    ✅ Fallback de error de positionSide y position not exist
-
-  NUESTROS FIXES anteriores:
-    ✅ Sin closePosition=true (fix error 10940)
-    ✅ qty real siempre en place_stop_market_order
-═══════════════════════════════════════════════════════════════════════════════
+Ref: https://bingx-api.github.io/docs/#/swapV2/authentication.html
 """
 import asyncio
 import hashlib
@@ -28,6 +11,7 @@ import hmac
 import logging
 import math
 import time
+from typing import Optional
 from urllib.parse import urlencode
 
 import aiohttp
@@ -35,34 +19,38 @@ import config as C
 
 log = logging.getLogger("bingx")
 
-
 # ── Firma ─────────────────────────────────────────────────────────────────────
 
-def _ts() -> int:
-    return int(time.time() * 1000)
+def _ts() -> str:
+    return str(int(time.time() * 1000))
 
 
-def _sign(params: dict) -> str:
+def _build_signed_qs(params: dict) -> str:
     """
-    Firma parseParam oficial BingX:
-      sorted(params) → key=val&key=val → &timestamp=xxx → HMAC-SHA256
-    .strip() en secret key para eliminar espacios/newlines invisibles
-    que Railway puede añadir al copiar variables de entorno (fix 100001).
+    Construye el query string firmado exactamente como parseParam oficial BingX:
+
+        sorted_params_string + &timestamp=xxx + &signature=HMAC(todo_eso)
+
+    Pasos:
+      1. sorted(params.keys()) — sin timestamp
+      2. "key=val&key=val"     — concatenación simple (NO urlencode)
+      3. "&timestamp=xxx"      — siempre al final del payload firmado
+      4. HMAC-SHA256 del payload completo
+      5. "&signature=xxx"      — appended a la URL final
     """
     sorted_keys = sorted(params.keys())
     parts       = [f"{k}={params[k]}" for k in sorted_keys]
-    payload     = "&".join(parts)
-    key         = C.BINGX_SECRET_KEY.strip()
-    return hmac.new(
-        key.encode("utf-8"),
+    base        = "&".join(parts)
+    ts          = _ts()
+    payload     = (base + "&timestamp=" + ts) if base else ("timestamp=" + ts)
+    signature   = hmac.new(
+        C.BINGX_SECRET_KEY.encode("utf-8"),
         payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-
-
-def _api_key() -> str:
-    return C.BINGX_API_KEY.strip()
-
+    qs = payload + "&signature=" + signature
+    log.debug("FIRMA payload=%s sig=%s...", payload[:80], signature[:12])
+    return qs
 
 # ── Cliente HTTP ──────────────────────────────────────────────────────────────
 
@@ -70,15 +58,24 @@ class BingXClient:
     BASE = C.BINGX_BASE_URL
 
     def __init__(self):
-        self._session:        aiohttp.ClientSession | None = None
-        self._precision_map:  dict[str, int]   = {}
-        self._min_qty_map:    dict[str, float] = {}
-        self._step_map:       dict[str, float] = {}
-        log.info("BingXClient v7.4 — merged (retry + Hedge + strip + real_qty)")
+        self._session:       Optional[aiohttp.ClientSession] = None
+        self._precision_map: dict[str, int]   = {}
+        self._min_qty_map:   dict[str, float] = {}
+        log.info("BingXClient v6.4 iniciado — firma: sorted+ts_al_final (parseParam oficial)")
+        # ── FIX diagnóstico: longitud de claves (NUNCA el valor) ───────────────
+        # Las claves de BingX son típicamente 32-64 caracteres. Si ves una
+        # longitud rara (ej. con +1 o +2 de lo esperado) hay un espacio/salto
+        # de línea invisible pegado desde Railway → causa 100% de los 100001
+        # "signature mismatch" aunque la clave en sí sea correcta.
+        log.info("[auth] API_KEY len=%d | SECRET_KEY len=%d",
+                  len(C.BINGX_API_KEY), len(C.BINGX_SECRET_KEY))
+        if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
+            log.error("[auth] BINGX_API_KEY o BINGX_SECRET_KEY vacíos — revisa Railway → Variables")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
+                headers={"X-BX-APIKEY": C.BINGX_API_KEY},
                 timeout=aiohttp.ClientTimeout(total=15),
             )
         return self._session
@@ -87,23 +84,21 @@ class BingXClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    # ── HTTP primitives con retry ─────────────────────────────────────────────
+    # ── HTTP primitives ───────────────────────────────────────────────────────
 
-    async def _get(self, path: str, params: dict | None = None,
-                   signed: bool = True) -> dict:
-        """GET con 3 intentos y backoff exponencial."""
-        base = dict(params or {})
+    async def _get(self, path: str, params: dict | None = None, signed: bool = False) -> dict:
+        session = await self._get_session()
+        base    = params or {}
         for attempt in range(3):
             try:
-                s   = await self._get_session()
-                p   = dict(base)
-                ts  = _ts()
-                p["timestamp"]  = ts
-                p["recvWindow"] = 10000
-                p["signature"]  = _sign(p)
-                headers = {"X-BX-APIKEY": _api_key()} if signed else {}
-                async with s.get(f"{self.BASE}{path}", params=p,
-                                 headers=headers) as r:
+                if signed:
+                    qs  = _build_signed_qs(base)
+                    url = f"{self.BASE}{path}?{qs}"
+                elif base:
+                    url = f"{self.BASE}{path}?{urlencode(base)}"
+                else:
+                    url = f"{self.BASE}{path}"
+                async with session.get(url) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -113,16 +108,12 @@ class BingXClient:
         return {}
 
     async def _post(self, path: str, params: dict) -> dict:
-        """POST con 3 intentos y backoff exponencial."""
+        session = await self._get_session()
         for attempt in range(3):
             try:
-                s  = await self._get_session()
-                p  = dict(params)
-                p["timestamp"]  = _ts()
-                p["recvWindow"] = 10000
-                p["signature"]  = _sign(p)
-                async with s.post(f"{self.BASE}{path}", params=p,
-                                  headers={"X-BX-APIKEY": _api_key()}) as r:
+                qs  = _build_signed_qs(params)
+                url = f"{self.BASE}{path}?{qs}"
+                async with session.post(url) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -132,16 +123,12 @@ class BingXClient:
         return {}
 
     async def _delete(self, path: str, params: dict) -> dict:
-        """DELETE con 3 intentos y backoff exponencial."""
+        session = await self._get_session()
         for attempt in range(3):
             try:
-                s  = await self._get_session()
-                p  = dict(params)
-                p["timestamp"]  = _ts()
-                p["recvWindow"] = 10000
-                p["signature"]  = _sign(p)
-                async with s.delete(f"{self.BASE}{path}", params=p,
-                                    headers={"X-BX-APIKEY": _api_key()}) as r:
+                qs  = _build_signed_qs(params)
+                url = f"{self.BASE}{path}?{qs}"
+                async with session.delete(url) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -150,81 +137,28 @@ class BingXClient:
                 await asyncio.sleep(1.5 ** attempt)
         return {}
 
-    # ── Redondeo y precisión ──────────────────────────────────────────────────
+    # ── Redondeo de cantidad ──────────────────────────────────────────────────
 
     def _round_qty(self, symbol: str, qty: float) -> float:
-        step = self._step_map.get(symbol, 0)
-        if step > 0:
-            qty       = math.floor(qty / step) * step
-            precision = max(0, round(-math.log10(step)))
-            qty       = round(qty, precision)
-        else:
-            precision = self._precision_map.get(symbol, 4)
-            qty       = math.floor(qty * 10**precision) / 10**precision
-        min_qty = self._min_qty_map.get(symbol, 0)
-        return max(qty, min_qty) if qty > 0 else 0.0
+        precision = self._precision_map.get(symbol, 6)
+        if precision == 0:
+            return float(math.floor(qty))
+        factor = 10 ** precision
+        return math.floor(qty * factor) / factor
 
-    def _safe_qty_for_sl(self, symbol: str, qty: float) -> float:
-        """Qty segura para SL/TP garantizando qty_sl ≤ qty_real_ejecutada."""
-        step = self._step_map.get(symbol, 0)
-        if step > 0:
-            qty       = math.floor(qty / step) * step
-            precision = max(0, round(-math.log10(step)))
-            qty       = round(qty, precision)
-        else:
-            precision = self._precision_map.get(symbol, 4)
-            qty       = round(qty * 0.9999, precision)
-        min_qty = self._min_qty_map.get(symbol, 0)
-        return max(qty, min_qty) if qty > 0 else 0.0
-
-    def _extract_executed_qty(self, entry_resp: dict, fallback_qty: float) -> float:
-        """
-        Extrae qty REAL ejecutada de la respuesta BingX (fix error 110424).
-        BingX puede ejecutar con qty ligeramente diferente al cálculo local.
-        """
-        try:
-            data  = entry_resp.get("data", {})
-            order = data.get("order", data)
-            for field in ("executedQty", "origQty", "quantity"):
-                val = order.get(field, "")
-                if val and str(val) not in ("", "0", "0.0"):
-                    extracted = float(val)
-                    if extracted > 0:
-                        return extracted
-        except Exception:
-            pass
-        return self._safe_qty_for_sl("", fallback_qty)
-
-    def _parse_error(self, resp: dict) -> str:
-        if not isinstance(resp, dict):
-            return ""
-        return str(resp.get("msg", resp.get("message", ""))).lower()
-
-    # ── positionSide auto-detección (Hedge / One-Way) ─────────────────────────
-
-    async def _get_real_position_side(self, symbol: str, direction: str) -> str:
-        """
-        Lee positionSide real de BingX:
-          Hedge Mode  → LONG o SHORT
-          One-Way     → BOTH
-        Si no encuentra posición → usa direction (correcto para Hedge).
-        """
-        try:
-            positions = await self.get_open_positions()
-            for p in positions:
-                if p.get("symbol") != symbol:
-                    continue
-                ps = p.get("positionSide", "")
-                if ps in ("LONG", "SHORT", "BOTH"):
-                    return ps
-        except Exception as e:
-            log.debug("[%s] _get_real_position_side error: %s", symbol, e)
-        return direction
+    def _check_min_qty(self, symbol: str, qty: float) -> bool:
+        min_q = self._min_qty_map.get(symbol, 0.0)
+        return qty >= min_q if min_q > 0 else True
 
     # ── Símbolos ──────────────────────────────────────────────────────────────
 
     async def get_all_symbols(self) -> list[str]:
-        data = await self._get("/openApi/swap/v2/quote/contracts", signed=False)
+        """
+        Devuelve todos los pares USDT perpetuos activos en BingX,
+        filtrados por MIN_VOLUME_USDT y BLACKLIST.
+        Enriquece volumen desde /ticker si /contracts no lo incluye.
+        """
+        data = await self._get("/openApi/swap/v2/quote/contracts")
         raw  = data.get("data", [])
         if isinstance(raw, dict):
             raw = raw.get("contracts", raw.get("list", []))
@@ -243,6 +177,7 @@ class BingXClient:
             sym = item.get("symbol", "")
             if not sym:
                 continue
+            # Normalizar formato → XXX-USDT
             if "-" not in sym and sym.endswith("USDT"):
                 sym = sym[:-4] + "-USDT"
             if not sym.endswith("-USDT"):
@@ -253,13 +188,13 @@ class BingXClient:
             if any(base_coin.startswith(p) for p in _bad_prefixes):
                 continue
 
-            self._precision_map[sym] = int(item.get("volumePrecision",    item.get("quantityPrecision", 4)) or 4)
-            self._min_qty_map[sym]   = float(item.get("tradeMinQuantity", item.get("minOrderQty", 0)) or 0)
-            self._step_map[sym]      = float(item.get("qtyStep",          item.get("stepSize", 0)) or 0)
+            self._precision_map[sym] = int(item.get("volumePrecision",    6) or 6)
+            self._min_qty_map[sym]   = float(item.get("tradeMinQuantity", 0) or 0)
 
             vol_raw = (
                 item.get("volume24h") or item.get("vol24h") or
-                item.get("quoteVolume") or item.get("tradeAmt") or 0
+                item.get("quoteVolume") or item.get("turnover24h") or
+                item.get("tradeAmt") or item.get("vol") or 0
             )
             vol = float(vol_raw) if vol_raw else 0.0
             if vol > 0:
@@ -267,13 +202,13 @@ class BingXClient:
             vol_map[sym] = vol
             symbols.append(sym)
 
-        # Enriquecer desde /ticker si contracts no tiene volumen
+        # Enriquecer volumen desde /ticker si contracts no lo incluye
         if vol_detected == 0 and symbols:
             log.info("contracts sin volumen → enriqueciendo con /ticker")
             try:
-                td = await self._get("/openApi/swap/v2/quote/ticker", signed=False)
+                td = await self._get("/openApi/swap/v2/quote/ticker")
                 for t in (td.get("data", []) or []):
-                    s  = t.get("symbol", "")
+                    s = t.get("symbol", "")
                     if "-" not in s and s.endswith("USDT"):
                         s = s[:-4] + "-USDT"
                     qv = float(t.get("quoteVolume", 0) or t.get("volume", 0) or 0)
@@ -284,6 +219,7 @@ class BingXClient:
             except Exception as e:
                 log.warning("ticker fallback error: %s", e)
 
+        # Filtro de volumen
         if vol_detected > 0 and C.MIN_VOLUME_USDT > 0:
             symbols = [s for s in symbols if vol_map.get(s, 0) >= C.MIN_VOLUME_USDT]
 
@@ -295,17 +231,18 @@ class BingXClient:
                  len(symbols), len(raw), vol_detected)
         return symbols
 
-    # ── Market data ───────────────────────────────────────────────────────────
-
-    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list:
+    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list[list]:
+        """Devuelve klines [[ts, o, h, l, c, v], ...] ordenadas cronológicamente."""
         data = await self._get(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
-            signed=False,
         )
         raw = data.get("data", [])
         if isinstance(raw, dict):
             raw = raw.get("klines", [])
+        if not raw:
+            return []
+
         result = []
         for c in raw:
             try:
@@ -326,25 +263,36 @@ class BingXClient:
         return sorted(result, key=lambda x: x[0])
 
     async def get_ticker(self, symbol: str) -> dict:
-        data = await self._get("/openApi/swap/v2/quote/ticker",
-                               {"symbol": symbol}, signed=False)
+        data = await self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
         raw = data.get("data", {})
+        # API a veces devuelve lista con un elemento
         if isinstance(raw, list):
             return raw[0] if raw else {}
         return raw if isinstance(raw, dict) else {}
 
     async def get_order_book(self, symbol: str, limit: int = 10) -> dict:
-        data = await self._get("/openApi/swap/v2/quote/depth",
-                               {"symbol": symbol, "limit": limit}, signed=False)
+        """
+        Order book público (sin firma). Devuelve {"bids": [[price, qty], ...], "asks": [...]}
+        """
+        data = await self._get(
+            "/openApi/swap/v2/quote/depth",
+            {"symbol": symbol, "limit": limit},
+        )
         raw = data.get("data", data)
         if isinstance(raw, dict):
-            return {"bids": raw.get("bids", []), "asks": raw.get("asks", [])}
+            return {
+                "bids": raw.get("bids", []),
+                "asks": raw.get("asks", []),
+            }
         return {"bids": [], "asks": []}
 
     async def get_funding_rate(self, symbol: str) -> float:
+        """Devuelve el funding rate actual como float (e.g. 0.0001)."""
         try:
-            data = await self._get("/openApi/swap/v2/quote/fundingRate",
-                                   {"symbol": symbol}, signed=False)
+            data = await self._get(
+                "/openApi/swap/v2/quote/fundingRate",
+                {"symbol": symbol},
+            )
             raw = data.get("data", {})
             if isinstance(raw, list):
                 raw = raw[0] if raw else {}
@@ -355,8 +303,16 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        data = await self._get("/openApi/swap/v3/user/balance",
-                               {"currency": "USDT"})
+        """
+        Retorna availableMargin USDT.
+        Si availableMargin=0 pero hay equity (posiciones abiertas),
+        usa equity como proxy del capital real disponible.
+        """
+        data = await self._get(
+            "/openApi/swap/v3/user/balance",
+            {"currency": "USDT"},
+            signed=True,
+        )
         raw = data.get("data", {})
 
         def _extract(d: dict) -> float:
@@ -365,6 +321,7 @@ class BingXClient:
             if avail > 0:
                 return avail
             if equity > 0:
+                log.debug("availableMargin=0, usando equity=%.4f", equity)
                 return equity
             return 0.0
 
@@ -376,6 +333,7 @@ class BingXClient:
                 if isinstance(a, dict) and ("availableMargin" in a or "equity" in a):
                     return _extract(a)
             return 0.0
+
         if isinstance(raw, dict):
             bal = raw.get("balance", raw)
             if isinstance(bal, list):
@@ -384,125 +342,115 @@ class BingXClient:
                         return _extract(a)
             if isinstance(bal, dict):
                 return _extract(bal)
+
+        log.warning("get_balance: formato inesperado %s", str(data)[:200])
         return 0.0
 
-    async def get_open_positions(self) -> list:
-        data = await self._get("/openApi/swap/v2/user/positions")
+    # ── Posiciones ────────────────────────────────────────────────────────────
+
+    async def get_open_positions(self) -> list[dict]:
+        data = await self._get("/openApi/swap/v2/user/positions", None, signed=True)
         positions = data.get("data", [])
         if not isinstance(positions, list):
             return []
         return [p for p in positions if float(p.get("positionAmt", 0) or 0) != 0]
 
-    async def get_open_orders(self, symbol: str) -> list:
-        data = await self._get("/openApi/swap/v2/trade/openOrders",
-                               {"symbol": symbol})
+    async def get_open_orders(self, symbol: str) -> list[dict]:
+        data = await self._get(
+            "/openApi/swap/v2/trade/openOrders",
+            {"symbol": symbol},
+            signed=True,
+        )
         return data.get("data", {}).get("orders", [])
 
     # ── Apalancamiento ────────────────────────────────────────────────────────
 
-    async def set_leverage(self, symbol: str, leverage: int,
-                            side: str = "LONG") -> bool:
-        results = await asyncio.gather(
-            self._post("/openApi/swap/v2/trade/leverage",
-                       {"symbol": symbol, "side": "LONG", "leverage": leverage}),
-            self._post("/openApi/swap/v2/trade/leverage",
-                       {"symbol": symbol, "side": "SHORT", "leverage": leverage}),
-            return_exceptions=True,
+    async def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> bool:
+        data = await self._post(
+            "/openApi/swap/v2/trade/leverage",
+            {"symbol": symbol, "side": side, "leverage": leverage},
         )
-        ok = True
-        for s, r in zip(["LONG", "SHORT"], results):
-            if isinstance(r, Exception):
-                log.warning("[%s] set_leverage %s error: %s", symbol, s, r)
-                ok = False
-            elif isinstance(r, dict) and r.get("code", -1) != 0:
-                log.warning("[%s] set_leverage %s: %s", symbol, s, r.get("code"))
+        ok = data.get("code", -1) == 0
+        if not ok:
+            log.warning("[%s] set_leverage code=%s — continuando", symbol, data.get("code"))
         return ok
 
     # ── Órdenes ───────────────────────────────────────────────────────────────
 
-    async def place_stop_market_order(
+    async def place_market_order(
         self,
         symbol:        str,
         side:          str,
         quantity:      float,
-        stop_price:    float,
-        direction:     str = "LONG",
-        order_type:    str = "STOP_MARKET",
+        position_side: str = "LONG",
     ) -> dict:
-        qty     = self._round_qty(symbol, quantity)
-        real_ps = await self._get_real_position_side(symbol, direction)
-
+        qty = self._round_qty(symbol, quantity)
+        if not self._check_min_qty(symbol, qty):
+            log.warning("[%s] qty %.6f < min_qty — skip", symbol, qty)
+            return {"code": -1, "msg": "qty_below_minimum"}
         params = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": real_ps,
-            "type":         order_type,
-            "stopPrice":    str(round(stop_price, 8)),
+            "positionSide": position_side,
+            "type":         "MARKET",
             "quantity":     str(qty),
-            "workingType":  "MARK_PRICE",
-            "priceProtect": "true",
         }
-        log.debug("[%s] %s side=%s ps=%s stop=%.6f qty=%s",
-                  symbol, order_type, side, real_ps, stop_price, qty)
+        log.info("[%s] MARKET order params: %s", symbol, params)
+        return await self._post("/openApi/swap/v2/trade/order", params)
 
-        resp = await self._post("/openApi/swap/v2/trade/order", params)
-
-        # Fallbacks automáticos por errores de positionSide
-        if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            msg = self._parse_error(resp)
-            if "positionside" in msg or "position side" in msg:
-                log.warning("[%s] positionSide fallback → %s", symbol, direction)
-                params["positionSide"] = direction
-                resp = await self._post("/openApi/swap/v2/trade/order", params)
-            elif "position not exist" in msg and real_ps != "BOTH":
-                log.warning("[%s] position not exist → probando BOTH", symbol)
-                params["positionSide"] = "BOTH"
-                resp = await self._post("/openApi/swap/v2/trade/order", params)
-
-        return resp if isinstance(resp, dict) else {"code": -1, "msg": str(resp)}
+    async def place_stop_market_order(
+        self,
+        symbol:         str,
+        side:           str,
+        quantity:       float,
+        stop_price:     float,
+        position_side:  str  = "LONG",
+        close_position: bool = True,
+        order_type:     str  = "STOP_MARKET",
+    ) -> dict:
+        qty = self._round_qty(symbol, quantity)
+        params = {
+            "symbol":        symbol,
+            "side":          side,
+            "positionSide":  position_side,
+            "type":          order_type,
+            "stopPrice":     str(round(stop_price, 8)),
+            "closePosition": "true" if close_position else "false",
+            "quantity":      "0" if close_position else str(qty),
+            "workingType":   "MARK_PRICE",
+            "priceProtect":  "true",
+        }
+        return await self._post("/openApi/swap/v2/trade/order", params)
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict:
-        """DELETE correcto para cancelar orden individual."""
         return await self._delete(
             "/openApi/swap/v2/trade/order",
             {"symbol": symbol, "orderId": order_id},
         )
 
     async def cancel_all_orders(self, symbol: str) -> dict:
-        """DELETE correcto para cancelar todas las órdenes de un símbolo."""
         return await self._delete(
             "/openApi/swap/v2/trade/allOpenOrders",
             {"symbol": symbol},
         )
 
-    async def close_position_market(self, symbol: str, quantity: float,
-                                     direction: str) -> dict:
-        side    = "SELL" if direction == "LONG" else "BUY"
-        qty     = self._round_qty(symbol, quantity)
-        real_ps = await self._get_real_position_side(symbol, direction)
-
-        params = {
+    async def close_position_market(
+        self,
+        symbol:        str,
+        quantity:      float,
+        position_side: str,
+    ) -> dict:
+        side = "SELL" if position_side == "LONG" else "BUY"
+        qty  = self._round_qty(symbol, quantity)
+        return await self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": real_ps,
+            "positionSide": position_side,
             "type":         "MARKET",
             "quantity":     str(qty),
-        }
-        log.info("[%s] CLOSE MARKET ps=%s qty=%s", symbol, real_ps, qty)
-        resp = await self._post("/openApi/swap/v2/trade/order", params)
+        })
 
-        if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            msg = self._parse_error(resp)
-            if "positionside" in msg or "position side" in msg:
-                params["positionSide"] = direction
-                resp = await self._post("/openApi/swap/v2/trade/order", params)
-            elif "position not exist" in msg and real_ps != "BOTH":
-                params["positionSide"] = "BOTH"
-                resp = await self._post("/openApi/swap/v2/trade/order", params)
-
-        return resp if isinstance(resp, dict) else {"code": -1}
-
-    # ── open_trade completo ───────────────────────────────────────────────────
+    # ── open_trade completo (entrada + SL + TP1 + TP2) ───────────────────────
 
     async def open_trade(
         self,
@@ -514,85 +462,46 @@ class BingXClient:
         tp2_price: float,
     ) -> dict:
         """
-        Abre posición (MARKET) + SL + TP1(50%) + TP2(50%).
-        Usa qty REAL ejecutada por BingX para SL/TP (fix error 110424).
-        Sleep 1.2s post-entrada para dar tiempo a BingX a registrar posición.
+        Abre posición con market order + coloca SL, TP1 y TP2 en paralelo.
+        Retorna dict con claves: entry, sl, tp1, tp2.
         """
-        qty       = self._round_qty(symbol, quantity)
-        side_open = "BUY"  if direction == "LONG" else "SELL"
-        side_cls  = "SELL" if direction == "LONG" else "BUY"
-        results   = {}
+        side_entry = "BUY"  if direction == "LONG" else "SELL"
+        side_close = "SELL" if direction == "LONG" else "BUY"
+        results: dict = {}
 
         await self.set_leverage(symbol, C.LEVERAGE, direction)
 
-        if not self._min_qty_map.get(symbol) or qty >= self._min_qty_map.get(symbol, 0):
-            pass
-        if qty <= 0:
-            return {"entry": {"code": -1, "msg": "qty_zero"}}
+        qty = self._round_qty(symbol, quantity)
+        if not self._check_min_qty(symbol, qty):
+            log.warning("[%s] qty %.6f < min → skip", symbol, qty)
+            return {"entry": {"code": -1, "msg": "qty_below_minimum"}}
 
-        # ── Entrada ───────────────────────────────────────────────────────────
-        entry_resp = await self._post("/openApi/swap/v2/trade/order", {
-            "symbol":       symbol,
-            "side":         side_open,
-            "positionSide": direction,
-            "type":         "MARKET",
-            "quantity":     str(qty),
-        })
+        entry_resp = await self.place_market_order(symbol, side_entry, qty, direction)
         results["entry"] = entry_resp
-        log.info("[%s] MARKET %s qty=%s → code=%s",
-                 symbol, side_open, qty, entry_resp.get("code", "?"))
-
         if entry_resp.get("code", -1) != 0:
+            log.error("[%s] Entrada fallida: %s", symbol, entry_resp)
             return results
 
-        # Extraer qty real ejecutada (fix 110424)
-        real_qty = self._extract_executed_qty(entry_resp, qty)
-        if abs(real_qty - qty) > qty * 0.001:
-            log.info("[%s] qty ajustada: local=%.6f real_BingX=%.6f", symbol, qty, real_qty)
-        qty = real_qty
+        await asyncio.sleep(0.5)
 
-        # Sleep post-entrada (fix race condition positionSide)
-        await asyncio.sleep(1.2)
+        qty_half = self._round_qty(symbol, qty / 2)
 
-        # ── Split qty para TP1/TP2 ────────────────────────────────────────────
-        step = self._step_map.get(symbol, 0)
-        if step > 0:
-            precision = max(0, round(-math.log10(step)))
-        else:
-            precision = self._precision_map.get(symbol, 4)
-        factor     = 10 ** precision
-        qty_half   = math.floor(qty / 2 * factor) / factor
-        qty_remain = math.floor((qty - qty_half) * factor) / factor
-        if qty_half + qty_remain > qty:
-            qty_remain = math.floor((qty - qty_half) * factor) / factor
-
-        # ── SL + TP1 + TP2 en paralelo ───────────────────────────────────────
-        sl_r, tp1_r, tp2_r = await asyncio.gather(
-            self.place_stop_market_order(symbol, side_cls, qty,        sl_price,  direction, "STOP_MARKET"),
-            self.place_stop_market_order(symbol, side_cls, qty_half,   tp1_price, direction, "TAKE_PROFIT_MARKET"),
-            self.place_stop_market_order(symbol, side_cls, qty_remain, tp2_price, direction, "TAKE_PROFIT_MARKET"),
-            return_exceptions=True,
+        sl_task  = self.place_stop_market_order(
+            symbol, side_close, qty, sl_price, direction,
+            close_position=True, order_type="STOP_MARKET",
+        )
+        tp1_task = self.place_stop_market_order(
+            symbol, side_close, qty_half, tp1_price, direction,
+            close_position=False, order_type="TAKE_PROFIT_MARKET",
+        )
+        tp2_task = self.place_stop_market_order(
+            symbol, side_close, qty_half, tp2_price, direction,
+            close_position=False, order_type="TAKE_PROFIT_MARKET",
         )
 
-        for label, r, price in [("SL", sl_r, sl_price), ("TP1", tp1_r, tp1_price), ("TP2", tp2_r, tp2_price)]:
-            resp = r if isinstance(r, dict) else {"code": -1, "msg": str(r)}
-            results[label.lower()] = resp
-            if resp.get("code", -1) == 0:
-                log.info("[%s] %s OK @ %.6f", symbol, label, price)
-            else:
-                log.error("[%s] %s FALLIDO: %s", symbol, label, resp)
-                # Retry SL con qty_safe (nunca dejar posición sin protección)
-                if label == "SL":
-                    qty_safe = self._safe_qty_for_sl(symbol, qty)
-                    if qty_safe != qty:
-                        log.info("[%s] SL retry con qty_safe=%.6f", symbol, qty_safe)
-                        resp2 = await self.place_stop_market_order(
-                            symbol, side_cls, qty_safe, sl_price, direction, "STOP_MARKET"
-                        )
-                        results["sl"] = resp2
-                        if resp2.get("code", -1) == 0:
-                            log.info("[%s] SL OK (retry) @ %.6f", symbol, sl_price)
-                        else:
-                            log.error("[%s] SL FALLIDO (retry): %s", symbol, resp2)
-
+        sl_r, tp1_r, tp2_r = await asyncio.gather(sl_task, tp1_task, tp2_task,
+                                                    return_exceptions=True)
+        results["sl"]  = sl_r  if isinstance(sl_r,  dict) else {"code": -1, "msg": str(sl_r)}
+        results["tp1"] = tp1_r if isinstance(tp1_r, dict) else {"code": -1, "msg": str(tp1_r)}
+        results["tp2"] = tp2_r if isinstance(tp2_r, dict) else {"code": -1, "msg": str(tp2_r)}
         return results
