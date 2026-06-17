@@ -132,7 +132,22 @@ class PositionManager:
     # ── Reconciliar al arrancar ───────────────────────────────────────────────
 
     async def reconcile_on_startup(self):
-        """Lee posiciones reales de BingX. NO toca _open_count."""
+        """
+        Lee posiciones reales de BingX al arrancar y registra las que tienen
+        entry>0. NO toca _open_count.
+
+        FIX v7.3:
+          - RECONCILE_ON_STARTUP=false desactiva el reconcile en cuentas
+            compartidas donde BingX tiene posiciones de otros bots que no
+            deben ser gestionadas por este bot.
+          - Filtra posiciones con entry=0 (símbolo sin precio de mercado)
+            para evitar sl_price=0 → error 10940 en _place_emergency_sl_all.
+        """
+        import os
+        if os.getenv("RECONCILE_ON_STARTUP", "true").strip().lower() in ("false", "0", "no"):
+            log.info("reconcile_on_startup desactivado (RECONCILE_ON_STARTUP=false)")
+            return
+
         try:
             positions = await self.client.get_open_positions()
         except Exception as e:
@@ -155,9 +170,15 @@ class PositionManager:
                 pos_side = "BOTH"
             entry = float(pos.get("avgPrice", pos.get("entryPrice", 0)) or 0)
             qty   = abs(amt)
-            sl    = entry * (0.99 if direction == "LONG" else 1.01)
-            tp1   = entry * (1.02 if direction == "LONG" else 0.98)
-            tp2   = entry * (1.04 if direction == "LONG" else 0.96)
+
+            # FIX v7.3: entry=0 → sl_price=0 → BingX error 10940. Saltar.
+            if entry <= 0:
+                log.warning("[%s] reconcile: entry=0, ignorando (sin precio válido)", sym)
+                continue
+
+            sl  = entry * (0.99 if direction == "LONG" else 1.01)
+            tp1 = entry * (1.02 if direction == "LONG" else 0.98)
+            tp2 = entry * (1.04 if direction == "LONG" else 0.96)
             async with self._lock:
                 self._trades[sym] = OpenTrade(
                     symbol=sym, direction=direction, entry=entry,
@@ -178,11 +199,18 @@ class PositionManager:
     async def _place_emergency_sl_all(self):
         """
         Coloca SL inmediato en todas las posiciones reconciliadas.
-        SL calculado desde mark price actual con 2% offset → siempre válido.
+        SL calculado desde mark price actual con 2% offset.
         Guarda el orderId para el sistema de trailing.
+
+        FIX v7.3:
+          - Valida mark>0 y sl_price>0 antes de llamar a BingX (evita 10940).
+          - Trata 109420 ('position not exist') y 10940 como señal de que la
+            posición ya fue cerrada → elimina el trade del tracker en vez de
+            logear error en bucle.
         """
         async with self._lock:
             trades = dict(self._trades)
+
         for sym, trade in trades.items():
             try:
                 ticker = await self.client.get_ticker(sym)
@@ -190,8 +218,22 @@ class PositionManager:
                 if mark <= 0:
                     mark = trade.entry
 
+                # FIX v7.3: si mark sigue siendo 0 no podemos calcular sl_price
+                if mark <= 0:
+                    log.warning("[%s] _place_emergency_sl_all: mark=0, saltando "
+                                "(no hay precio válido)", sym)
+                    await self.remove_trade(sym, 0.0)
+                    continue
+
                 side_close = "SELL" if trade.direction == "LONG" else "BUY"
                 sl_price   = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
+
+                # Doble validación: sl_price nunca debe ser 0 ni negativo
+                if sl_price <= 0:
+                    log.warning("[%s] _place_emergency_sl_all: sl_price=%.6f inválido, "
+                                "saltando", sym, sl_price)
+                    await self.remove_trade(sym, 0.0)
+                    continue
 
                 log.info("[%s] SL emergencia: mark=%.6f sl=%.6f", sym, mark, sl_price)
 
@@ -199,14 +241,31 @@ class PositionManager:
                     sym, side_close, trade.qty, sl_price,
                     trade.direction, order_type="STOP_MARKET",
                 )
-                if resp.get("code", -1) == 0:
+
+                code = resp.get("code", -1) if isinstance(resp, dict) else -1
+
+                if code == 0:
                     oid = _extract_order_id(resp)
                     trade.sl             = sl_price
                     trade.trail_sl       = sl_price
                     trade.trail_order_id = oid
                     log.info("[%s] SL emergencia OK @ %.6f (oid=%s)", sym, sl_price, oid)
+
+                elif code in (109420, 10940):
+                    # 109420 = position not exist | 10940 = bad params (pos ya cerrada)
+                    # FIX v7.3: la posición no existe → limpiar tracker
+                    log.info("[%s] SL emergencia: posición ya cerrada (code=%d) — "
+                             "eliminando del tracker", sym, code)
+                    pnl = self._calc_pnl(trade, mark)
+                    await tg.notify_trade_closed(
+                        sym, trade.direction, trade.entry,
+                        mark, trade.qty, "sl_tp_auto(reconcile_detect)", pnl,
+                    )
+                    await self.remove_trade(sym, pnl)
+
                 else:
                     log.error("[%s] SL emergencia FALLIDO: %s", sym, resp)
+
             except Exception as e:
                 log.error("[%s] _place_emergency_sl_all: %s", sym, e)
             await asyncio.sleep(0.4)
