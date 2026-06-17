@@ -400,6 +400,10 @@ class BingXClient:
         order_type:     str  = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
+        # FIX v7.3: pasar qty real siempre.
+        # BingX devuelve 10940 "parameter quantity or stopPrice is must"
+        # cuando closePosition=true y quantity="0" en ciertas versiones de API.
+        # Pasar la qty real evita el error sin cambiar el comportamiento.
         params = {
             "symbol":        symbol,
             "side":          side,
@@ -407,7 +411,7 @@ class BingXClient:
             "type":          order_type,
             "stopPrice":     str(round(stop_price, 8)),
             "closePosition": "true" if close_position else "false",
-            "quantity":      "0" if close_position else str(qty),
+            "quantity":      str(qty),
             "workingType":   "MARK_PRICE",
             "priceProtect":  "true",
         }
