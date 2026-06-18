@@ -1,27 +1,40 @@
 """
-QF×JP Bot v7.5 — BingX Client DEFINITIVO
+QF×JP Bot v7.6 — BingX Client DEFINITIVO (fix firma byte-a-byte)
 ═══════════════════════════════════════════════════════════════════════════════
-FIRMA: urlencode(sorted(params.items())) — método v7.2 confirmado en producción.
-  v7.4 usaba f-string concatenation → error 100001 "Signature mismatch".
-  La causa: urlencode codifica algunos caracteres de forma diferente al
-  f-string directo. Para BingX la firma debe ser EXACTAMENTE urlencode.
+FIX v7.6 — causa real del 100001 "Signature mismatch" que persistía en v7.5:
 
-DE v7.2 (firma + features que funcionan):
-  ✅ urlencode(sorted(params.items())) para firma — ÚNICO método que funciona
-  ✅ .strip() en API key y secret (fix error 100001 por espacios invisibles)
+  v7.5 firmaba con:
+      qs  = urlencode(sorted(params.items()))
+      sig = hmac.new(secret, qs.encode(), sha256).hexdigest()
+  ... pero luego enviaba la petición con `session.get(url, params=p)`,
+  dejando que aiohttp/yarl reconstruyera el query string POR SU CUENTA a
+  partir del dict `p`. aiohttp serializa por orden de inserción del dict
+  (no alfabético) y con sus propias reglas de encoding — NO garantizado
+  idéntico byte a byte a `urlencode(sorted(...))`. BingX exige que la
+  cadena firmada y la cadena realmente transmitida sean EXACTAMENTE la
+  misma; cualquier diferencia de orden o encoding rompe la firma aunque
+  el secret sea 100% correcto. Por eso .strip() y regenerar la clave no
+  arreglaba nada: el secret nunca fue el problema.
+
+  FIX: se construye la URL completa (incluyendo "&signature=...") UNA
+  sola vez, y esa URL exacta es la que se pasa a aiohttp — sin ningún
+  parámetro params= adicional que pueda volver a serializar nada.
+
+DE v7.5 (features que se conservan):
+  ✅ .strip() en API key y secret (config.py ya lo aplica también)
   ✅ _get_real_position_side() — Hedge/One-Way auto-detección
   ✅ _extract_executed_qty() — qty real de BingX (fix error 110424)
   ✅ _safe_qty_for_sl()
   ✅ Sleep 1.2s post-entrada
-
-DE v6.4 (robustez):
   ✅ Retry HTTP 3 intentos con backoff exponencial
-  ✅ cancel_order con DELETE (v7.2 usaba POST → no cancelaba nada)
-  ✅ cancel_all_orders con DELETE
-
-NUESTROS FIXES:
+  ✅ cancel_order / cancel_all_orders con DELETE (no POST)
   ✅ Sin closePosition=true (fix error 10940)
-  ✅ qty real siempre en place_stop_market_order
+
+FIX v6.4 reincorporado (visibilidad de errores):
+  ✅ get_balance() y get_open_positions() ahora revisan data["code"]
+     ANTES de extraer — un error de firma/permiso llega como HTTP 200
+     + {'code': 100001}, y antes se traducía en silencio a "balance=0"
+     o "0 posiciones" sin ningún log de error visible.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -44,7 +57,12 @@ class BingXClient:
         self._precision_map:  dict[str, int]   = {}
         self._min_qty_map:    dict[str, float] = {}
         self._step_map:       dict[str, float] = {}
-        log.info("BingXClient v7.5 — firma urlencode (producción verified)")
+        log.info("BingXClient v7.6 — firma byte-a-byte (fix double-serialización)")
+        # Diagnóstico seguro: longitud de claves, NUNCA el valor real.
+        log.info("[auth] API_KEY len=%d | SECRET_KEY len=%d",
+                  len(C.BINGX_API_KEY), len(C.BINGX_SECRET_KEY))
+        if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
+            log.error("[auth] BINGX_API_KEY o BINGX_SECRET_KEY vacíos — revisa Railway → Variables")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -57,39 +75,52 @@ class BingXClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    # ── Firma — EXACTAMENTE como v7.2 (urlencode, confirmado en producción) ──
+    # ── Firma + construcción de URL — TODO en un solo paso ───────────────────
 
-    def _sign(self, params: dict) -> str:
+    def _build_url(self, path: str, params: dict | None, signed: bool) -> tuple[str, dict]:
         """
-        urlencode(sorted(params.items())) es el único método que BingX acepta.
-        f-string concatenation (v7.4) produce error 100001 "Signature mismatch".
-        .strip() elimina espacios/newlines invisibles de Railway (fix 100001).
-        """
-        qs  = urlencode(sorted(params.items()))
-        key = C.BINGX_SECRET_KEY.strip()
-        return hmac.new(key.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        Construye la URL completa con el query string EXACTO que se firma.
 
-    def _api_key(self) -> str:
-        return C.BINGX_API_KEY.strip()
+        CRÍTICO: el string que se firma y el string que se transmite deben
+        ser BYTE-IDÉNTICOS. Por eso esta función no devuelve un dict para
+        que aiohttp lo vuelva a serializar — devuelve la URL ya completa
+        (con &signature= incluido si signed=True) para pasarla directo a
+        session.get/post/delete SIN el argumento params=.
+        """
+        p = dict(params or {})
+        headers = {}
+
+        if signed:
+            p["timestamp"]  = int(time.time() * 1000)
+            p["recvWindow"] = 10000
+            qs  = urlencode(sorted(p.items()))
+            sig = hmac.new(
+                C.BINGX_SECRET_KEY.encode("utf-8"),
+                qs.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            qs = f"{qs}&signature={sig}"
+            headers = {"X-BX-APIKEY": C.BINGX_API_KEY}
+        else:
+            qs = urlencode(sorted(p.items())) if p else ""
+
+        url = f"{C.BINGX_BASE_URL}{path}"
+        if qs:
+            url = f"{url}?{qs}"
+        return url, headers
 
     # ── HTTP con retry (3 intentos, backoff exponencial) ─────────────────────
+    # FIX v7.6: nunca se pasa params= aquí — la URL ya viene completa y
+    # firmada desde _build_url(), así que session.get/post/delete(url) la
+    # usa tal cual, sin ninguna re-serialización intermedia.
 
     async def _get(self, path: str, params: dict | None = None,
                    signed: bool = True) -> dict:
-        base = dict(params or {})
         for attempt in range(3):
             try:
                 s = await self._get_session()
-                p = dict(base)
-                if signed:
-                    p["timestamp"]  = int(time.time() * 1000)
-                    p["recvWindow"] = 10000
-                    p["signature"]  = self._sign(p)
-                    headers = {"X-BX-APIKEY": self._api_key()}
-                else:
-                    headers = {}
-                async with s.get(f"{C.BINGX_BASE_URL}{path}",
-                                  params=p, headers=headers) as r:
+                url, headers = self._build_url(path, params, signed)
+                async with s.get(url, headers=headers) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -102,13 +133,8 @@ class BingXClient:
         for attempt in range(3):
             try:
                 s = await self._get_session()
-                p = dict(params)
-                p["timestamp"]  = int(time.time() * 1000)
-                p["recvWindow"] = 10000
-                p["signature"]  = self._sign(p)
-                async with s.post(f"{C.BINGX_BASE_URL}{path}",
-                                   params=p,
-                                   headers={"X-BX-APIKEY": self._api_key()}) as r:
+                url, headers = self._build_url(path, params, signed=True)
+                async with s.post(url, headers=headers) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -122,13 +148,8 @@ class BingXClient:
         for attempt in range(3):
             try:
                 s = await self._get_session()
-                p = dict(params)
-                p["timestamp"]  = int(time.time() * 1000)
-                p["recvWindow"] = 10000
-                p["signature"]  = self._sign(p)
-                async with s.delete(f"{C.BINGX_BASE_URL}{path}",
-                                     params=p,
-                                     headers={"X-BX-APIKEY": self._api_key()}) as r:
+                url, headers = self._build_url(path, params, signed=True)
+                async with s.delete(url, headers=headers) as r:
                     return await r.json(content_type=None)
             except Exception as e:
                 if attempt == 2:
@@ -222,7 +243,7 @@ class BingXClient:
                 sym = sym[:-4] + "-USDT"
             if not sym.endswith("-USDT") or sym in C.BLACKLIST:
                 continue
-            if any(sym.replace("-USDT","").startswith(p) for p in _bad):
+            if any(sym.replace("-USDT", "").startswith(p) for p in _bad):
                 continue
 
             self._precision_map[sym] = int(item.get("volumePrecision",
@@ -322,8 +343,21 @@ class BingXClient:
     # ── Cuenta ────────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> float:
+        """
+        FIX v7.6 (reincorporado de v6.4): revisa data["code"] ANTES de
+        extraer. Un error de firma/permiso llega como HTTP 200 +
+        {'code': 100001}, y antes se traducía en silencio a balance=0.0
+        sin ningún log de error — ahora queda visible explícitamente.
+        """
         data = await self._get("/openApi/swap/v3/user/balance", {"currency": "USDT"})
-        raw  = data.get("data", {})
+
+        code = data.get("code", 0)
+        if code not in (0, None):
+            log.error("[auth] get_balance código=%s msg=%s — firma/permiso rechazado por BingX",
+                      code, data.get("msg", ""))
+            return 0.0
+
+        raw = data.get("data", {})
 
         def _extract(d: dict) -> float:
             avail  = float(d.get("availableMargin", 0) or 0)
@@ -349,8 +383,16 @@ class BingXClient:
         return 0.0
 
     async def get_open_positions(self) -> list:
+        """FIX v7.6: mismo chequeo de código que get_balance() — ver ahí."""
         data = await self._get("/openApi/swap/v2/user/positions")
-        pos  = data.get("data", [])
+
+        code = data.get("code", 0)
+        if code not in (0, None):
+            log.error("[auth] get_open_positions código=%s msg=%s — firma/permiso rechazado por BingX",
+                      code, data.get("msg", ""))
+            return []
+
+        pos = data.get("data", [])
         if not isinstance(pos, list):
             return []
         return [p for p in pos if float(p.get("positionAmt", 0) or 0) != 0]
