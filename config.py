@@ -1,9 +1,13 @@
 """
-QF×JP Bot v7.1 — Config TRAILING STOP + ANTI-LIQUIDACIÓN + INDICADORES v3.6
-Cambios vs v7.0:
-  - Añadidas constantes faltantes para indicators.py v3.6 (Pine Sync):
-      CVD_ROLL_WINDOW, EQL_LEN, EQL_TOL, OBP2_DIST, PRE_SCORE
-  - Sin estas constantes el bot crasheaba con AttributeError en cada análisis
+QF×JP Bot v7.6 — Config DEFINITIVO
+═══════════════════════════════════════════════════════════════════════════════
+TODOS LOS FIXES ACUMULADOS:
+  ✅ .strip() en API keys y Telegram (fix 100001 por whitespace invisible)
+  ✅ Indicadores v3.6: CVD_ROLL_WINDOW, EQL_LEN, EQL_TOL, OBP2_DIST, PRE_SCORE
+  ✅ Trailing Stop: BREAKEVEN_ATR_MULT, TRAIL_DISTANCE_ATR
+  ✅ Time Stop: MAX_HOLD_MINUTES, TIME_STOP_MIN_PROGRESS_ATR
+  ✅ Correlation Guard: CORRELATION_WINDOW_SEC, MAX_SAME_DIRECTION
+  ✅ DAILY_LOSS_PCT recomendado: mínimo 1.0% (0.7% bloquea tras 1 SL normal)
 """
 import os
 from dotenv import load_dotenv
@@ -11,20 +15,19 @@ load_dotenv()
 
 def _bool(k, d): return os.getenv(k, str(d)).strip().lower() in ("true","1","yes")
 def _float(k, d):
-    try: return float(os.getenv(k, str(d)))
+    try: return float(os.getenv(k, str(d)).strip().split()[0])
     except: return d
 def _int(k, d):
-    try: return int(os.getenv(k, str(d)))
+    try: return int(os.getenv(k, str(d)).strip().split()[0])
     except: return d
 def _list(k, d):
     r = os.getenv(k, d).strip()
     return [x.strip() for x in r.split(",") if x.strip()] if r else []
 
 # ── BingX ─────────────────────────────────────────────────────────────────────
-# FIX: .strip() — un espacio/salto de línea invisible al copiar-pegar la
-# clave en Railway rompe la firma HMAC en EL 100% de las llamadas (balance,
-# set_leverage, entrada...) con error 100001 "signature mismatch", porque
-# el secret usado para firmar ya no es exactamente el secret real de BingX.
+# FIX: .strip() elimina espacios/newlines invisibles que rompen la firma HMAC
+# causando error 100001 "Signature mismatch" en el 100% de las llamadas.
+# bingx_client.py v7.6 también aplica .strip() internamente como doble seguridad.
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "").strip()
 BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "").strip()
 BINGX_BASE_URL   = "https://open-api.bingx.com"
@@ -37,9 +40,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MODE = os.getenv("MODE", "SIGNAL").upper()
 
 # ── Capital y riesgo ──────────────────────────────────────────────────────────
-CAPITAL          = _float("CAPITAL", 700.0)
+CAPITAL          = _float("CAPITAL", 500.0)
 RISK_PCT         = _float("RISK_PCT", 0.5)
-LEVERAGE         = _int("LEVERAGE", 10)
+LEVERAGE         = _int("LEVERAGE", 5)         # 5x recomendado vs 10x (más margen antes de liquidación)
 MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)
 MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)
 
@@ -50,11 +53,12 @@ SUP_SCORE  = _float("SUP_SCORE",  80.0)
 MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
-# IMPORTANTE: estas 3 son las que más probablemente estén bloqueando TODAS
-# las señales. Se pueden cambiar en Railway → Variables sin redeploy:
-#   REQUIRE_TL_BREAK=false   → quita el requisito de ruptura exacta de trendline
-#   HTF_MIN_ALIGNED=1        → solo exige 1 de 3 timeframes alineado
-#   MIN_TIER=STD             → acepta score>=58 en vez de >=65
+# ESTAS 3 VARIABLES SON LAS QUE MÁS PROBABLEMENTE BLOQUEEN TODAS LAS SEÑALES
+# Si el diagnóstico de Telegram muestra solo no_tl_break o htf_not_aligned,
+# prueba en Railway sin redeploy:
+#   REQUIRE_TL_BREAK=false  → quita requisito de ruptura exacta de trendline
+#   HTF_MIN_ALIGNED=1       → solo 1 de 3 timeframes alineado (más permisivo)
+#   MIN_TIER=STD            → acepta score>=58 en vez de >=65
 REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
 HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)
 
@@ -87,7 +91,7 @@ KELLY_RR       = _float("KELLY_RR",       1.5)
 KELLY_FRACTION = _float("KELLY_FRACTION", 0.15)
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
-CB_ENABLED  = _bool("CB_ENABLED",   True)
+CB_ENABLED  = _bool("CB_ENABLED",   False)   # False = sin notificaciones spam de CB
 CB_ATR_MULT = _float("CB_ATR_MULT", 3.0)
 CB_BARS     = _int("CB_BARS",       10)
 
@@ -95,11 +99,30 @@ CB_BARS     = _int("CB_BARS",       10)
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
 
 # ── Trailing Stop Dinámico ────────────────────────────────────────────────────
+# BREAKEVEN_ATR_MULT: ATR de beneficio necesario para activar el trailing
+# TRAIL_DISTANCE_ATR: el SL sigue el peak del precio a esta distancia (en ATR)
 BREAKEVEN_ATR_MULT = _float("BREAKEVEN_ATR_MULT", 1.0)
 TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)
 
+# ── Time Stop ─────────────────────────────────────────────────────────────────
+# Cierra trades que llevan demasiado tiempo sin progresar (caso FHEU/XNY:
+# LONG abiertos 4h que bajaban lentamente sin tocar SL de 2.0 ATR)
+# Solo aplica si el trailing NO se ha activado todavía (si ya ganó, no cierra)
+MAX_HOLD_MINUTES           = _int("MAX_HOLD_MINUTES", 60)
+TIME_STOP_MIN_PROGRESS_ATR = _float("TIME_STOP_MIN_PROGRESS_ATR", 0.5)
+
+# ── Correlation Guard ─────────────────────────────────────────────────────────
+# Limita cuántos trades en la MISMA dirección (LONG o SHORT) se pueden abrir
+# dentro de la ventana de tiempo — evita apilar el mismo riesgo de mercado
+# (caso real: FHEU+XNY, dos LONG abiertos casi a la vez, cerrados al mismo tiempo)
+CORRELATION_WINDOW_SEC = _int("CORRELATION_WINDOW_SEC", 900)  # 15 min
+MAX_SAME_DIRECTION     = _int("MAX_SAME_DIRECTION", 2)        # máx 2 LONG o 2 SHORT a la vez
+
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
-DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)
+# ATENCIÓN: con CAPITAL=500, DAILY_LOSS_PCT=0.7% el límite es 3.5 USDT —
+# una sola pérdida normal de SL puede superarlo y bloquear el bot todo el día.
+# Recomendado: mínimo 1.5-2.0% para que no se bloquee con el primer SL.
+DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 1.5)
 
 # ── Notional máximo por trade ─────────────────────────────────────────────────
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
@@ -107,22 +130,11 @@ MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ── Indicadores v3.6 (Pine Sync) — NUEVO en v7.1 ─────────────────────────────
-# CRÍTICO: estas 5 constantes son requeridas por indicators.py v3.6.
-# Sin ellas el bot lanza AttributeError en cada llamada a analyze() y no
-# produce ninguna señal (analyze_error=126 en los logs de Railway).
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# CVD rolling window (barras). Pine v3.6 usa 60 (bajado de 100).
-CVD_ROLL_WINDOW = _int("CVD_ROLL_WINDOW", 60)
-
-# Equal Highs / Equal Lows detector [EQH/EQL]
-EQL_LEN = _int("EQL_LEN",     20)    # lookback en barras
-EQL_TOL = _float("EQL_TOL", 0.15)   # tolerancia en múltiplos de ATR
-
-# Order Block Premium approach distance [OBP2]
-OBP2_DIST = _float("OBP2_DIST", 1.5)  # distancia al OB en ATR
-
-# Pre-señal anticipatoria [PRE] — score mínimo antes de STD (58)
-PRE_SCORE = _float("PRE_SCORE", 45.0)
+# ── Indicadores v3.6 (Pine Sync) ─────────────────────────────────────────────
+# CRÍTICO: sin estas constantes indicators.py lanza AttributeError en cada
+# llamada a analyze() → analyze_error=N en logs → 0 señales siempre.
+CVD_ROLL_WINDOW = _int("CVD_ROLL_WINDOW", 60)   # ventana CVD en barras
+EQL_LEN         = _int("EQL_LEN", 20)           # lookback Equal Highs/Lows
+EQL_TOL         = _float("EQL_TOL", 0.15)       # tolerancia en múltiplos de ATR
+OBP2_DIST       = _float("OBP2_DIST", 1.5)      # distancia al Order Block en ATR
+PRE_SCORE       = _float("PRE_SCORE", 45.0)     # score mínimo pre-señal anticipatoria

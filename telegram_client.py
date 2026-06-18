@@ -98,14 +98,20 @@ async def notify_circuit_breaker(symbol: str) -> None:
 
 
 async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
-    """Status periódico del bot."""
+    """Status periódico del bot — incluye PnL no realizado (v7.1)."""
+    pnl_total = status.get("daily_pnl_total", status.get("daily_pnl", 0))
+    pnl_real  = status.get("daily_pnl", 0)
+    pnl_unrealized = status.get("daily_pnl_no_real", 0)
+    limit     = status.get("daily_limit", 0)
+    pnl_icon  = "💚" if pnl_total >= 0 else "💔"
     msg = (
         f"📊 *STATUS QF×JP Bot*\n"
         f"Modo: `{status.get('mode', '?')}`\n"
         f"Balance: `{balance:.2f} USDT`\n"
         f"Trades abiertos: `{status.get('open_trades', 0)}/{status.get('max_open', 0)}`\n"
         f"Trades hoy: `{status.get('daily_trades', 0)}/{status.get('max_daily', 0)}`\n"
-        f"PnL diario: `{status.get('daily_pnl', 0):+.4f} USDT`\n"
+        f"{pnl_icon} PnL cerrado: `{pnl_real:+.4f}` | No realizado: `{pnl_unrealized:+.4f}` | Total: `{pnl_total:+.4f} USDT`\n"
+        f"Límite diario: `{limit:.2f} USDT`\n"
         f"Símbolos escaneados: `{n_symbols}`"
     )
     await send(msg)

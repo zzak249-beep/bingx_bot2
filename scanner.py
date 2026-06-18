@@ -149,6 +149,14 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
         diag["counts"]["symbol_blocked"] += 1
         return None
 
+    # Correlation Guard — evita apilar varios LONG o SHORT simultáneos
+    # que se mueven juntos (caso FHEU+XNY)
+    dir_ok, dir_reason = risk.direction_allowed(sig.direction)
+    if not dir_ok:
+        log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
+        diag["counts"]["correlation_blocked"] += 1
+        return None
+
     try:
         balance = await client.get_balance()
     except Exception as e:
