@@ -265,7 +265,7 @@ class PositionManager:
             await self.risk.on_trade_closed(pnl=pnl, symbol=symbol)
             # Notificar al journal para win rate adaptativo
             if self._journal is not None:
-                self._journal.on_close(symbol, pnl)
+                await self._journal.on_close(symbol, pnl)
 
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
