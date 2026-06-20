@@ -1,6 +1,13 @@
 """
-QF×JP Bot v7.6 — Scanner COMPLETO
+QF×JP Bot v7.7 — Scanner COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+FIX v7.7:
+  ✅ Cada señal acumula filter_tags{} con los filtros de confirmación que
+     dispararon (stc_asym, stc_vol_slope, price_action) y se pasa a
+     journal.on_open(). Permite a trade_journal.py v7.8 medir, con datos
+     reales, si cada filtro nuevo aporta win rate o solo añade ruido —
+     ver _filter_breakdown() en trade_journal.py.
+
 FIX v7.6:
   ✅ Nuevo filtro opcional Price Action Framework (Large Bodies / Wicks
      Into Levels / Grindy Staircase / Choppy Range) — ver
@@ -333,6 +340,11 @@ async def _process_symbol(
             if slope_adj >= 10:
                 log.info("[%s] 📈 %s → score=%.1f", symbol, slope_reason, sig.score)
 
+    # ── FIX v7.7: acumula qué filtros de confirmación dispararon esta señal
+    # — se pasa al journal en on_open() para medir después si cada filtro
+    # nuevo aporta de verdad (ver trade_journal.py v7.8, _filter_breakdown).
+    filter_tags: dict = {}
+
     # ── 5b. STC + Asimetría de precio (1m) — confirmación de giro ───────────
     # FIX v7.5: filtro nuevo, desactivado por defecto. Ver stc_asymmetry.py
     # para el aviso completo sobre la fórmula de asimetría sin verificar
@@ -366,6 +378,7 @@ async def _process_symbol(
                 sig.score = min(sig.score + stc_boost, 100.0)
                 sig.tier  = score_to_tier(sig.score)
                 diag["counts"]["stc_asym_boost"] += 1
+                filter_tags["stc_asym"] = stc_reason
                 log.info("[%s] 🌀 %s", symbol, stc_reason)
 
     # ── 5c. STC + Volumen + Slope (1m) — confirmación alternativa ───────────
@@ -404,6 +417,7 @@ async def _process_symbol(
                 sig.score = min(sig.score + vs_boost, 100.0)
                 sig.tier  = score_to_tier(sig.score)
                 diag["counts"]["stc_vol_slope_boost"] += 1
+                filter_tags["stc_vol_slope"] = vs_reason
                 log.info("[%s] 🌀 %s", symbol, vs_reason)
 
     # ── 5d. Price Action Framework (Zero Complexity Trading) ────────────────
@@ -428,6 +442,7 @@ async def _process_symbol(
             sig.score = min(sig.score + pa_boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
             diag["counts"]["price_action_boost"] += 1
+            filter_tags["price_action"] = pa_reason
             log.info("[%s] 📐 %s", symbol, pa_reason)
 
     # ── 6. BTC Correlation Guard se evalúa DENTRO del bloque LIVE (más abajo)
@@ -604,6 +619,7 @@ async def _process_symbol(
                 symbol=symbol, direction=sig.direction, tier=sig.tier,
                 score=sig.score, fr=fr, obi=obi, oi_delta=oi_delta,
                 htf_score=sig.htf_score, adx=sig.adx,
+                filter_tags=filter_tags,
             )
 
         return sig
@@ -777,7 +793,7 @@ def get_current_symbols() -> list[str]:
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info("Scanner v7.6 | Modo=%s | Interval=%ds | Batch=20",
+    log.info("Scanner v7.7 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
