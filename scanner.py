@@ -118,6 +118,31 @@ def _atr(klines: list, period: int) -> list:
     return _rma(tr, period)
 
 
+def _swing_fib_zone(daily_klines: list, lookback: int = 20):
+    """
+    Tercer ingrediente — distinto de fibonacci_mtf.py (ese mide un solo día
+    con dirección inferida; esto mide un SWING de varios días, que es lo
+    relevante para un dip-buy: ¿el dip cae en la zona dorada de retroceso
+    desde el máximo reciente del swing? No necesita inferir dirección —
+    el contexto ya es claro (buscamos pullback dentro de un swing), se
+    mide siempre desde el swing high hacia el swing low.
+
+    Reutiliza las klines diarias que _detect_setup() ya fetchea para la
+    MA25 — sin llamada extra a la API.
+    """
+    window = daily_klines[-lookback:] if len(daily_klines) >= lookback else daily_klines
+    if not window:
+        return None
+    swing_high = max(c[2] for c in window)
+    swing_low  = min(c[3] for c in window)
+    rng = swing_high - swing_low
+    if rng <= 1e-12:
+        return None
+    zone_618 = swing_high - rng * 0.618
+    zone_786 = swing_high - rng * 0.786
+    return min(zone_618, zone_786), max(zone_618, zone_786)
+
+
 # ── Detección del setup combinado ───────────────────────────────────────────
 
 async def _detect_setup(client: BingXClient, symbol: str):
@@ -125,16 +150,31 @@ async def _detect_setup(client: BingXClient, symbol: str):
     Retorna el setup (dict) si TODAS las condiciones se cumplen, None si no.
     Requiere: dip de Kotegawa (MA25 diaria + RSI + BB) Y barrido de
     liquidez Bellsz en H1/H4/D Y vela de confirmación alcista.
+
+    FIX: toda lectura de C.KOTE_* usa getattr() con default — si falta
+    una variable en Railway, usa el valor por defecto en vez de crashear.
+    Mismo principio de seguridad que el resto de módulos de esta sesión.
     """
+    liq_lookback   = getattr(C, 'KOTE_LIQ_LOOKBACK', 50)
+    dip_uses_low   = getattr(C, 'KOTE_DIP_USES_LOW', True)
+    rsi_len        = getattr(C, 'KOTE_RSI_LEN', 14)
+    bb_len         = getattr(C, 'KOTE_BB_LEN', 20)
+    bb_mult        = getattr(C, 'KOTE_BB_MULT', 2.0)
+    dip_pct        = getattr(C, 'KOTE_DIP_PCT', 20.0)
+    use_rsi_filter = getattr(C, 'KOTE_USE_RSI_FILTER', True)
+    rsi_oversold   = getattr(C, 'KOTE_RSI_OVERSOLD', 24.0)
+    use_bb_filter  = getattr(C, 'KOTE_USE_BB_FILTER', True)
+    liq_margin_pct = getattr(C, 'KOTE_LIQ_MARGIN_PCT', 0.1)
+
     try:
         daily = await client.get_klines(symbol, "1d", 30)
         k1h   = await client.get_klines(symbol, "1h", 60)
-        k_h4  = await client.get_klines(symbol, "4h", C.KOTE_LIQ_LOOKBACK + 5)
+        k_h4  = await client.get_klines(symbol, "4h", liq_lookback + 5)
     except Exception as e:
         log.debug("[%s] fetch error: %s", symbol, e)
         return None
 
-    if len(daily) < 26 or len(k1h) < 22 or len(k_h4) < C.KOTE_LIQ_LOOKBACK + 2:
+    if len(daily) < 26 or len(k1h) < 22 or len(k_h4) < liq_lookback + 2:
         return None
 
     # ── Kotegawa: dip vs media de 25 días ────────────────────────────────────
@@ -142,36 +182,40 @@ async def _detect_setup(client: BingXClient, symbol: str):
     ma25 = sum(daily_closes[-25:]) / 25
 
     closes_1h = [c[4] for c in k1h]
-    rsi_series = _rsi(closes_1h, C.KOTE_RSI_LEN)
-    bb_basis_s = _sma(closes_1h, C.KOTE_BB_LEN)
-    bb_std_s   = _stdev(closes_1h, C.KOTE_BB_LEN)
+    rsi_series = _rsi(closes_1h, rsi_len)
+    bb_basis_s = _sma(closes_1h, bb_len)
+    bb_std_s   = _stdev(closes_1h, bb_len)
 
     last = k1h[-1]
     close, open_ = last[4], last[1]
     rsi      = rsi_series[-1]
     bb_basis = bb_basis_s[-1]
-    bb_lower = bb_basis - C.KOTE_BB_MULT * bb_std_s[-1]
+    bb_lower = bb_basis - bb_mult * bb_std_s[-1]
 
-    src_dip   = last[3] if C.KOTE_DIP_USES_LOW else close   # low o close
-    dip_level = ma25 * (1 - C.KOTE_DIP_PCT / 100)
+    src_dip   = last[3] if dip_uses_low else close   # low o close
+    dip_level = ma25 * (1 - dip_pct / 100)
 
     dip_ok = src_dip <= dip_level
-    rsi_ok = (not C.KOTE_USE_RSI_FILTER) or rsi <= C.KOTE_RSI_OVERSOLD
-    bb_ok  = (not C.KOTE_USE_BB_FILTER)  or src_dip <= bb_lower
+    rsi_ok = (not use_rsi_filter) or rsi <= rsi_oversold
+    bb_ok  = (not use_bb_filter)  or src_dip <= bb_lower
 
-    if not (dip_ok and rsi_ok and bb_ok):
-        return None
+    if not dip_ok:
+        return None, "dip_fail"        # precio no está suficientemente bajo vs MA25
+    if not rsi_ok:
+        return None, "rsi_fail"        # RSI no está sobrevendido
+    if not bb_ok:
+        return None, "bb_fail"         # no está bajo la banda de Bollinger
 
     # ── Bellsz: barrido de liquidez REQUERIDO (no opcional) ──────────────────
     def _ssl(klines: list, lookback: int):
         window = klines[-lookback - 1:-1]   # excluye la vela actual
         return min(c[3] for c in window) if window else None
 
-    ssl_h1 = _ssl(k1h,  C.KOTE_LIQ_LOOKBACK)
-    ssl_h4 = _ssl(k_h4, C.KOTE_LIQ_LOOKBACK)
-    ssl_d  = _ssl(daily, min(C.KOTE_LIQ_LOOKBACK, len(daily) - 1))
+    ssl_h1 = _ssl(k1h,  liq_lookback)
+    ssl_h4 = _ssl(k_h4, liq_lookback)
+    ssl_d  = _ssl(daily, min(liq_lookback, len(daily) - 1))
 
-    margin = close * C.KOTE_LIQ_MARGIN_PCT / 100
+    margin = close * liq_margin_pct / 100
 
     def _purga_alcista(ssl):
         if ssl is None or ssl <= 0:
@@ -185,11 +229,25 @@ async def _detect_setup(client: BingXClient, symbol: str):
             break
 
     if swept_level is None:
-        return None
+        return None, "sweep_fail"      # no hay barrido de liquidez en ningún TF
 
     bull = close > open_
     if not bull:
-        return None
+        return None, "bull_fail"       # vela actual no es alcista
+
+    # ── Tercer ingrediente: confluencia Fibonacci de swing ───────────────────
+    # Configurable: KOTE_REQUIRE_FIB=true lo convierte en requisito duro
+    # (descarta el setup si el dip no cae en la zona dorada del swing
+    # reciente); False (default) lo deja como dato informativo en el log/
+    # Telegram, sin bloquear — para que puedas observar cuánta diferencia
+    # hace antes de comprometerte a exigirlo.
+    fib_zone = _swing_fib_zone(daily, getattr(C, 'KOTE_FIB_LOOKBACK', 20))
+    fib_confluence = False
+    if fib_zone:
+        lo, hi = fib_zone
+        fib_confluence = lo <= close <= hi
+        if getattr(C, 'KOTE_REQUIRE_FIB', False) and not fib_confluence:
+            return None
 
     atr_1h = _atr(k1h, 14)[-1]
 
@@ -197,7 +255,8 @@ async def _detect_setup(client: BingXClient, symbol: str):
         "entry": close, "ma25": ma25, "bb_basis": bb_basis,
         "swept_level": swept_level, "atr": atr_1h,
         "dip_pct": (ma25 - close) / ma25 * 100, "rsi": rsi,
-    }
+        "fib_confluence": fib_confluence,
+    }, "ok"
 
 
 # ── Loop principal ───────────────────────────────────────────────────────────
@@ -211,9 +270,9 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
         diag["counts"]["already_trading"] += 1
         return
 
-    setup = await _detect_setup(client, symbol)
+    setup, reason = await _detect_setup(client, symbol)
     if setup is None:
-        diag["counts"]["no_setup"] += 1
+        diag["counts"][reason] += 1
         return
 
     diag["setups_found"] += 1
@@ -223,7 +282,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
     # SL: bajo el nivel barrido, con un pequeño colchón de ATR — estilo SMC
     # (stop bajo la mecha que generó el barrido), no un múltiplo fijo
     # genérico como en los scalpers.
-    sl = setup["swept_level"] - atr * C.KOTE_SL_ATR_BUFFER
+    sl = setup["swept_level"] - atr * getattr(C, 'KOTE_SL_ATR_BUFFER', 0.5)
 
     # TP: reversión a la media/banda — el más cercano de los dos es TP1,
     # el más lejano TP2. Ambos por encima de entry (LONG-only).
@@ -236,16 +295,18 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
 
     log.info(
         "[%s] 🎯 SETUP Kotegawa+Liquidez — entry=%.6f dip=%.1f%% rsi=%.1f "
-        "barrido=%.6f SL=%.6f TP1=%.6f TP2=%.6f",
+        "barrido=%.6f fib_zona_dorada=%s SL=%.6f TP1=%.6f TP2=%.6f",
         symbol, entry, setup["dip_pct"], setup["rsi"],
-        setup["swept_level"], sl, tp1, tp2,
+        setup["swept_level"], setup["fib_confluence"], sl, tp1, tp2,
     )
 
     if C.MODE == "SIGNAL":
+        fib_txt = "✅ en zona dorada" if setup["fib_confluence"] else "fuera de zona dorada"
         await tg.send(
             f"🎯 *SETUP* — `{symbol}` LONG (Kotegawa+Liquidez)\n"
             f"Entry: `{entry:.6f}` | Dip: `{setup['dip_pct']:.1f}%` bajo MA25\n"
             f"RSI: `{setup['rsi']:.1f}` | Barrido en: `{setup['swept_level']:.6f}`\n"
+            f"Fibonacci swing: {fib_txt}\n"
             f"SL: `{sl:.6f}` | TP1: `{tp1:.6f}` | TP2: `{tp2:.6f}`"
         )
         return
