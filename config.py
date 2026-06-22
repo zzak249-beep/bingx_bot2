@@ -8,6 +8,8 @@ TODOS LOS FIXES ACUMULADOS:
   ✅ Time Stop: MAX_HOLD_MINUTES, TIME_STOP_MIN_PROGRESS_ATR
   ✅ Correlation Guard: CORRELATION_WINDOW_SEC, MAX_SAME_DIRECTION
   ✅ DAILY_LOSS_PCT recomendado: mínimo 1.0% (0.7% bloquea tras 1 SL normal)
+  ✅ Kotegawa Scanner: bloque KOTE_* completo — sin esto Railway es ignorado
+  ✅ FIXED_NOTIONAL_USDT, RECONCILE_ON_STARTUP, MIN_MARGIN_USDT, EMA_EXIT_ENABLED
 """
 import os
 from dotenv import load_dotenv
@@ -127,6 +129,26 @@ DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 1.5)
 # ── Notional máximo por trade ─────────────────────────────────────────────────
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)
 
+# ── Notional fijo (alternativa a Kelly) ───────────────────────────────────────
+# 0.0 = desactivado, usa Kelly. Cualquier valor >0 fuerza ese notional por trade.
+# ⚠️ PELIGRO: en Railway está puesto a 999 — con 194 USDT de balance son 5x el capital.
+# Cambiar en Railway a 0 (para usar Kelly) o a 30-50 USDT máximo.
+FIXED_NOTIONAL_USDT = _float("FIXED_NOTIONAL_USDT", 0.0)
+
+# ── Piso mínimo de notional ───────────────────────────────────────────────────
+# FIX: con el bug de sizing corregido, posiciones calculadas por debajo de
+# este umbral se SALTAN en vez de abrirse — evita pagar fees por posiciones
+# simbólicas donde las comisiones dominarían cualquier edge real.
+MIN_NOTIONAL_USDT = _float("MIN_NOTIONAL_USDT", 3.0)
+
+# ── Margen mínimo requerido ───────────────────────────────────────────────────
+MIN_MARGIN_USDT = _float("MIN_MARGIN_USDT", 1.0)
+
+# ── Reconciliación al arranque ────────────────────────────────────────────────
+RECONCILE_ON_STARTUP = _bool("RECONCILE_ON_STARTUP", False)
+
+# ── EMA Exit ─────────────────────────────────────────────────────────────────
+EMA_EXIT_ENABLED = _bool("EMA_EXIT_ENABLED", False)
 
 # ── Session filter ────────────────────────────────────────────────────────────
 # Evita operar en horas de bajo volumen donde se concentran las pérdidas.
@@ -153,11 +175,6 @@ OI_FILTER_ENABLED = _bool("OI_FILTER_ENABLED", True)
 # Si la orden no se llena en LIMIT_TIMEOUT_SECS → cancela y usa market
 LIMIT_ORDERS_ENABLED = _bool("LIMIT_ORDERS_ENABLED", True)   # True = fee maker 0.02%
 LIMIT_TIMEOUT_SECS   = _int("LIMIT_TIMEOUT_SECS", 25)
-
-# ── Time Stop ─────────────────────────────────────────────────────────────────
-
-# ── Correlation Guard ─────────────────────────────────────────────────────────
-
 
 # ── Funding Regime Engine ─────────────────────────────────────────────────────
 # Detecta régimen de funding con anticipación pre-pago: el edge profesional.
@@ -226,12 +243,6 @@ WS_ENABLED = _bool("WS_ENABLED", False)
 EXPLOSION_ENABLED = _bool("EXPLOSION_ENABLED", True)
 
 
-# ── Piso mínimo de notional ───────────────────────────────────────────────────
-# FIX: con el bug de sizing corregido, posiciones calculadas por debajo de
-# este umbral se SALTAN en vez de abrirse — evita pagar fees por posiciones
-# simbólicas donde las comisiones dominarían cualquier edge real.
-MIN_NOTIONAL_USDT = _float("MIN_NOTIONAL_USDT", 3.0)
-
 # ── Puerto ────────────────────────────────────────────────────────────────────
 PORT = _int("PORT", 8080)
 
@@ -243,3 +254,23 @@ EQL_LEN         = _int("EQL_LEN", 20)           # lookback Equal Highs/Lows
 EQL_TOL         = _float("EQL_TOL", 0.15)       # tolerancia en múltiplos de ATR
 OBP2_DIST       = _float("OBP2_DIST", 1.5)      # distancia al Order Block en ATR
 PRE_SCORE       = _float("PRE_SCORE", 45.0)     # score mínimo pre-señal anticipatoria
+
+# ── Kotegawa Scanner ──────────────────────────────────────────────────────────
+# CRÍTICO: sin este bloque, getattr(C, 'KOTE_*', default) siempre devuelve
+# el default hardcodeado en kotegawa_scanner.py — Railway es completamente
+# ignorado aunque las variables estén correctamente guardadas.
+KOTE_DIP_PCT        = _float("KOTE_DIP_PCT", 20.0)    # % bajo MA25 para considerar dip
+KOTE_RSI_OVERSOLD   = _float("KOTE_RSI_OVERSOLD", 24.0)
+KOTE_USE_BB_FILTER  = _bool("KOTE_USE_BB_FILTER", True)
+KOTE_USE_RSI_FILTER = _bool("KOTE_USE_RSI_FILTER", True)
+KOTE_RSI_LEN        = _int("KOTE_RSI_LEN", 14)
+KOTE_BB_LEN         = _int("KOTE_BB_LEN", 20)
+KOTE_BB_MULT        = _float("KOTE_BB_MULT", 2.0)
+KOTE_DIP_USES_LOW   = _bool("KOTE_DIP_USES_LOW", True)
+KOTE_LIQ_LOOKBACK   = _int("KOTE_LIQ_LOOKBACK", 50)
+KOTE_LIQ_MARGIN_PCT = _float("KOTE_LIQ_MARGIN_PCT", 0.1)
+KOTE_SL_ATR_BUFFER  = _float("KOTE_SL_ATR_BUFFER", 0.5)
+KOTE_FIB_LOOKBACK   = _int("KOTE_FIB_LOOKBACK", 20)
+KOTE_REQUIRE_FIB    = _bool("KOTE_REQUIRE_FIB", False)
+KOTE_SCAN_INTERVAL  = _int("KOTE_SCAN_INTERVAL", 900)
+KOTE_SYMBOLS_LIST   = _list("KOTE_SYMBOLS_LIST", "")  # vacío = usa get_all_symbols()
