@@ -1,25 +1,31 @@
 """
-QF×JP Bot #4 — Kotegawa Dip + Liquidez Lateral v1.2
+QF×JP Bot #4 — Kotegawa Dip + Liquidez Lateral v1.3
 ═══════════════════════════════════════════════════════════════════════════════
-v1.2 — Divergencia alcista como confirmación opcional
-  Nuevo: _has_bullish_divergence() detecta si el RSI está haciendo mínimos
-  más altos mientras el precio hace mínimos más bajos — señal clásica de
-  que el momentum está girando antes que el precio. Se activa cuando el
-  indicador ya está en zona de sobreventa (<35) y el precio en dip profundo.
+v1.3 — Confluencia con rango de sesión NY open (Magic Hour adaptado)
+  Nuevo: _session_range() detecta el HIGH y LOW de la ventana 13:30-15:00 UTC
+  (09:30-10:30 ET = NY open, el "magic hour" de NomadaScalper) usando las
+  klines de 1H que ya se fetchean para el resto de filtros — sin llamada extra.
 
-  Configurable con KOTE_REQUIRE_DIVERGENCE:
-    False (default): la divergencia es informativa — aparece en el log
-                     y en Telegram pero no bloquea el setup
-    True:            requisito duro — sin divergencia no hay trade
+  Lógica adaptada de Magic Hour al contexto crypto:
+    - En equities, el 06:00-07:00 ET marca el "magic hour" real. En crypto,
+      el equivalente más cercano es el NY open (09:30-10:30 ET = 13:30-15:00 UTC)
+      porque los movimientos institucionales de BTC/ETH siguen concentrándose
+      en esa ventana.
+    - El FADE LONG del Magic Hour (nube verde + ruptura del LOW → fade hacia
+      el 50%) encaja perfectamente con la tesis Kotegawa: un dip bajo la MA25
+      que además rompe el low de sesión NY tiene más probabilidad estadística
+      de rebotar (dos fuentes de liquidez cazada coinciden).
+    - El barrido de Bellsz que coincide con el session low es la confirmación
+      más fuerte posible: el sweep NO es aleatorio, ocurre en un nivel que
+      miles de traders usan como referencia.
 
-  La divergencia se calcula sobre el RSI de 1H que ya se computa para el
-  filtro de sobreventa — sin llamadas extra a la API.
+  Configurable con:
+    KOTE_SESSION_START_UTC=13  (hora UTC inicio ventana, default 13)
+    KOTE_SESSION_END_UTC=15    (hora UTC fin ventana, default 15)
+    KOTE_REQUIRE_SESSION=false (requisito duro, default false = informativo)
 
-v1.1-DIAG (sin cambios):
-  ✅ KOTE_* leídos desde C (config.py) vía getattr con defaults seguros
-  ✅ Log de diagnóstico DIAG con dip_pct y rsi_ovs al arranque
-  ✅ Retorno de razón de fallo ("dip_fail", "sweep_fail", etc.) en iteraciones
-  ✅ Tercer ingrediente: zona Fibonacci de swing (KOTE_REQUIRE_FIB)
+v1.2 (sin cambios): divergencia alcista RSI vs precio.
+v1.1 (sin cambios): KOTE_* desde config, DIAG, Fibonacci de swing.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -176,6 +182,70 @@ def _has_bullish_divergence(klines_1h: list, rsi_series: list,
     return False, "no_div"
 
 
+# ── Rango de sesión NY open (v1.3) ────────────────────────────────────────────
+
+def _session_range(klines_1h: list,
+                   session_start_utc: int = 13,
+                   session_end_utc:   int = 15) -> dict:
+    """
+    Detecta el HIGH y LOW de la ventana NY open usando las klines de 1H
+    ya fetcheadas — sin llamada extra a la API.
+
+    Default: 13:00-15:00 UTC = 09:00-11:00 ET (NY open).
+
+    Posición del precio en el box (0%=low, 100%=high).
+    Zona 0-30% = cerca del session low = zona óptima LONG FADE.
+
+    Confluencia clave: si el swept_level coincide con session_low
+    dentro de 0.5%, el barrido no es aleatorio — ocurre en un nivel
+    institucional conocido, señal muy fuerte.
+    """
+    if not klines_1h:
+        return {"valid": False, "label": "no_data"}
+
+    now_s      = time.time()
+    day_ago_ms = (now_s - 86400) * 1000
+
+    session_bars = []
+    for k in klines_1h:
+        ts_ms = k[0]
+        if ts_ms < day_ago_ms:
+            continue
+        hour_utc = int((ts_ms / 1000) % 86400 // 3600)
+        if session_start_utc <= hour_utc < session_end_utc:
+            session_bars.append(k)
+
+    if not session_bars:
+        return {
+            "valid": False,
+            "label": f"sin_bars_sesion({session_start_utc}-{session_end_utc}UTC)"
+        }
+
+    s_high  = max(k[2] for k in session_bars)
+    s_low   = min(k[3] for k in session_bars)
+    s_range = s_high - s_low
+
+    if s_range <= 1e-12:
+        return {"valid": False, "label": "session_range_cero"}
+
+    curr    = klines_1h[-1][4]
+    pct_pos = (curr - s_low) / s_range * 100
+    near_low = pct_pos <= 30.0
+
+    return {
+        "valid":         True,
+        "session_high":  s_high,
+        "session_low":   s_low,
+        "session_range": s_range,
+        "pct_pos":       round(pct_pos, 1),
+        "near_low":      near_low,
+        "label": (
+            f"NY_session H={s_high:.6f} L={s_low:.6f} "
+            f"pos={pct_pos:.0f}% {'✅near_low' if near_low else ''}"
+        ),
+    }
+
+
 # ── Detección del setup combinado ───────────────────────────────────────────
 
 async def _detect_setup(client: BingXClient, symbol: str):
@@ -284,6 +354,25 @@ async def _detect_setup(client: BingXClient, symbol: str):
     if require_div and not div_detected:
         return None, "div_fail"
 
+    # ── v1.3: Confluencia con rango de sesión NY open ─────────────────────────
+    session_start = getattr(C, 'KOTE_SESSION_START_UTC', 13)
+    session_end   = getattr(C, 'KOTE_SESSION_END_UTC', 15)
+    require_sess  = getattr(C, 'KOTE_REQUIRE_SESSION', False)
+
+    sess = _session_range(k1h, session_start, session_end)
+
+    # Confluencia máxima: el barrido de Bellsz coincide con el session low
+    sweep_on_session_low = False
+    if sess["valid"] and swept_level:
+        margin_pct = abs(swept_level - sess["session_low"]) / max(sess["session_low"], 1e-9)
+        sweep_on_session_low = margin_pct < 0.005   # dentro del 0.5%
+
+    # near_low: precio en la zona baja del rango de sesión (0-30%)
+    session_confluence = sess.get("near_low", False) or sweep_on_session_low
+
+    if require_sess and not session_confluence:
+        return None, "session_fail"
+
     atr_1h = _atr(k1h, 14)[-1]
 
     return {
@@ -295,8 +384,11 @@ async def _detect_setup(client: BingXClient, symbol: str):
         "dip_pct":        (ma25 - close) / ma25 * 100,
         "rsi":            rsi,
         "fib_confluence": fib_confluence,
-        "div_detected":   div_detected,    # v1.2
-        "div_detail":     div_detail,      # v1.2
+        "div_detected":         div_detected,
+        "div_detail":           div_detail,
+        "session_confluence":   session_confluence,       # v1.3
+        "sweep_on_session_low": sweep_on_session_low,     # v1.3
+        "session_label":        sess.get("label", ""),    # v1.3
     }, "ok"
 
 
@@ -338,22 +430,37 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
     else:
         div_str = " (sin div)"
 
+    # ── v1.3: info de sesión NY en logs ──────────────────────────────────────
+    sess_str = ""
+    if setup["sweep_on_session_low"]:
+        sess_str = " 🏛️SWEEP@SESSION_LOW"
+    elif setup["session_confluence"]:
+        sess_str = " 🏛️near_session_low"
+
     log.info(
         "[%s] 🎯 SETUP Kotegawa+Liquidez — entry=%.6f dip=%.1f%% rsi=%.1f "
-        "barrido=%.6f fib_zona_dorada=%s%s SL=%.6f TP1=%.6f TP2=%.6f",
+        "barrido=%.6f fib=%s%s%s SL=%.6f TP1=%.6f TP2=%.6f",
         symbol, entry, setup["dip_pct"], setup["rsi"],
-        setup["swept_level"], setup["fib_confluence"], div_str, sl, tp1, tp2,
+        setup["swept_level"], setup["fib_confluence"], div_str, sess_str, sl, tp1, tp2,
     )
 
     if C.MODE == "SIGNAL":
-        fib_txt = "✅ en zona dorada" if setup["fib_confluence"] else "fuera de zona dorada"
-        div_txt = f"✅ {setup['div_detail']}" if setup["div_detected"] else "❌ sin divergencia"
+        fib_txt  = "✅ zona dorada" if setup["fib_confluence"] else "❌ fuera"
+        div_txt  = f"✅ {setup['div_detail']}" if setup["div_detected"] else "❌ sin divergencia"
+        sess_txt = (
+            "🏛️ ✅ SWEEP EN SESSION LOW (máxima confluencia)"
+            if setup["sweep_on_session_low"] else
+            "🏛️ ✅ cerca del low de sesión"
+            if setup["session_confluence"] else
+            f"🏛️ ❌ {setup['session_label']}"
+        )
         await tg.send(
             f"🎯 *SETUP* — `{symbol}` LONG (Kotegawa+Liquidez)\n"
             f"Entry: `{entry:.6f}` | Dip: `{setup['dip_pct']:.1f}%` bajo MA25\n"
-            f"RSI: `{setup['rsi']:.1f}` | Barrido en: `{setup['swept_level']:.6f}`\n"
-            f"Fibonacci swing: {fib_txt}\n"
-            f"Divergencia alcista: {div_txt}\n"
+            f"RSI: `{setup['rsi']:.1f}` | Barrido: `{setup['swept_level']:.6f}`\n"
+            f"Fibonacci: {fib_txt}\n"
+            f"Divergencia: {div_txt}\n"
+            f"Sesión NY: {sess_txt}\n"
             f"SL: `{sl:.6f}` | TP1: `{tp1:.6f}` | TP2: `{tp2:.6f}`"
         )
         return
