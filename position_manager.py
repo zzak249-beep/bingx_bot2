@@ -609,6 +609,16 @@ class PositionManager:
                     await tg.notify_trade_closed(symbol, trade.direction, trade.entry,
                                                   mark, trade.qty, "sl_tp_auto(trail_detect)", pnl)
                     await self.remove_trade(symbol, pnl)
+                elif self.client.is_api_disabled_error(em_resp):
+                    # Error 109400: BingX deshabilita órdenes durante volatilidad extrema.
+                    # Es TEMPORAL (1-5 min). No es un bug — el bot reintentará en el
+                    # próximo ciclo vía trail_order_id="". No enviar alerta Telegram.
+                    log.warning(
+                        "[%s] Trail activation: BingX API DESHABILITADA (109400) — "
+                        "volatilidad extrema. Reintentará en próximo ciclo (FIX v7.3). "
+                        "Posición temporalmente sin SL pero en profit (mark=%.6f entry=%.6f).",
+                        symbol, mark, trade.entry,
+                    )
                 else:
                     # cancel_all ya corrió — esto es crítico, posición desnuda
                     log.error(
