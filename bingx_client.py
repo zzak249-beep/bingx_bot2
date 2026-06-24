@@ -55,7 +55,7 @@ NON_CRYPTO_PREFIXES = (
 
 class BingXClient:
     def __init__(self):
-        self._session:        aiohttp.ClientSession | None = None
+        self._session:        object = None
         self._precision_map:  dict[str, int]   = {}
         self._min_qty_map:    dict[str, float] = {}
         self._step_map:       dict[str, float] = {}
@@ -82,7 +82,7 @@ class BingXClient:
 
     # ── Firma + construcción de URL ───────────────────────────────────────────
 
-    def _build_url(self, path: str, params: dict | None, signed: bool) -> tuple[str, dict]:
+    def _build_url(self, path: str, params: dict, signed: bool) -> tuple[str, dict]:
         p = dict(params or {})
         headers = {}
         if signed:
@@ -105,7 +105,7 @@ class BingXClient:
 
     # ── HTTP con retry ────────────────────────────────────────────────────────
 
-    async def _get(self, path: str, params: dict | None = None,
+    async def _get(self, path: str, params: dict = None,
                    signed: bool = True) -> dict:
         for attempt in range(3):
             try:
@@ -236,6 +236,24 @@ class BingXClient:
         if not isinstance(resp, dict):
             return ""
         return str(resp.get("msg", resp.get("message", ""))).lower()
+
+    @staticmethod
+    def is_api_disabled_error(resp: dict) -> bool:
+        """
+        Detecta el error 109400: BingX deshabilita órdenes API temporalmente
+        durante volatilidad extrema para evitar liquidaciones en cascada.
+
+        Cuando ocurre, NO hay que reintentar inmediatamente — BingX tarda
+        entre 1 y 5 minutos en restaurar. El caller debe esperar y reintentar
+        en el próximo ciclo del monitor (ya implementado via trail_order_id="").
+
+        Ejemplo del mensaje:
+          'Reminder: Due to the large market fluctuations, in order to reduce
+          the risk of liquidation, API orders are temporarily disabled.'
+        """
+        if not isinstance(resp, dict):
+            return False
+        return resp.get("code") == 109400
 
     # ── positionSide auto-detección ───────────────────────────────────────────
 
@@ -492,7 +510,7 @@ class BingXClient:
         stop_price:  float,
         direction:   str = "LONG",
         order_type:  str = "STOP_MARKET",
-        limit_price: float | None = None,
+        limit_price: float = None,
     ) -> dict:
         qty     = self._round_qty(symbol, quantity)
         real_direction, real_ps = await self._get_real_direction_and_side(symbol, direction)
