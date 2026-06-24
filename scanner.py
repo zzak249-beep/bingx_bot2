@@ -270,7 +270,10 @@ async def _detect_setup(client: BingXClient, symbol: str):
     Retorna (setup_dict, "ok") si TODAS las condiciones se cumplen,
     o (None, reason_str) con la razón de fallo para diagnóstico.
 
-    v1.2: añade detección de divergencia alcista opcional.
+    v1.4: añade 3 filtros de calidad antes del resto de checks:
+      1. Volume quality — mínimo volumen diario en USDT
+      2. Prior uptrend  — el token subió antes del dip (no en downtrend previo)
+      3. BTC regime     — BTC por encima de su MA25 diaria (opcional)
     """
     liq_lookback   = getattr(C, 'KOTE_LIQ_LOOKBACK', 50)
     dip_uses_low   = getattr(C, 'KOTE_DIP_USES_LOW', True)
@@ -286,7 +289,7 @@ async def _detect_setup(client: BingXClient, symbol: str):
     div_lookback   = getattr(C, 'KOTE_DIV_LOOKBACK', 30)
 
     try:
-        daily = await client.get_klines(symbol, "1d", 30)
+        daily = await client.get_klines(symbol, "1d", 60)  # más días para quality checks
         k1h   = await client.get_klines(symbol, "1h", max(60, div_lookback + 10))
         k_h4  = await client.get_klines(symbol, "4h", liq_lookback + 5)
     except Exception as e:
@@ -296,8 +299,74 @@ async def _detect_setup(client: BingXClient, symbol: str):
     if len(daily) < 26 or len(k1h) < 22 or len(k_h4) < liq_lookback + 2:
         return None, "insufficient_data"
 
-    # ── Kotegawa: dip vs media de 25 días ────────────────────────────────────
-    daily_closes = [c[4] for c in daily]
+    daily_closes  = [c[4] for c in daily]
+    daily_volumes = [c[4] * c[5] for c in daily]   # precio × contratos = USDT aprox.
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FILTRO 1 — VOLUMEN MÍNIMO DIARIO
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tokens con volumen < umbral son ilíquidos: slippage alto, SL puede no
+    # ejecutarse al precio correcto, y el dip puede no tener fuerza compradora.
+    # HUS(-9.66), F(-1.24), STRK(-1.07), API3(-0.96), ULTIMA(-0.99) habrían
+    # sido filtrados aquí.
+    min_vol_usdt = getattr(C, 'KOTE_MIN_VOL_USDT', 1_000_000)
+    if min_vol_usdt > 0:
+        avg_vol_5d = sum(daily_volumes[-5:]) / min(5, len(daily_volumes))
+        if avg_vol_5d < min_vol_usdt:
+            log.debug("[%s] vol_fail: avg_vol_5d=%.0f < min=%.0f",
+                      symbol, avg_vol_5d, min_vol_usdt)
+            return None, "vol_fail"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FILTRO 2 — UPTREND PREVIO AL DIP (anti-falling-knife de largo plazo)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Kotegawa funciona mejor cuando el token SUBIÓ antes de la corrección.
+    # Un token que lleva meses bajando ya NO es un "dip" — es un downtrend.
+    # Se compara el precio actual con el de hace 20-30 días.
+    # Si el precio actual está >X% por debajo de ese nivel → no hay uptrend
+    # que justifique el rebote.
+    # ZEC(-1.22), NEAR(-0.63), DEEP(-0.64), 0G(-0.17) habrían sido filtrados.
+    prior_trend_days   = getattr(C, 'KOTE_TREND_LOOKBACK_DAYS', 20)
+    min_prior_return   = getattr(C, 'KOTE_MIN_PRIOR_RETURN_PCT', -15.0)
+    require_uptrend    = getattr(C, 'KOTE_REQUIRE_UPTREND', True)
+
+    if require_uptrend and len(daily_closes) >= prior_trend_days + 2:
+        price_now        = daily_closes[-1]
+        price_prior      = daily_closes[-(prior_trend_days + 1)]
+        prior_return_pct = (price_now - price_prior) / price_prior * 100
+        if prior_return_pct < min_prior_return:
+            log.debug("[%s] trend_fail: return_%dd=%.1f%% < min=%.1f%%",
+                      symbol, prior_trend_days, prior_return_pct, min_prior_return)
+            return None, "trend_fail"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FILTRO 3 — RÉGIMEN BTC (Qullamaggie market filter adaptado)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Si BTC está por debajo de su propia MA25 diaria, el mercado está en
+    # downtrend macro. Comprar altcoin dips en ese entorno es nadar contra la
+    # corriente institucional. En modo WARNING (no bloqueo), solo se logea.
+    # En modo BLOCK (KOTE_REQUIRE_BTC_REGIME=true), descarta el setup.
+    btc_regime_enabled = getattr(C, 'KOTE_BTC_REGIME_ENABLED', True)
+    btc_above_ma25     = True
+    btc_return_pct     = 0.0
+    if btc_regime_enabled and symbol != "BTC-USDT":
+        try:
+            btc_daily    = await client.get_klines("BTC-USDT", "1d", 30)
+            btc_closes   = [c[4] for c in btc_daily]
+            if len(btc_closes) >= 25:
+                btc_ma25       = sum(btc_closes[-25:]) / 25
+                btc_above_ma25 = btc_closes[-1] > btc_ma25
+                btc_return_pct = (btc_closes[-1] - btc_ma25) / btc_ma25 * 100
+        except Exception:
+            pass   # si no disponible, no bloquear
+
+        if not btc_above_ma25:
+            require_btc = getattr(C, 'KOTE_REQUIRE_BTC_REGIME', False)
+            if require_btc:
+                log.debug("[%s] btc_regime_fail: BTC %.1f%% bajo MA25", symbol, btc_return_pct)
+                return None, "btc_regime_fail"
+            # Si no es requisito, loguear como advertencia (sigue el análisis)
+            log.debug("[%s] ⚠️ BTC bajo MA25 (%.1f%%) — dip en mercado bajista", symbol, btc_return_pct)
     ma25 = sum(daily_closes[-25:]) / 25
 
     closes_1h = [c[4] for c in k1h]
@@ -456,9 +525,11 @@ async def _detect_setup(client: BingXClient, symbol: str):
         "session_confluence":   session_confluence,
         "sweep_on_session_low": sweep_on_session_low,
         "session_label":        sess.get("label", ""),
-        "nexus_score_1h":       round(nexus_score_1h, 1),   # v1.4
-        "nexus_score_4h":       round(nexus_score_4h, 1),   # v1.4
-        "nexus_label":          nexus_label,                 # v1.4
+        "nexus_score_1h":       round(nexus_score_1h, 1),
+        "nexus_score_4h":       round(nexus_score_4h, 1),
+        "nexus_label":          nexus_label,
+        "btc_above_ma25":       btc_above_ma25,           # v1.4 regime
+        "btc_return_pct":       round(btc_return_pct, 1), # v1.4 regime
     }, "ok"
 
 
