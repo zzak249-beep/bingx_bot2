@@ -1,32 +1,38 @@
 """
-QF×JP Bot #4 — Kotegawa Dip + Liquidez Lateral v1.3
+QF×JP Bot #4 — Kotegawa Dip + Liquidez Lateral v1.4
 ═══════════════════════════════════════════════════════════════════════════════
-v1.3 — Confluencia con rango de sesión NY open (Magic Hour adaptado)
-  Nuevo: _session_range() detecta el HIGH y LOW de la ventana 13:30-15:00 UTC
-  (09:30-10:30 ET = NY open, el "magic hour" de NomadaScalper) usando las
-  klines de 1H que ya se fetchean para el resto de filtros — sin llamada extra.
+v1.4 — Momentum Nexus como filtro anti-falling-knife
+  Nuevo: integra momentum_nexus.py (adaptación del 'Momentum Nexus Heatmap
+  [UAlgo]') como confirmación de calidad del dip. Usa las klines de 1H y 4H
+  ya fetcheadas — sin llamada extra a la API.
 
-  Lógica adaptada de Magic Hour al contexto crypto:
-    - En equities, el 06:00-07:00 ET marca el "magic hour" real. En crypto,
-      el equivalente más cercano es el NY open (09:30-10:30 ET = 13:30-15:00 UTC)
-      porque los movimientos institucionales de BTC/ETH siguen concentrándose
-      en esa ventana.
-    - El FADE LONG del Magic Hour (nube verde + ruptura del LOW → fade hacia
-      el 50%) encaja perfectamente con la tesis Kotegawa: un dip bajo la MA25
-      que además rompe el low de sesión NY tiene más probabilidad estadística
-      de rebotar (dos fuentes de liquidez cazada coinciden).
-    - El barrido de Bellsz que coincide con el session low es la confirmación
-      más fuerte posible: el sweep NO es aleatorio, ocurre en un nivel que
-      miles de traders usan como referencia.
+  Score 0-100 combinando RSI + MFI + VZO (Volume Zone Oscillator) + CCI.
+  El VZO es la pieza nueva respecto a lo que ya tenía el bot: mide si el
+  VOLUMEN también es bajista, no solo el precio. Un RSI < 35 con VZO positivo
+  = el dinero está fluyendo al alza aunque el precio haya caído = trampa.
 
-  Configurable con:
-    KOTE_SESSION_START_UTC=13  (hora UTC inicio ventana, default 13)
-    KOTE_SESSION_END_UTC=15    (hora UTC fin ventana, default 15)
-    KOTE_REQUIRE_SESSION=false (requisito duro, default false = informativo)
+  Umbrales:
+    nexus_score(1H) < KOTE_NEXUS_OVERSOLD (26): dip confirmado por 4 indicadores
+    nexus_score(4H) < KOTE_NEXUS_OVERSOLD:      el downtrend es real en 4H también
+    nexus_score(4H) > KOTE_NEXUS_OVERBOUGHT(74): 4H en uptrend = dip superficial,
+                                                 no es el tipo de dip de Kotegawa
 
-v1.2 (sin cambios): divergencia alcista RSI vs precio.
+  Caso real prevenido: ANIME, FLOCK, 0G — todos abiertos con precio lejos de
+  MA25 pero con el 4H score > 50 (mercado no realmente oversold en 4H). El
+  filtro los habría marcado como "dip superficial" y reducido la posición o
+  bloqueado según KOTE_REQUIRE_NEXUS.
+
+  Configurable:
+    KOTE_NEXUS_ENABLED=true       (default false — activar gradualmente)
+    KOTE_REQUIRE_NEXUS=false      (true = filtro duro, false = solo informativo)
+    KOTE_NEXUS_OVERSOLD=26        (umbral oversold para 1H y 4H)
+    KOTE_NEXUS_OVERBOUGHT=74      (umbral para detectar dip superficial)
+
+v1.3 (sin cambios): Confluencia con rango de sesión NY open.
+v1.2 (sin cambios): Divergencia alcista RSI vs precio.
 v1.1 (sin cambios): KOTE_* desde config, DIAG, Fibonacci de swing.
 ═══════════════════════════════════════════════════════════════════════════════
+
 """
 import asyncio
 import logging
@@ -38,6 +44,17 @@ from bingx_client import BingXClient
 from risk_manager import RiskManager
 from position_manager import PositionManager, OpenTrade
 import telegram_client as tg
+
+# v1.4: Momentum Nexus — import opcional para no crashear si el archivo no está
+try:
+    from momentum_nexus import combined_score as _nexus_score, momentum_nexus_filter
+    _NEXUS_AVAILABLE = True
+except ImportError:
+    _NEXUS_AVAILABLE = False
+    logging.getLogger("kotegawa_scanner").warning(
+        "momentum_nexus.py no encontrado — KOTE_NEXUS_ENABLED ignorado. "
+        "Sube el archivo para activar el filtro anti-falling-knife."
+    )
 
 log = logging.getLogger("kotegawa_scanner")
 
@@ -373,6 +390,56 @@ async def _detect_setup(client: BingXClient, symbol: str):
     if require_sess and not session_confluence:
         return None, "session_fail"
 
+    # ── v1.4: Momentum Nexus — confirmación anti-falling-knife ───────────────
+    # Usa klines de 1H y 4H ya fetcheadas — sin API extra.
+    nexus_score_1h  = 50.0
+    nexus_score_4h  = 50.0
+    nexus_ok        = True
+    nexus_label     = ""
+
+    if getattr(C, 'KOTE_NEXUS_ENABLED', False) and _NEXUS_AVAILABLE:
+        n_oversold  = getattr(C, 'KOTE_NEXUS_OVERSOLD', 26.0)
+        n_overbought = getattr(C, 'KOTE_NEXUS_OVERBOUGHT', 74.0)
+        require_nx  = getattr(C, 'KOTE_REQUIRE_NEXUS', False)
+
+        nexus_score_1h = _nexus_score(k1h)
+        nexus_score_4h = _nexus_score(k_h4)
+
+        # Clasificación del dip
+        dip_1h_confirmed = nexus_score_1h < n_oversold
+        htf_4h_bullish   = nexus_score_4h > n_overbought  # dip superficial = 4H no está oversold
+        htf_4h_confirmed = nexus_score_4h < n_oversold
+
+        if htf_4h_bullish:
+            # 4H aún alcista = el dip es superficial, Kotegawa pide que sea de días
+            nexus_ok    = not require_nx
+            nexus_label = (
+                f"⚠️ nexus_4H={nexus_score_4h:.0f} (OB) — dip superficial "
+                f"{'BLOQUEADO' if not nexus_ok else 'advertencia'}"
+            )
+            if require_nx:
+                return None, "nexus_4h_overbought"
+        elif dip_1h_confirmed and htf_4h_confirmed:
+            nexus_ok    = True
+            nexus_label = (
+                f"✅ nexus_1H={nexus_score_1h:.0f} 4H={nexus_score_4h:.0f} "
+                f"— oversold confirmado en ambos TF (máxima confluencia)"
+            )
+        elif dip_1h_confirmed:
+            nexus_ok    = True
+            nexus_label = (
+                f"🟡 nexus_1H={nexus_score_1h:.0f} 4H={nexus_score_4h:.0f} "
+                f"— oversold en 1H, 4H neutral"
+            )
+        else:
+            nexus_ok    = not require_nx
+            nexus_label = (
+                f"⚠️ nexus_1H={nexus_score_1h:.0f} 4H={nexus_score_4h:.0f} "
+                f"— 1H no confirmado {'BLOQUEADO' if not nexus_ok else ''}"
+            )
+            if require_nx:
+                return None, "nexus_1h_not_oversold"
+
     atr_1h = _atr(k1h, 14)[-1]
 
     return {
@@ -386,9 +453,12 @@ async def _detect_setup(client: BingXClient, symbol: str):
         "fib_confluence": fib_confluence,
         "div_detected":         div_detected,
         "div_detail":           div_detail,
-        "session_confluence":   session_confluence,       # v1.3
-        "sweep_on_session_low": sweep_on_session_low,     # v1.3
-        "session_label":        sess.get("label", ""),    # v1.3
+        "session_confluence":   session_confluence,
+        "sweep_on_session_low": sweep_on_session_low,
+        "session_label":        sess.get("label", ""),
+        "nexus_score_1h":       round(nexus_score_1h, 1),   # v1.4
+        "nexus_score_4h":       round(nexus_score_4h, 1),   # v1.4
+        "nexus_label":          nexus_label,                 # v1.4
     }, "ok"
 
 
@@ -438,29 +508,34 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
         sess_str = " 🏛️near_session_low"
 
     log.info(
-        "[%s] 🎯 SETUP Kotegawa+Liquidez — entry=%.6f dip=%.1f%% rsi=%.1f "
-        "barrido=%.6f fib=%s%s%s SL=%.6f TP1=%.6f TP2=%.6f",
+        "[%s] 🎯 SETUP Kotegawa+Liquidez v1.4 — entry=%.6f dip=%.1f%% rsi=%.1f "
+        "barrido=%.6f fib=%s%s%s nexus=1H:%.0f/4H:%.0f SL=%.6f TP1=%.6f TP2=%.6f",
         symbol, entry, setup["dip_pct"], setup["rsi"],
-        setup["swept_level"], setup["fib_confluence"], div_str, sess_str, sl, tp1, tp2,
+        setup["swept_level"], setup["fib_confluence"],
+        div_str, sess_str,
+        setup["nexus_score_1h"], setup["nexus_score_4h"],
+        sl, tp1, tp2,
     )
 
     if C.MODE == "SIGNAL":
         fib_txt  = "✅ zona dorada" if setup["fib_confluence"] else "❌ fuera"
         div_txt  = f"✅ {setup['div_detail']}" if setup["div_detected"] else "❌ sin divergencia"
         sess_txt = (
-            "🏛️ ✅ SWEEP EN SESSION LOW (máxima confluencia)"
+            "🏛️ ✅ SWEEP EN SESSION LOW"
             if setup["sweep_on_session_low"] else
             "🏛️ ✅ cerca del low de sesión"
             if setup["session_confluence"] else
             f"🏛️ ❌ {setup['session_label']}"
         )
+        nexus_txt = setup["nexus_label"] if setup["nexus_label"] else "—"
         await tg.send(
-            f"🎯 *SETUP* — `{symbol}` LONG (Kotegawa+Liquidez)\n"
+            f"🎯 *SETUP* — `{symbol}` LONG (Kotegawa+Liquidez v1.4)\n"
             f"Entry: `{entry:.6f}` | Dip: `{setup['dip_pct']:.1f}%` bajo MA25\n"
             f"RSI: `{setup['rsi']:.1f}` | Barrido: `{setup['swept_level']:.6f}`\n"
             f"Fibonacci: {fib_txt}\n"
             f"Divergencia: {div_txt}\n"
             f"Sesión NY: {sess_txt}\n"
+            f"Nexus: {nexus_txt}\n"
             f"SL: `{sl:.6f}` | TP1: `{tp1:.6f}` | TP2: `{tp2:.6f}`"
         )
         return
