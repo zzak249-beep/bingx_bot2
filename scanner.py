@@ -31,6 +31,22 @@ v1.4 — Momentum Nexus como filtro anti-falling-knife
 v1.3 (sin cambios): Confluencia con rango de sesión NY open.
 v1.2 (sin cambios): Divergencia alcista RSI vs precio.
 v1.1 (sin cambios): KOTE_* desde config, DIAG, Fibonacci de swing.
+
+FIX (esta revisión) — _process_symbol() tenía doble-release de reservas:
+  1. Cada camino de rechazo llamaba a risk.release_reservation() de forma
+     explícita Y ADEMÁS el bloque finally volvía a llamarlo (Python ejecuta
+     finally incluso tras un return dentro del try). _pending_reservations
+     estaba protegido por max(0,...), pero _daily_trades no — cada rechazo
+     lo restaba de más, haciendo que MAX_DAILY_TRADES protegiera menos de
+     lo diseñado con el tiempo.
+  2. direction_allowed("LONG") reservaba un timestamp de correlation guard,
+     pero release_direction_reservation() nunca se llamaba desde aquí —
+     cualquier rechazo posterior (balance, qty=0, orden rechazada por el
+     exchange) dejaba esa reserva colgada. Con MAX_SAME_DIRECTION=2 y bot
+     LONG-only, dos rechazos bastan para bloquear toda entrada nueva
+     durante CORRELATION_WINDOW_SEC sin ninguna posición real abierta.
+  Fix: un único punto de liberación en finally, con estado explícito
+  (trade_confirmed, direction_reserved) en vez de releases dispersos.
 ═══════════════════════════════════════════════════════════════════════════════
 
 """
@@ -618,32 +634,34 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
         diag["counts"]["risk_blocked"] += 1
         return
 
-    trade_confirmed = False
+    # FIX: releases centralizados en finally con estado explícito, en vez de
+    # llamadas dispersas + finally (causaba doble-release — ver docstring
+    # del módulo). direction_reserved rastrea si direction_allowed() llegó
+    # a reservar, para liberar también esa parte cuando el trade no cuaja.
+    trade_confirmed    = False
+    direction_reserved = False
     try:
         sym_ok, sym_reason = risk.symbol_allowed(symbol)
         if not sym_ok:
             diag["counts"]["symbol_blocked"] += 1
-            await risk.release_reservation()
             return
 
         dir_ok, dir_reason = risk.direction_allowed("LONG")
         if not dir_ok:
             diag["counts"]["correlation_blocked"] += 1
-            await risk.release_reservation()
             return
+        direction_reserved = True
 
         try:
             balance = await client.get_balance()
         except Exception as e:
             log.error("[%s] get_balance error: %s", symbol, e)
-            await risk.release_reservation()
             return
         if balance < 5.0:
             balance = C.CAPITAL
 
         qty = risk.kelly_position_size(balance, entry, sl, score=70.0, tier="STD", symbol=symbol)
         if qty <= 0:
-            await risk.release_reservation()
             return
 
         results = await client.open_trade(
@@ -653,7 +671,6 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
         entry_resp = results.get("entry", {})
         if entry_resp.get("code", -1) != 0:
             log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
-            await risk.release_reservation()
             return
 
         order_id = str(
@@ -688,6 +705,8 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag, journal=None):
     finally:
         if not trade_confirmed:
             await risk.release_reservation()
+            if direction_reserved:
+                await risk.release_direction_reservation("LONG")
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
