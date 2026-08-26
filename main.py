@@ -20,11 +20,13 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import os
 import time
 
 import httpx
 
 import config
+import journal
 import strategy
 from bingx import BingX, BingXError
 from notify import State, Telegram
@@ -65,6 +67,9 @@ class Bot:
         self.live = config.is_live()
         self.last_heartbeat = time.time()
         self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+        self.journal = journal.Journal(
+            os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "operaciones_impulse-bot.csv")
+        )
 
     async def start(self) -> None:
         log.info("Modo: %s", config.describe())
@@ -224,6 +229,7 @@ class Bot:
             "side": "BUY", "entry": sig.entry, "sl": sig.sl, "qty": qty,
             "opened_at": time.time(),
         }
+        self.journal.abrir(sig, qty, "LIVE")
         self.state.data["last_trade_ts"] = time.time()
         self.state.save()
         await self.tg.send(fmt_signal(sig, live=True))
