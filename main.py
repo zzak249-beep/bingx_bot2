@@ -42,6 +42,36 @@ if getattr(config, "LOG_LEVEL", "INFO") != "DEBUG":
 log = logging.getLogger("bot")
 
 
+
+_DEFAULTS = {
+    "TIMEFRAME": "30m", "ATR_LEN": 14, "MA_LEN": 20, "VOL_LEN": 20,
+    "COMPRESSION_LEN": 12, "MAX_COMPRESSION_ATR": 3.0,
+    "MIN_EXPANSION_ATR": 1.8, "MIN_CLOSE_POS": 0.66, "MIN_VOL_MULT": 2.0,
+    "MAX_STRETCH_AT_ENTRY": 3.5,
+    "SL_ATR": 0.5, "RR_TARGET": 4.0, "TRAIL_ATR": 2.0, "TRAIL_LOOKBACK": 3,
+    "COST_ROUNDTRIP_PCT": 0.25, "MIN_ATR_PCT": 1.0, "MIN_COST_COVER": 6.0,
+    "MAX_COST_IN_R": 0.20, "MAX_RISK_PCT": 4.0,
+    "MIN_QUOTE_VOLUME_24H": 2_000_000.0, "SCAN_INTERVAL_SEC": 120,
+    "MAX_SYMBOLS": 400, "SCAN_CONCURRENCY": 8, "SYMBOL_WHITELIST": [],
+    "EXCLUDE_PREFIXES": ["NC"], "RISK_PCT": 0.25, "MAX_CONCURRENT": 2,
+    "LEVERAGE": 2, "MAX_CONSECUTIVE_LOSSES": 4, "COOLDOWN_MINUTES": 180,
+    "ENTRY_TYPE": "MARKET", "LIMIT_OFFSET_PCT": 0.05,
+    "SIGNAL_COOLDOWN_MIN": 120, "DAILY_SUMMARY": True,
+    "DAILY_SUMMARY_HOUR_UTC": 7, "HEARTBEAT_HOURS": 12, "IDLE_ALERT_DAYS": 7,
+    "STATE_PATH": "/data/state_impulse.json", "LOG_LEVEL": "INFO",
+}
+
+
+def ensure_config() -> list[str]:
+    """Un config.py antiguo no puede tumbar un bot con dinero real."""
+    faltan = []
+    for nombre, valor in _DEFAULTS.items():
+        if not hasattr(config, nombre):
+            setattr(config, nombre, valor)
+            faltan.append(nombre)
+    return faltan
+
+
 def fmt_signal(sig: strategy.Signal, live: bool) -> str:
     cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
     nombre = sig.symbol.split("-")[0]
@@ -72,6 +102,9 @@ class Bot:
         )
 
     async def start(self) -> None:
+        faltan = ensure_config()
+        if faltan:
+            log.error("config.py desactualizado, faltaban: %s", ", ".join(faltan))
         log.info("Modo: %s", config.describe())
         await self.tg.send(
             f"🤖 <b>Bot de arranque de impulso iniciado</b>\n"
@@ -83,6 +116,7 @@ class Bot:
         await self.refresh_symbols()
         while True:
             try:
+                await self.reconcile()
                 await self.manage_open()
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
@@ -226,13 +260,51 @@ class Bot:
                 return
 
         self.state.data.setdefault("open", {})[sig.symbol] = {
-            "side": "BUY", "entry": sig.entry, "sl": sig.sl, "qty": qty,
+            "side": "BUY", "entry": sig.entry, "sl": sig.sl, "sl_inicial": sig.sl, "qty": qty,
             "opened_at": time.time(),
         }
         self.journal.abrir(sig, qty, "LIVE")
         self.state.data["last_trade_ts"] = time.time()
         self.state.save()
         await self.tg.send(fmt_signal(sig, live=True))
+
+    async def reconcile(self) -> None:
+        """
+        Detecta las posiciones cerradas EN EL EXCHANGE que el bot no vio.
+
+        Sin esto, cuando salta el stop la posición sigue "abierta" en el
+        estado para siempre: bloquea el hueco de MAX_CONCURRENT y el
+        circuit breaker no cuenta ni una pérdida.
+        """
+        if not self.live:
+            return
+        abiertas = self.state.data.get("open", {})
+        if not abiertas:
+            return
+        try:
+            posiciones = await self.api.open_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudieron leer las posiciones: %s", exc)
+            return
+        vivos = {
+            str(p.get("symbol", "")) for p in posiciones
+            if float(p.get("positionAmt", 0) or 0) != 0
+        }
+        for symbol, pos in list(abiertas.items()):
+            if symbol in vivos:
+                continue
+            velas = await self._velas(symbol)
+            ultimo = velas[-1]["close"] if velas else float(pos["entry"])
+            gano = ultimo > float(pos["entry"])
+            riesgo = abs(float(pos["entry"]) - float(pos.get("sl_inicial", pos["sl"])))
+            r_real = (ultimo - float(pos["entry"])) / riesgo if riesgo > 0 else 0.0
+            minutos = int((time.time() - float(pos.get("opened_at", time.time()))) / 60)
+            self.journal.cerrar(symbol, "sl/tp", ultimo, r_real, minutos)
+            await self.tg.send(
+                f"{'✅' if gano else '🛑'} <b>{symbol.split('-')[0]}</b> cerrada en el exchange\n"
+                f"Entrada {pos['entry']:.8g} → {ultimo:.8g}  ({r_real:+.2f} R)"
+            )
+            self.register_close(symbol, gano)
 
     async def manage_open(self) -> None:
         """
@@ -265,6 +337,10 @@ class Bot:
                     f"{'✅' if gano else '🛑'} <b>{symbol.split('-')[0]}</b> cerrada por trailing\n"
                     f"Entrada {pos['entry']:.8g} → {precio_actual:.8g}"
                 )
+                riesgo = abs(float(pos["entry"]) - float(pos.get("sl_inicial", pos["sl"])))
+                r_real = (precio_actual - float(pos["entry"])) / riesgo if riesgo > 0 else 0.0
+                minutos = int((time.time() - float(pos.get("opened_at", time.time()))) / 60)
+                self.journal.cerrar(symbol, "trailing", precio_actual, r_real, minutos)
                 self.register_close(symbol, gano)
                 continue
 
