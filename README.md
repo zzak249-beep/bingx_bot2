@@ -42,6 +42,28 @@ no hay NADA medido todavía, ni siquiera 35 operaciones.
 
 ---
 
+## Bug corregido (visto en producción el 28/08/2026)
+
+La primera versión desplegada cerraba posiciones al instante, al mismo
+precio de entrada (`REDSTONE-USDT` se abrió y cerró 3 veces en 11
+minutos, siempre 0.1044 → 0.1044, +0.00%). No era el mercado — la
+función de salida miraba "¿el SuperTrend está bajista AHORA?" en vez de
+"¿ACABA de girar a bajista?" (`ta.change(stDirection) > 0` en el Pine
+original). Si una señal de doble suelo RSI entraba en una vela donde el
+SuperTrend ya estaba bajista por otra razón, la siguiente comprobación
+lo veía "bajista" y cerraba en el acto.
+
+Dos arreglos, ambos en `entry_rsi.py`:
+- `flipped_bearish()` sustituye a la función anterior — detecta el
+  CAMBIO de dirección, no el estado, igual que el Pine original.
+- La entrada ahora exige que el SuperTrend NO esté ya bajista en la
+  vela de la señal — pequeña desviación deliberada del original, para
+  no quedar atascado esperando dos giros en vez de uno.
+- `REENTRY_COOLDOWN_MIN` (15 min por defecto): cerrojo adicional para
+  no perseguir el mismo símbolo dos veces seguidas en un mercado picado.
+
+---
+
 ## La estrategia, en corto
 
 1. RSI(10) y su propia media móvil SMA(10).

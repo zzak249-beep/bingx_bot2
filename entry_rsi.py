@@ -161,6 +161,17 @@ def evaluate(
 
     entry = closes[-1]
     st_stop = st[-1]
+
+    # Desviación pequeña y deliberada respecto al Pine original: si el
+    # SuperTrend YA está bajista en la vela de la señal, no se entra.
+    # Sin este filtro, una posición podría abrirse en contra del propio
+    # indicador que decide la salida — y quedarse atascada hasta que
+    # gire DOS veces (a alcista y luego otra vez a bajista) en vez de
+    # una, porque flipped_bearish() solo detecta el CAMBIO de
+    # dirección, no el estado. Mejor no entrar que entrar ya contradicho.
+    if _direction[-1] == 1:
+        return None
+
     riesgo_pct = abs(entry - st_stop) / entry * 100.0 if entry > 0 else 0.0
     atr_pct = atr[-1] / entry * 100.0 if entry > 0 else 0.0
 
@@ -170,18 +181,31 @@ def evaluate(
     )
 
 
-def is_bearish_now(candles: list[dict], st_period: int = 10, st_factor: float = 2.5) -> bool:
+def flipped_bearish(candles: list[dict], st_period: int = 10, st_factor: float = 2.5) -> bool:
     """
-    Para las posiciones ya abiertas: ¿el SuperTrend está ahora mismo en
-    dirección bajista? No hace falta detectar el instante exacto del
-    giro — con comprobarlo en cada ciclo basta, igual que el resto del
-    proyecto vigila SL/TP por sondeo en vez de por evento.
+    ¿El SuperTrend acaba de CAMBIAR a bajista en la última vela cerrada?
+    Traducción exacta de `ta.change(stDirection) > 0` del Pine
+    original — que solo dispara en el instante del giro, no mientras
+    la tendencia SIGUE bajista.
+
+    BUG QUE ESTO CORRIGE: la versión anterior (is_bearish_now) miraba
+    si el SuperTrend estaba bajista AHORA, no si acababa de girar. Si
+    una señal de doble suelo RSI entraba en una vela donde el
+    SuperTrend YA estaba bajista (son dos condiciones independientes,
+    nada lo impide), la siguiente comprobación —60s después, la misma
+    vela de 15m todavía— veía "está bajista" y cerraba al instante, al
+    mismo precio de entrada. Eso es justo lo que se vio en producción:
+    REDSTONE-USDT abriéndose y cerrándose 3 veces en 11 minutos,
+    siempre a 0.1044 → 0.1044, +0.00%. No era el mercado: era este bug.
     """
     c = candles[:-1]
-    if len(c) < st_period + 5:
+    if len(c) < st_period + 6:
         return False
     highs = [x["high"] for x in c]
     lows = [x["low"] for x in c]
     closes = [x["close"] for x in c]
     _st, direction, _atr = supertrend(highs, lows, closes, st_period, st_factor)
-    return direction[-1] == 1
+    # Cambio real: la vela anterior era alcista (-1) y la última ya es
+    # bajista (1) — igual que ta.change() de Pine, que compara el
+    # valor actual contra el de la vela previa.
+    return direction[-1] == 1 and direction[-2] == -1

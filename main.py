@@ -111,6 +111,9 @@ class Bot:
                 break
             if sym in self.state.data.get("open", {}):
                 continue
+            ultimo_cierre = self.state.data.get("last_close", {}).get(sym, 0)
+            if time.time() - ultimo_cierre < config.REENTRY_COOLDOWN_MIN * 60:
+                continue
             try:
                 velas = await self.api.klines(sym, config.TIMEFRAME, limit=200)
             except Exception as exc:  # noqa: BLE001
@@ -203,7 +206,7 @@ class Bot:
             except Exception as exc:  # noqa: BLE001
                 log.debug("%s: no se pudo comprobar salida (%s)", symbol, exc)
                 continue
-            if not entry_rsi.is_bearish_now(velas, config.ST_ATR_PERIOD, config.ST_FACTOR):
+            if not entry_rsi.flipped_bearish(velas, config.ST_ATR_PERIOD, config.ST_FACTOR):
                 continue
 
             exit_price = velas[-2]["close"] if len(velas) >= 2 else velas[-1]["close"]
@@ -233,6 +236,7 @@ class Bot:
             d["losses"] = d.get("losses", 0) + 1
             d["consecutive_losses"] = d.get("consecutive_losses", 0) + 1
         d.get("open", {}).pop(symbol, None)
+        d.setdefault("last_close", {})[symbol] = time.time()
         historial = d.setdefault("trades", [])
         historial.append({"symbol": symbol, "pct": round(pct, 3), "closed_at": time.time()})
         if len(historial) > 1000:

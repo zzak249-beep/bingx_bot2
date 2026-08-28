@@ -62,6 +62,13 @@ LEVERAGE = _int("LEVERAGE", 3)
 # Ponlo a mano si quieres acotar el riesgo agregado en LIVE.
 MAX_CONCURRENT = _int("MAX_CONCURRENT", 0)  # 0 = sin límite
 
+# Minutos mínimos antes de poder volver a abrir el MISMO símbolo tras
+# cerrarlo. Defensa adicional, independiente del arreglo del bug de
+# cierre prematuro: aunque ya no cierre al instante por error, un
+# mercado muy picado podría generar dos dobles-suelo RSI legítimos
+# muy seguidos en el mismo símbolo, y no siempre conviene perseguirlos.
+REENTRY_COOLDOWN_MIN = _int("REENTRY_COOLDOWN_MIN", 15)
+
 # ── Stop de emergencia REAL (solo LIVE) ─────────────────────────────────
 # El script original no manda ningún stop al exchange: cierra por
 # lógica cuando gira el SuperTrend, sondeado por el propio bot. Eso es
