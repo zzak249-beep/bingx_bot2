@@ -56,6 +56,8 @@ class Bot:
         self.live = config.is_live()
         self.last_daily = 0.0
         self.last_heartbeat = time.time()
+        self.volumes: dict[str, float] = {}
+        self.last_volume_refresh = 0.0
 
     async def refresh_symbols(self) -> None:
         try:
@@ -72,26 +74,103 @@ class Bot:
             self.symbols = self.symbols[: config.MAX_SYMBOLS]
         log.info("Universo: %d símbolos", len(self.symbols))
 
+    async def reconcile_startup(self) -> None:
+        """
+        Se llama UNA vez, antes de entrar en el bucle. Si Railway
+        reinicia el bot (redeploy, caída) mientras hay posiciones LIVE
+        abiertas, el estado guardado en disco podría no coincidir con
+        lo que de verdad hay en el exchange — sin esto, nadie se entera
+        y el bot puede seguir gestionando (o creer que gestiona) una
+        posición que ya no existe, o ignorar una que sí existe.
+        """
+        if not self.live:
+            return
+        try:
+            posiciones = await self.api.open_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo reconciliar contra el exchange al arrancar: %s", exc)
+            return
+
+        vivas = {str(p.get("symbol", "")) for p in posiciones if float(p.get("positionAmt", 0) or 0) != 0}
+        guardadas = {s for s, p in self.state.data.get("open", {}).items() if p.get("mode") == "LIVE"}
+
+        perdidas = guardadas - vivas  # el bot la creía abierta; el exchange dice que no
+        huerfanas = vivas - guardadas  # el exchange tiene una posición que el bot no conoce
+
+        if perdidas:
+            for sym in perdidas:
+                log.warning(
+                    "%s: el bot la creía abierta pero no está en el exchange — se retira sin "
+                    "registrar resultado (no hay forma fiable de saber a qué precio cerró de "
+                    "verdad mientras el bot estaba caído)",
+                    sym,
+                )
+                self.state.data["open"].pop(sym, None)
+            self.state.save()
+            await self.tg.send(
+                f"⚠️ <b>Reconciliación al arrancar</b>\n"
+                f"{len(perdidas)} posición(es) que el bot creía abiertas ya no están en BingX: "
+                f"{', '.join(sorted(perdidas))}. Se retiraron del estado SIN registrar ganancia "
+                f"ni pérdida — no hay dato fiable del precio real de cierre."
+            )
+
+        if huerfanas:
+            await self.tg.send(
+                f"⚠️ <b>Reconciliación al arrancar</b>\n"
+                f"BingX tiene {len(huerfanas)} posición(es) que este bot no gestiona: "
+                f"{', '.join(sorted(huerfanas))}. Revísalas a mano — el bot no las va a tocar."
+            )
+
+    async def refresh_volumes(self) -> None:
+        """Volumen 24h por símbolo, refrescado cada 15 min — no hace
+        falta más fresco que eso para un filtro de liquidez mínima."""
+        if time.time() - self.last_volume_refresh < 15 * 60 and self.volumes:
+            return
+        try:
+            self.volumes = await self.api.tickers_24h()
+            self.last_volume_refresh = time.time()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo refrescar volúmenes 24h: %s", exc)
+
+    def en_cooldown(self) -> bool:
+        return time.time() < self.state.data.get("cooldown_until", 0)
+
+    def riesgo_total_abierto(self) -> float:
+        """Suma aproximada de lo arriesgado en todas las posiciones
+        abiertas ahora mismo — cada una a RISK_PCT (aprox, no reajusta
+        por cambios de equity entre una apertura y otra, pero basta
+        para el propósito de acotar la exposición agregada)."""
+        return len(self.state.data.get("open", {})) * config.RISK_PCT
+
     def stats_text(self) -> str:
         d = self.state.data
         cerradas = d.get("closed_trades", 0)
         wins = d.get("wins", 0)
         wr = (wins / cerradas * 100.0) if cerradas else 0.0
         abiertas = len(d.get("open", {}))
-        return (
+        texto = (
             f"Cerradas: {cerradas} · aciertos {wins} ({wr:.0f}%)\n"
             f"Abiertas: {abiertas} · racha: {d.get('consecutive_losses', 0)}"
         )
+        if self.en_cooldown():
+            minutos = int((d.get("cooldown_until", 0) - time.time()) / 60)
+            texto += f"\n⏸️ Circuit breaker activo · quedan ~{max(minutos, 0)} min"
+        return texto
 
     async def start(self) -> None:
         await self.refresh_symbols()
+        await self.reconcile_startup()
         await self.tg.send(
             "🤖 <b>Bot RSI doble suelo iniciado</b>\n"
             f"{config.describe()}\n"
             f"RSI({config.RSI_LENGTH}) cruzando SMA({config.RSI_SIGNAL_LENGTH}) bajo {config.RSI_TRIGGER:.0f}\n"
             f"Señal en el cruce nº{config.RSI_TARGET_CROSSES} · "
             f"salida SuperTrend({config.ST_ATR_PERIOD}, {config.ST_FACTOR})\n"
-            f"Timeframe {config.TIMEFRAME} · riesgo {config.RISK_PCT}%"
+            f"Timeframe {config.TIMEFRAME} · riesgo {config.RISK_PCT}% por operación "
+            f"(máx. agregado {config.MAX_TOTAL_RISK_PCT}%)\n"
+            f"Circuit breaker: {config.MAX_CONSECUTIVE_LOSSES} pérdidas seguidas · "
+            f"pausa {config.COOLDOWN_MINUTES} min\n"
+            f"Liquidez mínima: {config.MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT/24h"
         )
         while True:
             try:
@@ -105,14 +184,25 @@ class Bot:
 
     # ── entradas ─────────────────────────────────────────────────────
     async def scan_once(self) -> None:
+        if self.en_cooldown():
+            log.info("Circuit breaker activo — sin escanear hasta que pase el enfriamiento")
+            return
+
+        await self.refresh_volumes()
+
         abiertas_activas = len(self.state.data.get("open", {}))
         for sym in self.symbols:
             if config.MAX_CONCURRENT > 0 and abiertas_activas >= config.MAX_CONCURRENT:
+                break
+            if self.riesgo_total_abierto() + config.RISK_PCT > config.MAX_TOTAL_RISK_PCT:
+                log.info("Riesgo agregado al límite (%.2f%%) — sin abrir más por ahora", config.MAX_TOTAL_RISK_PCT)
                 break
             if sym in self.state.data.get("open", {}):
                 continue
             ultimo_cierre = self.state.data.get("last_close", {}).get(sym, 0)
             if time.time() - ultimo_cierre < config.REENTRY_COOLDOWN_MIN * 60:
+                continue
+            if self.volumes and self.volumes.get(sym, 0.0) < config.MIN_QUOTE_VOLUME_24H:
                 continue
             try:
                 velas = await self.api.klines(sym, config.TIMEFRAME, limit=200)
@@ -159,25 +249,59 @@ class Bot:
         # exchange es un riesgo que el script nunca tuvo que asumir.
         equity = await self.api.balance_usdt()
         precio = sig.entry
-        # RISK_PCT como fracción de margen expuesto, apalancado por
-        # LEVERAGE — más conservador y explícito que replicar el 100%
-        # del equity que usa el backtest de Pine por defecto.
-        qty = (equity * config.RISK_PCT / 100.0 * config.LEVERAGE) / precio if precio > 0 else 0.0
+
+        if config.EMERGENCY_SL_ENABLED:
+            # Tamaño por RIESGO real: cuánto se pierde si salta el stop
+            # de emergencia es lo que debe igualar RISK_PCT del equity,
+            # no el margen comprometido. ANTES el tamaño salía de
+            # equity×RISK_PCT×LEVERAGE, que mide margen, no pérdida
+            # posible — con el stop al 8% y leverage 3x, la pérdida real
+            # si saltaba el stop rondaba el 0.06% del equity, muy por
+            # debajo de lo que RISK_PCT prometía por su nombre.
+            riesgo_cash = equity * config.RISK_PCT / 100.0
+            riesgo_por_unidad = precio * config.EMERGENCY_SL_PCT / 100.0
+            qty = riesgo_cash / riesgo_por_unidad if riesgo_por_unidad > 0 else 0.0
+        else:
+            # Sin stop de emergencia no hay una distancia de pérdida
+            # definida contra la que dimensionar — se cae al criterio
+            # antiguo (fracción de margen) y se avisa de que el riesgo
+            # real queda SIN acotar.
+            log.warning(
+                "%s: EMERGENCY_SL_ENABLED=false — el tamaño se calcula por margen, "
+                "no por riesgo; una pérdida grande no está acotada por RISK_PCT",
+                sig.symbol,
+            )
+            qty = (equity * config.RISK_PCT / 100.0 * config.LEVERAGE) / precio if precio > 0 else 0.0
+
         qty = self.api.round_qty(sig.symbol, qty)
         if qty <= 0 or qty < self.api.min_qty(sig.symbol):
             await self.tg.send(f"⚠️ {sig.symbol}: tamaño calculado por debajo del mínimo, señal descartada")
             return
 
+        margen_necesario = qty * precio / config.LEVERAGE if config.LEVERAGE > 0 else qty * precio
+        if margen_necesario > equity * 0.9:
+            await self.tg.send(
+                f"⚠️ {sig.symbol}: el tamaño calculado por riesgo pide más margen del disponible "
+                f"({margen_necesario:.2f} USDT sobre {equity:.2f} de equity) — señal descartada"
+            )
+            return
+
         try:
             await self.api.set_leverage(sig.symbol, "LONG", config.LEVERAGE)
             await self.api.set_leverage(sig.symbol, "SHORT", config.LEVERAGE)
-            sl_emergencia = precio * (1 - config.EMERGENCY_SL_PCT / 100.0)
             if config.EMERGENCY_SL_ENABLED:
+                sl_emergencia = precio * (1 - config.EMERGENCY_SL_PCT / 100.0)
                 sl_r = self.api.round_price(sig.symbol, sl_emergencia)
                 # market_order() de bingx.py exige sl Y tp en la misma
-                # orden — se manda un tp muy lejano (no debería
-                # tocarse nunca) solo para poder mandar el sl real.
-                tp_lejano = self.api.round_price(sig.symbol, precio * 1000)
+                # orden. Se manda un TP lejano solo para poder mandar el
+                # SL real — ×3 y no ×1000: un multiplicador absurdo
+                # puede caer fuera de los límites de precio válidos del
+                # contrato en BingX y hacer que la orden entera se
+                # rechace. ×3 sigue siendo, en la práctica, "nunca se
+                # toca" para la vida de esta operación (sale mucho antes
+                # por giro de SuperTrend), y es un precio con muchas más
+                # garantías de ser válido.
+                tp_lejano = self.api.round_price(sig.symbol, precio * 3)
                 await self.api.market_order(sig.symbol, "BUY", qty, sl_r, tp_lejano)
             else:
                 await self.api.market_order(sig.symbol, "BUY", qty, 0, 0)
@@ -235,6 +359,20 @@ class Bot:
         else:
             d["losses"] = d.get("losses", 0) + 1
             d["consecutive_losses"] = d.get("consecutive_losses", 0) + 1
+            if d["consecutive_losses"] >= config.MAX_CONSECUTIVE_LOSSES:
+                d["cooldown_until"] = time.time() + config.COOLDOWN_MINUTES * 60
+                d["consecutive_losses"] = 0
+                # register_close es síncrono (lo llama check_exits, que
+                # sí es async) — asyncio.create_task en vez de await,
+                # mismo patrón que ya usa el bot de reversión para esto.
+                asyncio.create_task(
+                    self.tg.send(
+                        f"⏸️ <b>Circuit breaker</b>\n"
+                        f"{config.MAX_CONSECUTIVE_LOSSES} pérdidas seguidas · "
+                        f"pausa de {config.COOLDOWN_MINUTES} min.\n"
+                        f"No es un fallo: es el bot dejando de insistir."
+                    )
+                )
         d.get("open", {}).pop(symbol, None)
         d.setdefault("last_close", {})[symbol] = time.time()
         historial = d.setdefault("trades", [])

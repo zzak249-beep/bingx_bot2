@@ -69,6 +69,28 @@ MAX_CONCURRENT = _int("MAX_CONCURRENT", 0)  # 0 = sin límite
 # muy seguidos en el mismo símbolo, y no siempre conviene perseguirlos.
 REENTRY_COOLDOWN_MIN = _int("REENTRY_COOLDOWN_MIN", 15)
 
+# Riesgo agregado máximo, sumando lo arriesgado en TODAS las posiciones
+# abiertas a la vez (aprox: nº de posiciones × RISK_PCT). MAX_CONCURRENT
+# limita CUÁNTAS, esto limita CUÁNTO en conjunto — con RISK_PCT alto y
+# muchas posiciones abiertas a la vez, el límite de cantidad solo no
+# basta para acotar la exposición total.
+MAX_TOTAL_RISK_PCT = _float("MAX_TOTAL_RISK_PCT", 3.0)
+
+# ── Circuit breaker (existía el contador, pero nada lo usaba) ──────────
+# Con el volumen de señales de este bot, una mala racha en un mercado
+# picado puede encadenar pérdidas rápido. Mismo patrón que el bot de
+# reversión: tras N pérdidas seguidas, pausa. Antes se contaba
+# consecutive_losses pero ningún sitio lo comprobaba — no frenaba nada.
+MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 4)
+COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 60)
+
+# ── Liquidez ──────────────────────────────────────────────────────────
+# El script Pine original no filtra por liquidez — cada símbolo es
+# independiente y el backtest no paga slippage real. En LIVE, un par
+# fino con poco volumen paga slippage peor justo cuando más importa: al
+# entrar a mercado, y sobre todo si llega a saltar el stop de urgencia.
+MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 2_000_000.0)
+
 # ── Stop de emergencia REAL (solo LIVE) ─────────────────────────────────
 # El script original no manda ningún stop al exchange: cierra por
 # lógica cuando gira el SuperTrend, sondeado por el propio bot. Eso es
@@ -79,6 +101,10 @@ REENTRY_COOLDOWN_MIN = _int("REENTRY_COOLDOWN_MIN", 15)
 # SOLO en LIVE, se manda además un stop físico de emergencia, ancho
 # (bien por detrás del SuperTrend), que no debería tocarse en
 # condiciones normales — es la red bajo la red.
+#
+# IMPORTANTE: este stop, cuando está activado, es también lo que define
+# el tamaño de la posición — ver RISK_PCT más abajo. Sin él, RISK_PCT
+# no puede controlar una pérdida máxima real y el bot avisa de ello.
 EMERGENCY_SL_ENABLED = _bool("EMERGENCY_SL_ENABLED", True)
 EMERGENCY_SL_PCT = _float("EMERGENCY_SL_PCT", 8.0)  # % por debajo de la entrada
 

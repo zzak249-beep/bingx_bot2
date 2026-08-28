@@ -64,6 +64,58 @@ Dos arreglos, ambos en `entry_rsi.py`:
 
 ---
 
+## Mejoras para operar con dinero real
+
+Cuatro problemas encontrados revisando el código pensando en LIVE, no
+en SIGNAL:
+
+**1. El tamaño de posición ahora controla el riesgo real, no el
+margen.** Antes, `RISK_PCT` multiplicaba equity × leverage — con
+RISK_PCT=0.25% y leverage 3x, si saltaba el stop de emergencia (8%) la
+pérdida real rondaba el 0.06% del equity, muy por debajo de lo que el
+nombre prometía. Ahora el tamaño se calcula para que, SI salta el stop
+de emergencia, la pérdida sea exactamente `RISK_PCT`% del equity —
+independiente del apalancamiento. Si `EMERGENCY_SL_ENABLED=false`, no
+hay una distancia de stop contra la que calcular esto, y el bot avisa
+por log que el riesgo real queda sin acotar.
+
+**2. El circuit breaker ahora frena de verdad.** Existía el contador de
+pérdidas seguidas, pero nada lo comprobaba — nunca pausaba. Ahora, tras
+`MAX_CONSECUTIVE_LOSSES` (4 por defecto) pérdidas seguidas, el bot deja
+de escanear durante `COOLDOWN_MINUTES` (60 por defecto) y avisa por
+Telegram.
+
+**3. Reconciliación al arrancar.** Si Railway reinicia el bot mientras
+hay posiciones LIVE abiertas, `reconcile_startup()` compara el estado
+guardado contra las posiciones reales en BingX. Si una posición que el
+bot creía abierta ya no existe, se retira del estado SIN inventar un
+resultado (no hay forma fiable de saber el precio real de cierre
+mientras el bot estaba caído) y se avisa. Si BingX tiene una posición
+que el bot no reconoce, también avisa — no la toca.
+
+**4. Filtro de liquidez** (`MIN_QUOTE_VOLUME_24H`, 2M USDT por
+defecto). El script Pine no lo tiene — cada símbolo es independiente y
+el backtest no paga slippage real. En LIVE, un par fino paga peor
+slippage justo cuando más importa: al entrar a mercado, y sobre todo si
+llega a saltar el stop de urgencia.
+
+**Además:** `MAX_TOTAL_RISK_PCT` (3% por defecto) limita cuánto se
+arriesga en CONJUNTO entre todas las posiciones abiertas a la vez —
+`MAX_CONCURRENT` limita cuántas, esto limita cuánto. Y el TP "lejano"
+que acompaña al stop de emergencia en la misma orden bajó de ×1000 a
+×3 el precio de entrada — un multiplicador tan extremo podía caer
+fuera de los límites de precio válidos del contrato en BingX y hacer
+que la orden entera se rechazara.
+
+**Lo que sigue sin estar cubierto, y vale la pena saberlo:** las
+entradas son a mercado, no a límite — con el volumen de señales de este
+bot, eso puede acumular slippage real. Y no hay ningún filtro de
+"régimen de mercado" (si BTC se desploma, este bot seguiría abriendo
+largos en altcoins uno tras otro). Son mejoras razonables para una
+siguiente vuelta, no bugs — dímelo si quieres que las construya.
+
+---
+
 ## La estrategia, en corto
 
 1. RSI(10) y su propia media móvil SMA(10).
