@@ -1,73 +1,122 @@
-# Bot de Arranque de Impulso — BingX 30m
+# Bot RSI Doble Suelo + SuperTrend — BingX
 
-Busca el **principio** de un movimiento, no su continuación.
+Traducción fiel y standalone del script Pine "ProBorsa: RSI &
+SuperTrend Özel Dip Stratejisi". **Proyecto aparte** del bot de
+reversión — no comparte filtros, no comparte estado, no comparte
+carpeta en el repo.
 
-**Arranca en SIGNAL.** Cero operaciones medidas.
-
----
-
-## Lo primero: esto ya falló una vez
-
-"Entrar a favor del pump" es lo que hacía la **ruptura de rango**, y se
-midió con **482 operaciones**: −0,32R en INDEXUS (159 ops), −18% en
-CATE, −27% en JIMOTHY. Perdió en los tres.
-
-El motivo es conocido: en un mercado picado el precio sale del rango
-constantemente, y casi todas esas salidas mueren en el primer
-retroceso. En una vertical, además, el rango de 20 velas queda tan por
-debajo que la señal llega cuando el movimiento ya ocurrió.
-
-## Qué se hace distinto aquí
-
-Cuatro condiciones **en la misma vela**:
-
-| Filtro | Qué exige | Por qué |
-|---|---|---|
-| **Compresión** | rango previo ≤ 3 ATR | Un pump nace de la calma. Si venía dando bandazos, la ruptura es una más |
-| **Expansión** | vela ≥ 1,8 ATR, cierre en el tercio alto | Una vela ancha que cierra por la mitad es indecisión |
-| **Volumen** | ≥ 2× la media | Sin volumen no es un pump: es un hueco en el libro |
-| **Que sea PRONTO** | estirón ≤ 3,5 ATR | **El que lo separa de la ruptura**: si ya está lejos de su media, el movimiento ya pasó |
-
-El cuarto es la única diferencia conceptual real. Los otros tres
-aprietan; ese cambia *cuándo* se entra.
-
-**Salida: trailing por ATR.** Los pumps tienen colas largas — la
-mayoría no va a ninguna parte y unos pocos corren muchísimo. Un
-objetivo fijo cobraría 2R en los que iban a hacer 10R.
+**Arranca en modo SIGNAL.** Avisa por Telegram y no toca el exchange.
 
 ---
 
-## Interacción entre filtros que hay que vigilar
+## Antes de nada: esto no tiene nada de lo que sí tiene el bot de reversión
 
-La vela de arranque **consume estirón**: si exiges una vela de 1,8 ATR
-y a la vez un estirón máximo de 2,0, la ventana es casi imposible y el
-bot no disparará nunca. Por eso `MAX_STRETCH_AT_ENTRY` está en 3,5.
+Y hay que decirlo claro, porque el contraste importa:
 
-Si tocas `MIN_EXPANSION_ATR`, mueve el otro en la misma dirección.
+- **Sin filtro de amplitud.** El bot de reversión no opera un símbolo
+  si el ATR no cubre 30× el coste de operar — el hallazgo principal de
+  todo ese proyecto. Este bot no tiene ningún filtro así: si el RSI
+  cruza dos veces bajo 50, entra, sea cual sea la volatilidad del
+  símbolo.
+- **Sin backtest.** El bot de reversión tiene 35 operaciones medidas
+  (pocas, pero medidas) y un README entero explicando qué combinación
+  de símbolo y contexto funcionó. Este es un script encontrado y
+  traducido — cero operaciones medidas, cero garantía de que el RSI
+  cruzando dos veces bajo 50 sea una ventaja real y no ruido con buena
+  pinta.
+- **Volumen de señales altísimo.** El log que dio origen a esto generó
+  más de 40 señales en un solo día. El bot de reversión, con su filtro
+  de amplitud, puede pasar días sin ninguna. Esa diferencia no es un
+  defecto de ninguno de los dos — es que son estrategias completamente
+  distintas, y este genera muchísimas más operaciones, así que cada
+  error de tamaño se repite muchísimas más veces.
+- **Sin TP, salida por SuperTrend.** El tamaño del ganador lo decide
+  por completo cuánto tarde el SuperTrend en girar — puede ser una
+  racha muy buena o una sangría lenta si el mercado se mueve lateral.
+  Sin datos propios no hay forma de saber cuál de las dos es más
+  probable en tu universo.
+
+**Recomendación honesta:** déjalo en SIGNAL bastante más tiempo del que
+dejarías el bot de reversión — no por ser peor estrategia, sino porque
+no hay NADA medido todavía, ni siquiera 35 operaciones.
 
 ---
 
-## Antes de operarlo: mídelo
+## La estrategia, en corto
+
+1. RSI(10) y su propia media móvil SMA(10).
+2. Cada vez que el RSI cruza por ENCIMA de su media MIENTRAS sigue por
+   debajo de 50 (zona débil), cuenta un cruce.
+3. El contador se reinicia cada vez que el RSI supera 50.
+4. En el **2º cruce** desde el último reinicio, entra en largo — es un
+   doble suelo visto en el RSI, no en el precio.
+5. Sale cuando el SuperTrend(10, 2.5) gira de alcista a bajista. No hay
+   TP ni SL de precio fijo en el script original.
+
+Solo largo. El script Pine no tiene lado corto, y aquí no se le añadió
+uno — a diferencia del RSI del bot de reversión, que sí se hizo
+simétrico porque ese bot opera los dos lados.
+
+---
+
+## El stop de emergencia que el script original NO tenía
+
+El Pine original nunca gestiona dinero real por sí solo — vive en
+TradingView, cierra por lógica cuando cambia una variable interna. Eso
+es aceptable en SIGNAL. Pero en LIVE, sin ningún stop físico en el
+exchange, si el bot se cae o pierde conexión, la posición queda abierta
+**sin nada protegiéndola** hasta que el bot vuelva a arrancar y sondee
+el SuperTrend de nuevo.
+
+Por eso, y SOLO en LIVE, este bot manda un stop de emergencia ancho
+(`EMERGENCY_SL_PCT`, 8% por defecto) junto a la orden de entrada — no
+debería tocarse en condiciones normales, es la red bajo la red. Puedes
+desactivarlo con `EMERGENCY_SL_ENABLED=false` si prefieres una
+traducción 100% literal, pero no es lo que se recomienda.
+
+---
+
+## Despliegue en Railway
+
+1. Repo aparte en GitHub con estos archivos.
+2. Railway → New Project → Deploy from GitHub repo.
+3. Monta un volumen en `/data` (mismo motivo que el otro bot: sin
+   volumen, el estado se pierde en cada redeploy).
+4. Variables desde `.env.example` — mínimo `TELEGRAM_TOKEN` y
+   `TELEGRAM_CHAT_ID` para SIGNAL.
+5. Si ya tienes el bot de reversión en el mismo proyecto de Railway,
+   usa un servicio NUEVO, no el mismo — `STATE_PATH` ya apunta a un
+   archivo distinto (`state_rsi.json`) por si acaso comparten volumen,
+   pero son dos procesos independientes.
+
+## Pasar a LIVE
+
+Mismos dos cerrojos que el otro bot:
 
 ```
-python backtest.py BTR-USDT 30m 180 --mensual
-python backtest.py BTR-USDT,CATE-USDT,JIMOTHY-USDT 30m 180
+MODE=LIVE
+LIVE_CONFIRMED=true
+BINGX_API_KEY=...
+BINGX_API_SECRET=...
 ```
 
-Descarga histórico de Binance (gratis, sin cuenta) y simula con el
-**mismo `strategy.py`** que ejecuta el bot. El desglose mensual es lo
-que dice si depende del régimen o no.
-
-Si sale como la ruptura de rango, ya lo sabrás sin haber arriesgado
-nada. Si sale distinto, tendrás por primera vez una estrategia de
-continuación con datos a favor.
+Con el volumen de señales de este bot, `RISK_PCT` importa todavía más
+que en el de reversión — 0.25% por defecto multiplicado por 40+
+señales/día es una exposición agregada que conviene mirar con calma
+antes de subirla.
 
 ---
 
-## Despliegue
+## Archivos
 
-Servicio **aparte** de los otros dos. Usa `state_impulse.json`, pero
-comparte proceso y logs si lo pones en el mismo sitio.
-
-Volumen en `/data`, `railway_vars_SIGNAL.txt` en el Raw Editor, y
-`python test_telegram.py` antes de nada.
+| Archivo | Qué hace |
+|---------|----------|
+| `main.py` | Bucle: escaneo, señales, salidas por giro de SuperTrend |
+| `entry_rsi.py` | Motor — RSI doble cruce + SuperTrend, traducción del Pine |
+| `bingx.py` | Cliente de la API (reutilizado del bot de reversión, sin cambios) |
+| `notify.py` | Telegram y estado en disco (reutilizado, sin cambios) |
+| `config.py` | Variables de entorno |
+| `requirements.txt` | httpx |
+| `Procfile` / `railway.json` | Arranque en Railway |
+| `.env.example` | Todas las variables documentadas |
+| `.gitignore` | — |
