@@ -26,6 +26,7 @@ import strategy
 import liquidations
 import rsi_confirm
 import breakout_fail
+import oi_confirm
 import score as scoring
 import stats
 from bingx import BingX, BingXError
@@ -55,6 +56,7 @@ def fmt_signal(
     bias30m: str | None = None,
     score: "scoring.EntryScore | None" = None,
     breakout_result: "breakout_fail.BreakoutFailResult | None" = None,
+    oi_quadrant: "oi_confirm.OIQuadrant | None" = None,
 ) -> str:
     lado = "LARGO" if sig.side == "BUY" else "CORTO"
     cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
@@ -85,6 +87,12 @@ def fmt_signal(
             f"en <code>{breakout_result.nivel:.8g}</code> "
             f"({breakout_result.distancia_atr:+.2f} ATR antes de fallar)"
         )
+    if oi_confirm.confirms(sig.side, oi_quadrant):
+        texto += (
+            f"\n📊 OI confirma: liquidación de largos "
+            f"(precio {oi_quadrant.precio_pct:+.1f}%, OI {oi_quadrant.oi_pct:+.1f}% "
+            f"en {config.OI_WINDOW_MIN} min)"
+        )
     if bias30m and bias30m != "NEUTRAL":
         texto += f"\n🧭 A favor de la tendencia de 30m ({bias30m.lower()})"
     if score is not None:
@@ -107,6 +115,8 @@ class Bot:
         self.last_rows: list = []
         self.last_heartbeat = time.time()
         self.liq = liquidations.LiquidationTracker() if config.LIQUIDATIONS_ENABLED else None
+        self.oi = oi_confirm.OpenInterestTracker() if config.OI_CONFIRM_ENABLED else None
+        self.last_oi_refresh = 0.0
         self.radar30 = scanner.Scanner(self.api, timeframe=config.RADAR30M_TIMEFRAME) if config.RADAR30M_ENABLED else None
         self.bias30m: dict[str, str] = {}
         self.last_radar30 = 0.0
@@ -134,6 +144,7 @@ class Bot:
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
                 await self.check_time_exits()
+                await self.maybe_refresh_oi()
                 await self.maybe_radar30m()
                 await self.maybe_rank()
                 await self.scan_once()
@@ -442,6 +453,36 @@ class Bot:
                 self.register_close_r(symbol, pos, exit_price, reason=reason, mode="SIGNAL")
                 break
 
+    async def maybe_refresh_oi(self) -> None:
+        """
+        Sondea el Open Interest de TODO el universo cada
+        OI_POLL_INTERVAL_MIN, con el mismo semáforo de concurrencia que
+        usa scanner.Scanner — mil símbolos son mil llamadas, y esto es
+        una llamada MÁS por símbolo encima de las velas, así que hay
+        que respetar el mismo límite para no provocar 429.
+
+        Corre en background, sin generar avisos propios: solo alimenta
+        el historial que oi_confirm.OpenInterestTracker necesita para
+        poder comparar "OI ahora" contra "OI hace OI_WINDOW_MIN".
+        """
+        if not self.oi:
+            return
+        if time.time() - self.last_oi_refresh < config.OI_POLL_INTERVAL_MIN * 60:
+            return
+        self.last_oi_refresh = time.time()
+
+        sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+
+        async def _uno(sym: str) -> None:
+            async with sem:
+                try:
+                    valor = await self.api.open_interest(sym)
+                    self.oi.add_snapshot(sym, valor)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("%s: no se pudo leer OI (%s)", sym, exc)
+
+        await asyncio.gather(*(_uno(s) for s in self.symbols))
+
     async def maybe_radar30m(self) -> None:
         """
         Escaneo aparte, en 30m, EXCLUSIVAMENTE para saber si hay
@@ -590,8 +631,23 @@ class Bot:
                 ventana=config.BREAKOUT_CONFIRM_BARS,
             ) if config.BREAKOUT_FAIL_ENABLED else None
 
+            oi_quadrant = None
+            if self.oi:
+                # Variación % del precio en la MISMA ventana que
+                # oi_confirm usa para el OI — se calcula aquí, con las
+                # velas ya descargadas, en vez de mantener una segunda
+                # fuente de precio dentro de oi_confirm.py.
+                cerradas = velas[:-1]
+                velas_atras = config.bars_for_minutes(config.OI_WINDOW_MIN)
+                if len(cerradas) > velas_atras and cerradas[-1 - velas_atras]["close"] > 0:
+                    precio_pct = (
+                        (cerradas[-1]["close"] - cerradas[-1 - velas_atras]["close"])
+                        / cerradas[-1 - velas_atras]["close"] * 100.0
+                    )
+                    oi_quadrant = self.oi.quadrant(sym, precio_pct)
+
             score_result = (
-                scoring.compute(sig, rsi_result, cascade, bias, breakout_result)
+                scoring.compute(sig, rsi_result, cascade, bias, breakout_result, oi_quadrant)
                 if config.SCORE_ENABLED else None
             )
             if score_result and config.SCORE_MIN > 0 and score_result.total < config.SCORE_MIN:
@@ -603,7 +659,7 @@ class Bot:
 
             await self.handle_signal(
                 sig, rsi_result=rsi_result, bias30m=bias, cascade=cascade,
-                score=score_result, breakout_result=breakout_result,
+                score=score_result, breakout_result=breakout_result, oi_quadrant=oi_quadrant,
             )
             abiertas += 1
             if abiertas >= config.MAX_CONCURRENT:
@@ -624,6 +680,7 @@ class Bot:
         cascade: dict | None = None,
         score: "scoring.EntryScore | None" = None,
         breakout_result: "breakout_fail.BreakoutFailResult | None" = None,
+        oi_quadrant: "oi_confirm.OIQuadrant | None" = None,
     ) -> None:
         log.info(
             "SEÑAL %s %s entrada=%.8g sl=%.8g tp=%.8g rr=%.2f atr=%.2f%%%s",
@@ -636,6 +693,7 @@ class Bot:
                 fmt_signal(
                     sig, live=False, cascade=cascade, rsi_result=rsi_result,
                     bias30m=bias30m, score=score, breakout_result=breakout_result,
+                    oi_quadrant=oi_quadrant,
                 )
             )
             self.state.data.setdefault("open", {})[sig.symbol] = {
@@ -717,6 +775,7 @@ class Bot:
         await self.tg.send(fmt_signal(
             sig, live=True, cascade=cascade, rsi_result=rsi_result,
             bias30m=bias30m, score=score, breakout_result=breakout_result,
+            oi_quadrant=oi_quadrant,
         ))
 
     def register_close_r(self, symbol: str, pos: dict, exit_price: float, reason: str, mode: str) -> None:

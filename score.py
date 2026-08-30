@@ -22,13 +22,13 @@ sume o reste puntos — el propio histórico del proyecto lo señaló como
 la causa #1 de pérdidas, y eso no se diluye en una puntuación. Esto es
 una capa por ENCIMA de lo que ya se decidió, para ordenar y medir.
 
-AVISO SOBRE stats.buckets_por_score(): los pesos de aquí abajo
-cambiaron al añadir la confirmación de ruptura fallida (antes: base 40
-+ r:r 15 + cobertura 15 + rsi 15 + cascada 15; ahora: base 30 + r:r 10
-+ cobertura 10 + rsi 15 + cascada 15 + ruptura 20). Un score de 70
-calculado ANTES de este cambio no significa exactamente lo mismo que
-un 70 calculado DESPUÉS — si vas a comparar franjas de score en el
-tiempo, ten en cuenta esta fecha como un corte.
+AVISO SOBRE stats.buckets_por_score(): los pesos cambiaron dos veces:
+al añadir la ruptura fallida (base 40→30, r:r 15→10, cobertura 15→10,
+rsi 15, cascada 15, ruptura +20) y ahora al añadir Open Interest (base
+30→25, cascada 15→12, ruptura 20→18, oi +10 nuevo). Un score calculado
+con una versión anterior no significa exactamente lo mismo que uno
+calculado después — si vas a comparar franjas de score en el tiempo,
+ten en cuenta estas fechas como cortes.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 import breakout_fail
 import config
 import liquidations
+import oi_confirm
 import rsi_confirm
 import strategy
 
@@ -53,12 +54,13 @@ def compute(
     cascade: dict | None,
     bias30m: str | None,
     breakout_result: "breakout_fail.BreakoutFailResult | None" = None,
+    oi_quadrant: "oi_confirm.OIQuadrant | None" = None,
 ) -> EntryScore:
     detalle: dict[str, float] = {}
 
     # Base: la señal ya pasó amplitud + ER + vela de agotamiento + R:R
     # mínimo — es la parte más validada del sistema (ver README).
-    detalle["base"] = 30.0
+    detalle["base"] = 25.0
 
     # R:R por encima del mínimo exigido, hasta +10.
     exceso_rr = max(0.0, sig.rr - config.MIN_RR)
@@ -77,17 +79,27 @@ def compute(
 
     # Cascada de liquidación confirmando la dirección.
     if cascade and cascade.get("activa") and liquidations.cascade_confirms(sig.side, cascade["lado"]):
-        detalle["cascada"] = 15.0
+        detalle["cascada"] = 12.0
     else:
         detalle["cascada"] = 0.0
 
     # Ruptura fallida reciente en el nivel que la señal está fadeando —
-    # confirmación estructural, el peso más alto de las cuatro porque
-    # es evidencia de precio real, no un indicador derivado.
+    # el peso más alto de las confirmaciones porque es evidencia de
+    # precio real, no un indicador derivado.
     if breakout_fail.confirms(sig.side, breakout_result):
-        detalle["ruptura"] = 20.0
+        detalle["ruptura"] = 18.0
     else:
         detalle["ruptura"] = 0.0
+
+    # Open Interest — ASIMÉTRICO A PROPÓSITO. oi_confirm.confirms() ya
+    # decide esto: solo confirma BUY vía liquidación de largos (única
+    # combinación con ventaja validada), nunca SELL. No es un fallo de
+    # cobertura del score — es la evidencia tratada con honestidad en
+    # vez de forzarla a encajar en una simetría bonita.
+    if oi_confirm.confirms(sig.side, oi_quadrant):
+        detalle["oi"] = 10.0
+    else:
+        detalle["oi"] = 0.0
 
     total = max(0.0, min(100.0, sum(detalle.values())))
     return EntryScore(total=total, detalle=detalle)

@@ -157,10 +157,12 @@ puede usarse como un umbral adicional más graduado que un simple sí/no,
 pero nadie lo activa por ti: hay que ponerlo a mano.
 
 **Aviso si vas a comparar franjas de score en el tiempo:** los pesos
-cambiaron al añadir la ruptura fallida (antes: base 40 + r:r 15 +
-cobertura 15 + rsi 15 + cascada 15; ahora: base 30 + r:r 10 + cobertura
-10 + rsi 15 + cascada 15 + ruptura 20). Un score de 70 de antes de este
-cambio no es exactamente comparable a un 70 de después.
+cambiaron dos veces — al añadir la ruptura fallida (base 40→30, r:r
+15→10, cobertura 15→10, ruptura +20 nuevo) y al añadir Open Interest
+(base 30→25, cascada 15→12, ruptura 20→18, oi +10 nuevo). Pesos
+actuales: base 25 + r:r 10 + cobertura 10 + rsi 15 + cascada 12 +
+ruptura 18 + oi 10 = 100. Un score de 70 calculado con una versión
+anterior no es exactamente comparable a un 70 de después.
 
 ---
 
@@ -202,6 +204,50 @@ propias fuentes de datos, y mezclarlo todo de golpe habría sido el
 mismo tipo de riesgo que ya causó el bug del SuperTrend en el otro bot.
 Puramente informativo por defecto — no bloquea ninguna entrada, mismo
 patrón que las cascadas de liquidación.
+
+---
+
+## Open Interest: cuadrante precio+OI (asimétrico a propósito)
+
+`oi_confirm.py` cruza la dirección del precio con la del Open Interest
+(contratos abiertos) en la misma ventana (`OI_WINDOW_MIN`, 30 min por
+defecto). Cuatro combinaciones posibles:
+
+| Precio | OI | Significa |
+|---|---|---|
+| ↑ | ↑ | Dinero nuevo en largo — tendencia real |
+| ↓ | ↑ | Dinero nuevo en corto — tendencia real |
+| ↑ | ↓ | Cobertura de cortos (squeeze) — no es demanda nueva |
+| ↓ | ↓ | Liquidación de largos — venta forzada, no convicción |
+
+**Investigado antes de construirlo, no asumido:** de las cuatro, solo
+"precio cae + OI cae" (liquidación de largos) mostró ventaja
+estadísticamente validada en backtesting real para comprar después. El
+cuadrante espejo — "precio sube + OI cae", cobertura de cortos — **no**
+mostró esa misma ventaja: el mercado suele seguir subiendo tras un
+squeeze, no devolverlo.
+
+**Por eso este módulo es asimétrico a propósito:** confirma con fuerza
+las señales BUY vía liquidación de largos, y **nunca** confirma señales
+SELL por ningún cuadrante de OI — tratar la cobertura de cortos como
+confirmación sería inventar una simetría que los datos no respaldan.
+Esto no es un capricho: es la misma asimetría que ya se midió de forma
+independiente en el propio histórico de este proyecto (cortos ~79% de
+acierto, largos a contra-tendencia en mercado bajista ~43%). Dos líneas
+de evidencia completamente distintas apuntando a lo mismo.
+
+```
+📊 OI confirma: liquidación de largos (precio -6.5%, OI -14.2% en 30 min)
+```
+
+**Cómo se construye el historial:** BingX no ofrece Open Interest
+histórico por API pública — solo el valor ACTUAL
+(`/openApi/swap/v2/quote/openInterest`). El bot sondea todo el universo
+cada `OI_POLL_INTERVAL_MIN` (5 min por defecto) y guarda los snapshots
+en memoria, mismo patrón que `liquidations.py` con las liquidaciones.
+Esto añade una llamada más por símbolo cada ciclo de sondeo — con el
+mismo semáforo (`SCAN_CONCURRENCY`) que ya usa el resto del proyecto
+para no provocar 429.
 
 ---
 
@@ -466,6 +512,7 @@ los del Strategy Tester, no iguales.
 | `liquidations.py` | Cascadas de liquidación (Binance + Bybit, gratis) — confirmación, no criterio de entrada |
 | `rsi_confirm.py` | RSI de doble cruce (traducido de ProBorsa) — confirmación de entrada en 5m |
 | `breakout_fail.py` | Ruptura fallida (adaptado de TRADION) — confirmación estructural |
+| `oi_confirm.py` | Open Interest — cuadrante precio+OI, asimétrico (solo confirma BUY) |
 | `score.py` | Puntuación de confianza 0-100 — ordena el universo y se mide contra el R real |
 | `xsection.py` | Sección cruzada (retorno de 24h) |
 | `bingx.py` | Cliente de la API (velas, saldo, órdenes) |
@@ -519,6 +566,7 @@ stats.py                   Expectancy en R, IC95%, profit factor
 liquidations.py            Cascadas de liquidación (Binance + Bybit, gratis)
 rsi_confirm.py             RSI de doble cruce — confirmación de entrada
 breakout_fail.py           Ruptura fallida — confirmación estructural
+oi_confirm.py              Open Interest — cuadrante precio+OI (asimétrico)
 score.py                   Puntuación de confianza 0-100 — ordena y mide
 xsection.py                Sección cruzada (retorno de 24h)
 bingx.py                   Cliente de la API

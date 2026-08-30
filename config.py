@@ -142,9 +142,19 @@ USE_TIME_EXIT = _bool("USE_TIME_EXIT", True)
 TIME_EXIT_ONLY_LOSING = _bool("TIME_EXIT_ONLY_LOSING", True)
 
 
+# Reutilizado por max_trade_seconds() y por bars_for_minutes() (esta
+# última, nueva, para la ventana de oi_confirm.py) — antes estaba
+# duplicado solo dentro de max_trade_seconds().
+MINUTOS_POR_VELA = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+
+
 def max_trade_seconds() -> int:
-    minutos_por_vela = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
-    return MAX_TRADE_BARS * minutos_por_vela.get(TIMEFRAME, 5) * 60
+    return MAX_TRADE_BARS * MINUTOS_POR_VELA.get(TIMEFRAME, 5) * 60
+
+
+def bars_for_minutes(minutes: int) -> int:
+    """Cuántas velas de TIMEFRAME caben en `minutes` minutos — mínimo 1."""
+    return max(1, minutes // MINUTOS_POR_VELA.get(TIMEFRAME, 5))
 
 
 # ── Riesgo ────────────────────────────────────────────────────────────
@@ -243,6 +253,21 @@ BREAKOUT_FAILURE_BARS = _int("BREAKOUT_FAILURE_BARS", 5)
 BREAKOUT_FAILURE_ATR = _float("BREAKOUT_FAILURE_ATR", 0.25)
 BREAKOUT_FAILURE_CLOSES = _int("BREAKOUT_FAILURE_CLOSES", 2)
 BREAKOUT_CONFIRM_BARS = _int("BREAKOUT_CONFIRM_BARS", 5)
+
+# ── Open Interest: cuadrante precio+OI (asimétrico a propósito) ────────
+# Cruza la dirección del precio con la del Open Interest en la misma
+# ventana. Investigado antes de construirlo: el cuadrante precio↓+OI↓
+# (liquidación forzada de largos) SÍ mostró ventaja validada en
+# backtesting para confirmar señales BUY. El espejo — precio↑+OI↓,
+# cobertura de cortos — NO la mostró: el mercado suele seguir subiendo
+# tras un squeeze, no devolverlo. Por eso oi_confirm.py NUNCA confirma
+# señales SELL — sería inventar una simetría que los datos no respaldan.
+# BingX solo da el OI ACTUAL, no histórico: este módulo construye su
+# propio histórico sondeando cada OI_POLL_INTERVAL_MIN minutos.
+OI_CONFIRM_ENABLED = _bool("OI_CONFIRM_ENABLED", True)
+OI_WINDOW_MIN = _int("OI_WINDOW_MIN", 30)
+OI_MIN_CHANGE_PCT = _float("OI_MIN_CHANGE_PCT", 2.0)
+OI_POLL_INTERVAL_MIN = _int("OI_POLL_INTERVAL_MIN", 5)
 
 # ── Puntuación de confianza de entrada (score.py) ──────────────────────
 # Combina en un solo número lo que antes se mostraba disperso (RSI,
