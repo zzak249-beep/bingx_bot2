@@ -115,11 +115,26 @@ class BingX:
                 out[sym] = 0.0
         return out
 
+    async def open_interest(self, symbol: str) -> float:
+        """
+        Open Interest ACTUAL del símbolo. BingX no ofrece histórico por
+        API pública — solo esta foto del momento. oi_confirm.py
+        construye su propio histórico sondeando esto periódicamente.
+        """
+        data = await self._public("/openApi/swap/v2/quote/openInterest", {"symbol": symbol})
+        if isinstance(data, dict):
+            return float(data.get("openInterest", 0) or 0)
+        return 0.0
+
     async def klines(self, symbol: str, interval: str, limit: int = 300) -> list[dict]:
         data = await self._public(
             "/openApi/swap/v3/quote/klines",
             {"symbol": symbol, "interval": interval, "limit": limit},
         )
+        return self._parse_klines(data)
+
+    @staticmethod
+    def _parse_klines(data: Any) -> list[dict]:
         rows: list[dict] = []
         for k in data or []:
             # BingX devuelve dicts o listas según versión; se aceptan ambos.
@@ -146,6 +161,48 @@ class BingX:
                     }
                 )
         rows.sort(key=lambda r: r["time"])
+        return rows
+
+    async def klines_history(
+        self, symbol: str, interval: str, total_velas: int, tanda: int = 500
+    ) -> list[dict]:
+        """
+        Historial LARGO, para backtest.py — klines() normal solo trae
+        `limit` velas de golpe (útil en vivo, no para meses de
+        histórico). Pagina hacia atrás con `endTime` (confirmado en la
+        documentación de BingX: acepta startTime/endTime en ms, mismo
+        patrón que Binance).
+
+        Se para sola si el símbolo no tiene tanto histórico —
+        devuelve lo que haya, no inventa velas que no existen.
+        """
+        todas: list[dict] = []
+        vistos: set[int] = set()
+        end_time: int | None = None
+
+        while len(todas) < total_velas:
+            params: dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": tanda}
+            if end_time is not None:
+                params["endTime"] = end_time
+            data = await self._public("/openApi/swap/v3/quote/klines", params)
+            filas = self._parse_klines(data)
+            if not filas:
+                break
+
+            nuevas = [f for f in filas if f["time"] not in vistos]
+            if not nuevas:
+                break
+            for f in nuevas:
+                vistos.add(f["time"])
+            todas.extend(nuevas)
+
+            end_time = min(f["time"] for f in filas) - 1
+            if len(filas) < tanda:
+                break  # el exchange ya no tiene más historial hacia atrás
+
+        todas.sort(key=lambda r: r["time"])
+        return todas[-total_velas:] if len(todas) > total_velas else todas
+
         return rows
 
     # ── privado ───────────────────────────────────────────────────────

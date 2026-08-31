@@ -1,196 +1,207 @@
 """
-backtest.py
------------
-Backtesting histórico de la estrategia RSI + SuperTrend contra datos REALES
-de BingX, usando la MISMA función `strategy.compute_signals` que usa el bot
-en vivo (así el backtest no se puede desincronizar de lo que realmente
-operaría el bot).
+backtest.py — reproduce strategy.evaluate() + las confirmaciones que SÍ
+se pueden reconstruir con velas históricas, sobre historial real.
 
-No necesita API keys: las velas históricas son un endpoint público.
+POR QUÉ EXISTE ESTE SCRIPT: la disciplina de Renaissance Technologies
+(Jim Simons) nunca fue "un indicador mejor" — fue validar cada señal
+contra datos masivos ANTES de arriesgar nada. En producción, juntar
+100-150 operaciones limpias (el tamaño de muestra donde el intervalo de
+confianza deja de tocar cero) tarda semanas. Sobre velas históricas de
+5m, un símbolo con meses de histórico puede dar esas mismas 100-150
+operaciones en minutos.
 
-Uso:
-    python backtest.py --symbol BTC/USDT --timeframe 15m --days 60
-    python backtest.py --symbol ETH/USDT --timeframe 15m --days 90 --trade-amount 200 --output resultados.csv
+QUÉ SÍ SE REPRODUCE, con total fidelidad porque solo dependen de velas:
+  - strategy.evaluate() — la base, con TODOS sus filtros tal cual.
+  - rsi_confirm.py — el doble cruce de RSI.
+  - breakout_fail.py — la ruptura fallida.
 
-Todos los parámetros de la estrategia (--rsi-length, --st-factor, etc.) son
-ajustables por si quieres explorar variantes antes de decidir la configuración
-final del bot en vivo.
+QUÉ NO SE REPRODUCE, Y SE DICE CON TODAS LAS LETRAS: liquidations.py y
+oi_confirm.py dependen de streams en vivo (liquidaciones) o de
+snapshots que el propio bot fue construyendo con el tiempo (Open
+Interest) — BingX no ofrece histórico de ninguno de los dos por API
+pública. Fingir esos datos hacia atrás sería inventar un resultado. Se
+quedan fuera del backtest, honestamente: esto mide un SUBCONJUNTO real
+del sistema completo, no el sistema completo.
+
+CÓMO SE SIMULA LA SALIDA: SL/TP más el cierre por tiempo
+(MAX_TRADE_BARS / TIME_EXIT_ONLY_LOSING), calcado de
+check_time_exits()/reconcile_signal() en main.py — mismo orden de
+comprobación (el peor caso, el stop, se mira primero si ambos niveles
+caen en la misma vela), para que el backtest no sea más generoso que
+lo que el bot haría de verdad.
+
+USO:
+    python backtest.py CATE-USDT MERL-USDT --dias 60
+    python backtest.py BASECAT-USDT --dias 30 --sin-rsi --sin-ruptura
 """
+from __future__ import annotations
 
 import argparse
-import os
-import sys
+import asyncio
+import logging
 
-import pandas as pd
-from dotenv import load_dotenv
+import httpx
 
-from exchange_client import ExchangeClient
-from strategy import compute_signals
+import breakout_fail
+import config
+import rsi_confirm
+import stats
+import strategy
+from bingx import BingX
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("backtest")
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--symbol", default=os.getenv("SYMBOL", "BTC/USDT"))
-    p.add_argument("--timeframe", default=os.getenv("TIMEFRAME", "15m"))
-    p.add_argument("--days", type=int, default=60, help="Días de histórico a descargar (por defecto 60)")
-    p.add_argument("--trade-amount", type=float, default=float(os.getenv("TRADE_AMOUNT_USDT", 100)),
-                    help="USDT simulados por operación")
-    p.add_argument("--fee-pct", type=float, default=0.1,
-                    help="Comisión por operación en %% (se aplica en la entrada y en la salida). BingX spot suele rondar 0.1%%.")
-    p.add_argument("--rsi-length", type=int, default=int(os.getenv("RSI_LENGTH", 10)))
-    p.add_argument("--signal-length", type=int, default=int(os.getenv("SIGNAL_LENGTH", 10)))
-    p.add_argument("--trigger-level", type=float, default=float(os.getenv("TRIGGER_LEVEL", 50)))
-    p.add_argument("--target-cross-count", type=int, default=int(os.getenv("TARGET_CROSS_COUNT", 2)))
-    p.add_argument("--atr-period", type=int, default=int(os.getenv("ATR_PERIOD", 10)))
-    p.add_argument("--st-factor", type=float, default=float(os.getenv("ST_FACTOR", 2.5)))
-    p.add_argument("--output", default=None, help="Ruta de un .csv donde guardar el detalle de cada operación")
-    return p.parse_args()
+# Misma ventana que usa el bot en vivo cada ciclo (scan_once pide
+# limit=300) — pasar más historial del que el bot real vería en cada
+# comprobación sería darle al backtest información que en producción
+# nunca tuvo.
+VENTANA_VIVA = 300
 
 
-def fetch_history(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
-    exchange = ExchangeClient("", "", demo=False)  # datos públicos: no requiere API keys
-    tf_ms = exchange.exchange.parse_timeframe(timeframe) * 1000
-    since = exchange.exchange.milliseconds() - days * 86400 * 1000
+def simular_salida(candles: list[dict], idx_entrada: int, sig: strategy.Signal) -> tuple[float | None, str]:
+    """
+    La señal en candles[idx_entrada] entra al CIERRE de esa vela —
+    igual que el bot real. Recorre las velas siguientes comprobando
+    SL/TP y el límite de tiempo, mismo orden que reconcile_signal() en
+    main.py: si SL y TP caen en la misma vela, gana el peor caso (el
+    stop) — convención conservadora, sin datos de tick no hay forma de
+    saber el orden real dentro de la vela.
 
-    all_rows = []
-    seen = set()
-    print(f"Descargando histórico de {symbol} ({timeframe}, últimos {days} días) desde BingX...")
-    for _ in range(200):  # límite de seguridad de páginas
-        batch = exchange.fetch_ohlcv_raw(symbol, timeframe, since=since, limit=500)
-        if not batch:
-            break
-        new_rows = [r for r in batch if r[0] not in seen]
-        if not new_rows:
-            break
-        all_rows.extend(new_rows)
-        seen.update(r[0] for r in new_rows)
-        since = batch[-1][0] + tf_ms
-        if len(batch) < 500 or since >= exchange.exchange.milliseconds():
-            break
+    Devuelve (None, 'sin_datos') si el historial se acaba antes de
+    resolverse — esas señales se descartan del informe, no se inventa
+    un resultado con datos que no existen.
+    """
+    entry, sl, tp, side = sig.entry, sig.sl, sig.tp, sig.side
+    limite_barras = config.MAX_TRADE_BARS
 
-    if not all_rows:
-        raise RuntimeError(f"No se recibieron velas para {symbol} en {timeframe}. ¿Símbolo o timeframe correctos?")
+    for i in range(idx_entrada + 1, min(idx_entrada + 1 + limite_barras + 1, len(candles))):
+        vela = candles[i]
+        if side == "BUY":
+            tp_hit = vela["high"] >= tp
+            sl_hit = vela["low"] <= sl
+        else:
+            tp_hit = vela["low"] <= tp
+            sl_hit = vela["high"] >= sl
 
-    all_rows.sort(key=lambda r: r[0])
-    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    print(f"  -> {len(df)} velas descargadas ({df['datetime'].iloc[0]} a {df['datetime'].iloc[-1]})\n")
-    return df
+        if sl_hit:
+            return stats.compute_r(entry, sl, side, sl), "stop"
+        if tp_hit:
+            return stats.compute_r(entry, sl, side, tp), "objetivo"
 
+        barras_transcurridas = i - idx_entrada
+        if config.USE_TIME_EXIT and barras_transcurridas >= limite_barras:
+            exit_price = vela["close"]
+            a_favor = (exit_price > entry) if side == "BUY" else (exit_price < entry)
+            if config.TIME_EXIT_ONLY_LOSING and a_favor:
+                continue  # va a favor: se deja correr, igual que en producción
+            return stats.compute_r(entry, sl, side, exit_price), "tiempo"
 
-def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame, trade_amount_usdt: float, fee_pct: float):
-    """Replica exactamente la decisión del bot en vivo: compra si no hay
-    posición y aparece special_buy; vende si hay posición y aparece sell_signal."""
-    trades = []
-    in_position = False
-    entry_price = None
-    entry_time = None
-
-    for i in range(len(signals)):
-        row = signals.iloc[i]
-        ts = df["datetime"].iloc[i]
-        if not in_position and bool(row["special_buy"]):
-            in_position = True
-            entry_price = float(row["close"])
-            entry_time = ts
-        elif in_position and bool(row["sell_signal"]):
-            exit_price = float(row["close"])
-            gross_return = exit_price / entry_price - 1
-            net_return = gross_return - 2 * (fee_pct / 100)  # comisión de entrada + salida
-            pnl_usdt = trade_amount_usdt * net_return
-            trades.append(
-                {
-                    "entry_time": entry_time,
-                    "exit_time": ts,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "return_pct": net_return * 100,
-                    "pnl_usdt": pnl_usdt,
-                }
-            )
-            in_position = False
-            entry_price = None
-            entry_time = None
-
-    open_position = {"entry_time": entry_time, "entry_price": entry_price} if in_position else None
-    return trades, open_position
+    return None, "sin_datos"
 
 
-def print_report(trades, open_position, trade_amount_usdt, symbol, timeframe, days):
-    print("=" * 66)
-    print(f"BACKTEST: {symbol} | {timeframe} | últimos {days} días | {trade_amount_usdt} USDT/operación")
-    print("=" * 66)
+async def backtest_symbol(
+    api: BingX, symbol: str, total_velas: int, con_rsi: bool, con_ruptura: bool
+) -> list[dict]:
+    log.info("%s: descargando %d velas de %s...", symbol, total_velas, config.TIMEFRAME)
+    candles = await api.klines_history(symbol, config.TIMEFRAME, total_velas)
+    log.info("%s: %d velas descargadas", symbol, len(candles))
 
-    if not trades:
-        print("\nNo se generó ninguna operación completa en el periodo analizado.")
-    else:
-        n = len(trades)
-        wins = [t for t in trades if t["pnl_usdt"] > 0]
-        losses = [t for t in trades if t["pnl_usdt"] <= 0]
-        total_pnl = sum(t["pnl_usdt"] for t in trades)
-        win_rate = len(wins) / n * 100
+    resultados: list[dict] = []
+    ventana_minima = max(config.MA_LEN, config.ATR_LEN) + config.MAX_BARS_STRETCH + 20
 
-        equity, peak, max_dd = 0.0, 0.0, 0.0
-        for t in trades:
-            equity += t["pnl_usdt"]
-            peak = max(peak, equity)
-            max_dd = max(max_dd, peak - equity)
+    for i in range(ventana_minima, len(candles) - 1):
+        # Ventana acotada a lo último, igual que ve el bot real cada
+        # ciclo (limit=300) — sin esto cada llamada recalcularía sobre
+        # TODO el historial acumulado y el backtest sería O(n²).
+        ventana = candles[max(0, i + 2 - VENTANA_VIVA) : i + 2]
+        sig, _motivo = strategy.evaluate(symbol, ventana)
+        if sig is None:
+            continue
 
-        print(f"\nOperaciones completas: {n}")
-        print(f"Ganadoras: {len(wins)} ({win_rate:.1f}%)  |  Perdedoras: {len(losses)}")
-        print(f"Resultado neto total: {total_pnl:+.2f} USDT  ({total_pnl / trade_amount_usdt * 100:+.2f}% acumulado sobre {trade_amount_usdt} USDT por operación)")
-        if wins:
-            print(f"Ganancia media: {sum(t['pnl_usdt'] for t in wins) / len(wins):+.2f} USDT")
-        if losses:
-            print(f"Pérdida media: {sum(t['pnl_usdt'] for t in losses) / len(losses):+.2f} USDT")
-        print(f"Máximo drawdown (sobre la curva de resultados acumulados): {max_dd:.2f} USDT")
+        rsi_ok = None
+        if con_rsi:
+            rsi_result = rsi_confirm.evaluate(ventana)
+            rsi_ok = rsi_confirm.confirms(sig.side, rsi_result)
 
-        print(f"\n{'Entrada (UTC)':<18}{'Salida (UTC)':<18}{'Precio in':<12}{'Precio out':<12}{'%':<9}{'USDT'}")
-        for t in trades:
-            print(
-                f"{str(t['entry_time'])[:16]:<18}{str(t['exit_time'])[:16]:<18}"
-                f"{t['entry_price']:<12.4f}{t['exit_price']:<12.4f}{t['return_pct']:+.2f}%   {t['pnl_usdt']:+.2f}"
-            )
+        breakout_ok = None
+        if con_ruptura:
+            breakout_result = breakout_fail.evaluate(ventana)
+            breakout_ok = breakout_fail.confirms(sig.side, breakout_result)
 
-    if open_position:
-        print(
-            f"\n⚠️  Posición todavía abierta al final del periodo "
-            f"(entrada: {open_position['entry_price']} el {open_position['entry_time']}) "
-            f"— no se cuenta en las estadísticas anteriores."
+        r, razon = simular_salida(candles, i, sig)
+        if r is None:
+            continue
+
+        resultados.append(
+            {
+                "symbol": symbol,
+                "side": sig.side,
+                "r": r,
+                "razon": razon,
+                "rsi_confirma": rsi_ok,
+                "breakout_confirma": breakout_ok,
+            }
         )
 
-    print("\n" + "=" * 66)
-    print("Esto es una simulación histórica sobre datos pasados. NO garantiza")
-    print("resultados futuros ni tiene en cuenta slippage, huecos de liquidez")
-    print("o rechazos de órdenes que sí pueden ocurrir en real.")
-    print("=" * 66)
+    log.info("%s: %d señales resueltas", symbol, len(resultados))
+    return resultados
 
 
-def main():
-    args = parse_args()
-    df = fetch_history(args.symbol, args.timeframe, args.days)
-    signals = compute_signals(
-        df,
-        rsi_length=args.rsi_length,
-        signal_length=args.signal_length,
-        trigger_level=args.trigger_level,
-        target_cross_count=args.target_cross_count,
-        atr_period=args.atr_period,
-        st_factor=args.st_factor,
-    )
-    trades, open_position = simulate_trades(df, signals, args.trade_amount, args.fee_pct)
-    print_report(trades, open_position, args.trade_amount, args.symbol, args.timeframe, args.days)
+def informe(resultados: list[dict]) -> str:
+    if not resultados:
+        return "Sin señales detectadas en el historial pedido — o el símbolo no cumple el filtro de amplitud casi nunca en ese periodo, o hace falta más historial."
 
-    if args.output and trades:
-        pd.DataFrame(trades).to_csv(args.output, index=False)
-        print(f"\nDetalle de operaciones guardado en: {args.output}")
+    partes = [f"📈 <b>Backtest</b> — {len(resultados)} señales resueltas\n"]
+    partes.append(stats.format_report({"Todas": [t["r"] for t in resultados]}))
+
+    con_rsi = [t["r"] for t in resultados if t.get("rsi_confirma") is True]
+    sin_rsi = [t["r"] for t in resultados if t.get("rsi_confirma") is False]
+    if con_rsi and sin_rsi:
+        partes.append(stats.format_report({"RSI confirma": con_rsi, "RSI no confirma": sin_rsi}))
+
+    con_break = [t["r"] for t in resultados if t.get("breakout_confirma") is True]
+    sin_break = [t["r"] for t in resultados if t.get("breakout_confirma") is False]
+    if con_break and sin_break:
+        partes.append(stats.format_report({"Ruptura fallida confirma": con_break, "No confirma": sin_break}))
+
+    por_simbolo: dict[str, list[float]] = {}
+    for t in resultados:
+        por_simbolo.setdefault(t["symbol"], []).append(t["r"])
+    if len(por_simbolo) > 1:
+        partes.append(stats.format_report(por_simbolo))
+
+    return "\n\n".join(partes)
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Backtest histórico del bot de reversión")
+    parser.add_argument("symbols", nargs="+", help="Símbolos BingX, p.ej. CATE-USDT")
+    parser.add_argument("--dias", type=int, default=30, help="Días de historial a descargar (por defecto 30)")
+    parser.add_argument("--sin-rsi", action="store_true", help="No calcular la confirmación RSI (más rápido)")
+    parser.add_argument("--sin-ruptura", action="store_true", help="No calcular la ruptura fallida (más rápido)")
+    args = parser.parse_args()
+
+    minutos_vela = config.MINUTOS_POR_VELA.get(config.TIMEFRAME, 5)
+    velas_por_dia = 24 * 60 // minutos_vela
+    total_velas = args.dias * velas_por_dia
+
+    async with httpx.AsyncClient() as client:
+        api = BingX(client)
+        todos_resultados: list[dict] = []
+        for symbol in args.symbols:
+            try:
+                r = await backtest_symbol(
+                    api, symbol.upper(), total_velas,
+                    con_rsi=not args.sin_rsi, con_ruptura=not args.sin_ruptura,
+                )
+                todos_resultados.extend(r)
+            except Exception as exc:  # noqa: BLE001
+                log.error("%s: fallo en el backtest (%s)", symbol, exc)
+
+    print()
+    print(informe(todos_resultados))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        sys.exit(1)
+    asyncio.run(main())
