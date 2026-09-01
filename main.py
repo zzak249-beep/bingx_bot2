@@ -25,8 +25,8 @@ import xsection
 import strategy
 import liquidations
 import rsi_confirm
-import breakout_fail
-import oi_confirm
+import wyckoff
+import momentum
 import score as scoring
 import stats
 from bingx import BingX, BingXError
@@ -55,8 +55,6 @@ def fmt_signal(
     rsi_result: "rsi_confirm.RsiConfirm | None" = None,
     bias30m: str | None = None,
     score: "scoring.EntryScore | None" = None,
-    breakout_result: "breakout_fail.BreakoutFailResult | None" = None,
-    oi_quadrant: "oi_confirm.OIQuadrant | None" = None,
 ) -> str:
     lado = "LARGO" if sig.side == "BUY" else "CORTO"
     cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
@@ -81,23 +79,35 @@ def fmt_signal(
             )
         else:
             texto += f"\n📉 RSI sin confirmar (RSI {rsi_result.rsi_actual:.0f}) — solo informativo"
-    if breakout_fail.confirms(sig.side, breakout_result):
-        texto += (
-            f"\n🧱 Ruptura fallida hace {breakout_result.velas_desde_fallo} vela(s) "
-            f"en <code>{breakout_result.nivel:.8g}</code> "
-            f"({breakout_result.distancia_atr:+.2f} ATR antes de fallar)"
-        )
-    if oi_confirm.confirms(sig.side, oi_quadrant):
-        texto += (
-            f"\n📊 OI confirma: liquidación de largos "
-            f"(precio {oi_quadrant.precio_pct:+.1f}%, OI {oi_quadrant.oi_pct:+.1f}% "
-            f"en {config.OI_WINDOW_MIN} min)"
-        )
     if bias30m and bias30m != "NEUTRAL":
         texto += f"\n🧭 A favor de la tendencia de 30m ({bias30m.lower()})"
     if score is not None:
         texto += f"\n🎯 {scoring.format_breakdown(score)}"
     return texto
+
+
+# AUDITORÍA: helper nuevo para el fix del bug #4 (check_time_exits usaba la
+# vela previa al cierre en vez del fill real). Igual que position_amt() en
+# bingx.py: se prueban varios nombres de campo plausibles porque no hay
+# forma de confirmar aquí cuál usa BingX exactamente; si ninguno aparece,
+# devuelve None y quien llama sigue cayendo al comportamiento anterior
+# (la vela previa), así que esto nunca puede dejar exit_price sin valor.
+_FILL_PRICE_FIELDS = ("avgPrice", "averagePrice", "avgFillPrice", "fillPrice", "price", "executedPrice")
+
+
+def _extract_fill_price(order_response: dict) -> float | None:
+    if not isinstance(order_response, dict):
+        return None
+    for field in _FILL_PRICE_FIELDS:
+        val = order_response.get(field)
+        if val not in (None, "", 0, "0"):
+            try:
+                price = float(val)
+                if price > 0:
+                    return price
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 class Bot:
@@ -115,8 +125,6 @@ class Bot:
         self.last_rows: list = []
         self.last_heartbeat = time.time()
         self.liq = liquidations.LiquidationTracker() if config.LIQUIDATIONS_ENABLED else None
-        self.oi = oi_confirm.OpenInterestTracker() if config.OI_CONFIRM_ENABLED else None
-        self.last_oi_refresh = 0.0
         self.radar30 = scanner.Scanner(self.api, timeframe=config.RADAR30M_TIMEFRAME) if config.RADAR30M_ENABLED else None
         self.bias30m: dict[str, str] = {}
         self.last_radar30 = 0.0
@@ -144,7 +152,6 @@ class Bot:
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
                 await self.check_time_exits()
-                await self.maybe_refresh_oi()
                 await self.maybe_radar30m()
                 await self.maybe_rank()
                 await self.scan_once()
@@ -328,7 +335,7 @@ class Bot:
             log.warning("No se pudieron leer las posiciones: %s", exc)
             return
 
-        vivos = {str(p.get("symbol", "")) for p in posiciones if float(p.get("positionAmt", 0) or 0) != 0}
+        vivos = {str(p.get("symbol", "")) for p in posiciones if self.api.position_amt(p) != 0}
         for symbol, pos in list(abiertas.items()):
             if symbol in vivos:
                 continue
@@ -384,16 +391,30 @@ class Bot:
                     continue
 
             log.info("%s lleva %.0f min abierta: cierre por tiempo", symbol, edad / 60)
+            fill_price = None
             if self.live and pos.get("mode") != "SIGNAL":
                 try:
                     qty = float(pos.get("qty", 0))
                     if qty > 0:
-                        await self.api.close_position(symbol, pos["side"], qty)
+                        # AUDITORÍA: antes se cerraba con una orden de mercado
+                        # sin cancelar el SL/TP que quedó adjunto a la entrada.
+                        # Ese SL/TP puede seguir vivo en el exchange y disparar
+                        # más tarde sobre una posición que el bot ya cree
+                        # cerrada y olvidada — se cancela primero.
+                        try:
+                            await self.api.cancel_open_orders(symbol)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("%s: no se pudieron cancelar las órdenes SL/TP colgadas antes de cerrar por tiempo (%s)", symbol, exc)
+                        orden = await self.api.close_position(symbol, pos["side"], qty)
+                        # AUDITORÍA: antes se descartaba la respuesta y el R se
+                        # calculaba con la vela anterior al cierre, no con el
+                        # fill real — con el fill ya en la mano, se usa.
+                        fill_price = _extract_fill_price(orden)
                 except Exception as exc:  # noqa: BLE001
                     await self.tg.send(f"⚠️ No se pudo cerrar {symbol} por tiempo: {exc}")
                     continue
 
-            exit_price = ultimo if ultimo is not None else pos["entry"]
+            exit_price = fill_price if fill_price is not None else (ultimo if ultimo is not None else pos["entry"])
             r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], exit_price)
             await self.tg.send(
                 f"⏱️ <b>{symbol}</b> cerrada por tiempo tras {edad / 60:.0f} min "
@@ -452,36 +473,6 @@ class Bot:
                 )
                 self.register_close_r(symbol, pos, exit_price, reason=reason, mode="SIGNAL")
                 break
-
-    async def maybe_refresh_oi(self) -> None:
-        """
-        Sondea el Open Interest de TODO el universo cada
-        OI_POLL_INTERVAL_MIN, con el mismo semáforo de concurrencia que
-        usa scanner.Scanner — mil símbolos son mil llamadas, y esto es
-        una llamada MÁS por símbolo encima de las velas, así que hay
-        que respetar el mismo límite para no provocar 429.
-
-        Corre en background, sin generar avisos propios: solo alimenta
-        el historial que oi_confirm.OpenInterestTracker necesita para
-        poder comparar "OI ahora" contra "OI hace OI_WINDOW_MIN".
-        """
-        if not self.oi:
-            return
-        if time.time() - self.last_oi_refresh < config.OI_POLL_INTERVAL_MIN * 60:
-            return
-        self.last_oi_refresh = time.time()
-
-        sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
-
-        async def _uno(sym: str) -> None:
-            async with sem:
-                try:
-                    valor = await self.api.open_interest(sym)
-                    self.oi.add_snapshot(sym, valor)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("%s: no se pudo leer OI (%s)", sym, exc)
-
-        await asyncio.gather(*(_uno(s) for s in self.symbols))
 
     async def maybe_radar30m(self) -> None:
         """
@@ -575,6 +566,7 @@ class Bot:
             return
 
         con_amplitud = 0
+        con_amplitud_momentum = 0
         for sym in self._priority_order():
             try:
                 velas = await self.api.klines(sym, config.TIMEFRAME, limit=300)
@@ -583,8 +575,22 @@ class Bot:
                 continue
 
             sig, motivo = strategy.evaluate(sym, velas)
+            motor = "reversion"
             if not motivo.startswith("sin amplitud"):
                 con_amplitud += 1
+
+            # MOMENTUM (Qullamaggie): módulo aparte, filosofía opuesta a
+            # la reversión — solo se prueba si reversión NO dio señal,
+            # y solo si está activado explícitamente (MOMENTUM_ENABLED).
+            # Con el flag apagado (por defecto) esta rama nunca se toca
+            # y el comportamiento es exactamente el de antes.
+            if sig is None and momentum.ENABLED:
+                sig, motivo_m = momentum.evaluate(sym, velas, cost_roundtrip_pct=config.COST_ROUNDTRIP_PCT)
+                if sig is not None:
+                    motor = "momentum"
+                    motivo = motivo_m
+                    con_amplitud_momentum += 1
+
             if sig is None:
                 log.debug("%s: %s", sym, motivo)
                 continue
@@ -598,8 +604,22 @@ class Bot:
             # principal fuente de pérdidas: largos a contra-tendencia
             # en mercado bajista. Esto sigue siendo un bloqueo DURO,
             # no algo que el score pueda compensar sumando puntos.
+            #
+            # Para MOMENTUM la lógica de Qullamaggie es la contraria:
+            # se busca ir CON la tendencia, no solo "no en contra". Por
+            # defecto se mantiene la misma regla laxa (no bloquear en
+            # NEUTRAL) para no repetir el error de un filtro nuevo
+            # demasiado estricto sin datos detrás — MOMENTUM_REQUIRE_30M_ALIGNMENT=true
+            # activa la versión estricta (exige ALCISTA para largos,
+            # BAJISTA para cortos) para quien prefiera esperar esa
+            # confirmación aunque dispare menos señales.
             bias = self.bias30m.get(sym, "NEUTRAL")
-            if (bias == "BAJISTA" and sig.side == "BUY") or (bias == "ALCISTA" and sig.side == "SELL"):
+            if motor == "momentum" and momentum.REQUIRE_30M_ALIGNMENT:
+                alineado = (bias == "ALCISTA" and sig.side == "BUY") or (bias == "BAJISTA" and sig.side == "SELL")
+                if not alineado:
+                    log.info("%s: momentum %s sin alineación de 30m (%s) — descartada", sym, sig.side, bias)
+                    continue
+            elif (bias == "BAJISTA" and sig.side == "BUY") or (bias == "ALCISTA" and sig.side == "SELL"):
                 log.info("%s: señal %s bloqueada — contra-tendencia de 30m (%s)", sym, sig.side, bias)
                 continue
 
@@ -619,35 +639,15 @@ class Bot:
                     log.info("%s: señal %s sin confirmar por RSI — descartada", sym, sig.side)
                     continue
 
+            # Estructura Wyckoff (spring/upthrust + climax de volumen),
+            # también sobre las mismas velas. Nunca bloquea por sí sola
+            # (ver wyckoff.py) — solo suma al score.
+            wyckoff_result = wyckoff.evaluate(velas)
+
             cascade = self.liq.cascade_status(sym) if self.liq else None
 
-            breakout_result = breakout_fail.evaluate(
-                velas,
-                structure_len=config.BREAKOUT_STRUCTURE_LEN,
-                min_break_atr=config.BREAKOUT_MIN_ATR,
-                failure_bars=config.BREAKOUT_FAILURE_BARS,
-                failure_atr=config.BREAKOUT_FAILURE_ATR,
-                failure_confirm_closes=config.BREAKOUT_FAILURE_CLOSES,
-                ventana=config.BREAKOUT_CONFIRM_BARS,
-            ) if config.BREAKOUT_FAIL_ENABLED else None
-
-            oi_quadrant = None
-            if self.oi:
-                # Variación % del precio en la MISMA ventana que
-                # oi_confirm usa para el OI — se calcula aquí, con las
-                # velas ya descargadas, en vez de mantener una segunda
-                # fuente de precio dentro de oi_confirm.py.
-                cerradas = velas[:-1]
-                velas_atras = config.bars_for_minutes(config.OI_WINDOW_MIN)
-                if len(cerradas) > velas_atras and cerradas[-1 - velas_atras]["close"] > 0:
-                    precio_pct = (
-                        (cerradas[-1]["close"] - cerradas[-1 - velas_atras]["close"])
-                        / cerradas[-1 - velas_atras]["close"] * 100.0
-                    )
-                    oi_quadrant = self.oi.quadrant(sym, precio_pct)
-
             score_result = (
-                scoring.compute(sig, rsi_result, cascade, bias, breakout_result, oi_quadrant)
+                scoring.compute(sig, rsi_result, cascade, bias, wyckoff_result=wyckoff_result)
                 if config.SCORE_ENABLED else None
             )
             if score_result and config.SCORE_MIN > 0 and score_result.total < config.SCORE_MIN:
@@ -657,19 +657,18 @@ class Bot:
                 )
                 continue
 
-            await self.handle_signal(
-                sig, rsi_result=rsi_result, bias30m=bias, cascade=cascade,
-                score=score_result, breakout_result=breakout_result, oi_quadrant=oi_quadrant,
-            )
+            log.info("%s: señal %s vía %s — %s", sym, sig.side, motor, motivo)
+            await self.handle_signal(sig, rsi_result=rsi_result, bias30m=bias, cascade=cascade, score=score_result)
             abiertas += 1
             if abiertas >= config.MAX_CONCURRENT:
                 break
             await asyncio.sleep(0.2)  # respiro entre llamadas
 
         log.info(
-            "Ciclo completo · %d símbolos, %d con amplitud suficiente",
+            "Ciclo completo · %d símbolos, %d con amplitud suficiente (reversión), %d señales de momentum",
             len(self.symbols),
             con_amplitud,
+            con_amplitud_momentum,
         )
 
     async def handle_signal(
@@ -679,8 +678,6 @@ class Bot:
         bias30m: str | None = None,
         cascade: dict | None = None,
         score: "scoring.EntryScore | None" = None,
-        breakout_result: "breakout_fail.BreakoutFailResult | None" = None,
-        oi_quadrant: "oi_confirm.OIQuadrant | None" = None,
     ) -> None:
         log.info(
             "SEÑAL %s %s entrada=%.8g sl=%.8g tp=%.8g rr=%.2f atr=%.2f%%%s",
@@ -690,11 +687,7 @@ class Bot:
 
         if not self.live:
             await self.tg.send(
-                fmt_signal(
-                    sig, live=False, cascade=cascade, rsi_result=rsi_result,
-                    bias30m=bias30m, score=score, breakout_result=breakout_result,
-                    oi_quadrant=oi_quadrant,
-                )
+                fmt_signal(sig, live=False, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m, score=score)
             )
             self.state.data.setdefault("open", {})[sig.symbol] = {
                 "mode": "SIGNAL",
@@ -732,8 +725,7 @@ class Bot:
             try:
                 vivas = await self.api.open_positions()
                 if any(
-                    str(p.get("symbol")) == sig.symbol
-                    and float(p.get("positionAmt", 0) or 0) != 0
+                    str(p.get("symbol")) == sig.symbol and self.api.position_amt(p) != 0
                     for p in vivas
                 ):
                     log.warning("%s ya tiene posición en el exchange: no se abre otra", sig.symbol)
@@ -772,11 +764,7 @@ class Bot:
             "score": score.total if score else None,
         }
         self.state.save()
-        await self.tg.send(fmt_signal(
-            sig, live=True, cascade=cascade, rsi_result=rsi_result,
-            bias30m=bias30m, score=score, breakout_result=breakout_result,
-            oi_quadrant=oi_quadrant,
-        ))
+        await self.tg.send(fmt_signal(sig, live=True, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m, score=score))
 
     def register_close_r(self, symbol: str, pos: dict, exit_price: float, reason: str, mode: str) -> None:
         """
