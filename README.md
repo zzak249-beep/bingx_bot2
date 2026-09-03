@@ -1,354 +1,263 @@
-# Wavelet MRA Haar Bot — BingX / Railway / Telegram
+## ⚠️ 0. IMPRESCINDIBLE antes de usar dinero real: Volume persistente en Railway
 
-A Python port of the `WMRA-H-5m` Pine Script strategy: a Haar multiresolution
-"trend vs. noise" regime filter that gates a price/SMA(8) crossover, with
-ATR-based stop-loss/take-profit, an optional trailing stop, a daily loss
-circuit breaker, and an optional second exit-only indicator. It scans a
-configurable universe of symbols — one, a list, or every active BingX
-USDT-M perpetual — under a shared, portfolio-wide concurrent-position cap,
-and can run in three modes (Telegram-only signals, paper trading, or live
-orders on BingX) controlled by two environment variables.
+Por defecto Railway **borra el disco del contenedor en cada redeploy**. Si
+`state.json` vive en el disco normal del contenedor (como está por defecto),
+cada vez que cambies una variable o subas un cambio, el bot **olvida** qué
+posiciones tenía abiertas y reinicia el circuit breaker a cero. Esto puede
+hacer que abra más posiciones de las que crees que tiene permitidas.
 
-## Read this before you turn on live trading
+**Antes de poner `AUTO_TRADE=true` con dinero real:**
+1. Railway → tu servicio → pestaña **Volumes** → *New Volume*.
+2. Móntalo en `/data` (o la ruta que prefieras).
+3. En Variables, pon `STATE_FILE=/data/state.json`.
+4. Redeploy una vez con esto ya puesto, y verifica con `/status` que el
+   estado sobrevive a un redeploy manual de prueba.
 
-**Where this strategy came from:** a Twitter/X thread offering a "free"
-wavelet trading bot setup that claimed turning \$80 into \$4,900 in 38 days
-(71% win rate, Sharpe 2.44) — gated behind liking, following, and DMing a
-keyword. That pattern (unverifiable returns + engagement-gated "proof") is
-a standard growth-hacking format on trading Twitter, and it's not evidence
-the strategy is actually profitable live. Treat those specific numbers as
-unverified marketing, not a track record.
+Independientemente de esto, el bot ya trae un tope de seguridad absoluto
+(`HARD_MAX_TOTAL_POSITIONS`, por defecto 5) que se comprueba contra las
+posiciones **reales** en BingX, no contra el JSON local — así que aunque el
+estado se pierda, el bot no puede abrir un número descontrolado de
+posiciones. Pero el Volume sigue siendo necesario para que el circuit
+breaker y el cooldown de señales funcionen bien entre reinicios.
 
-**What the code actually is:** a legitimate, well-worn signal-processing
-technique — comparing energy at fast vs. slow moving-average scales to
-detect trending vs. choppy regimes — wearing wavelet vocabulary. It is
-*not* the orthogonal Daubechies wavelet transform the original thread's
-video was about. That doesn't make it useless, but it means "wavelets" in
-the name isn't doing the heavy lifting you might assume.
+## 0b. Verificación de SL/TP tras cada entrada
 
-**What that means practically:**
-- Nothing here is financial advice, and this isn't a system either of us
-  has a live track record for. Backtest and paper-trade it yourself on
-  the pair and timeframe you actually intend to run before risking money.
-- The default config uses 3x leverage; the original script defaulted to
-  10x. Leverage multiplies losses as fast as gains, and a 5-minute crypto
-  timeframe can move a lot between polls. Only increase leverage once
-  you've watched the strategy's real behavior, not the thread's numbers.
-- An unattended bot fails differently than a human watching a chart — it
-  can hold a leveraged position through an outage, a bad fill, or an
-  exchange API hiccup. This code has retries, a kill switch, and explicit
-  alerts when something can't be verified, but no amount of error
-  handling makes leveraged perpetual futures low-risk.
-- Start in signal-only or paper mode. Stay there longer than feels
-  necessary.
+Si BingX rechaza en silencio el `stopLoss`/`takeProfit` embebido en la orden
+(pasa con algunos símbolos, sobre todo alts ilíquidos), la posición quedaría
+abierta sin protección y no se cerraría nunca sola — es lo que parece haber
+pasado si viste posiciones acumulándose sin cerrarse. Ahora, justo después
+de abrir cada orden, el bot llama a `bx.has_stop_and_take_profit(symbol)`:
+si no encuentra las órdenes condicionales de SL y TP abiertas, **cierra la
+posición inmediatamente** con una orden de mercado y te avisa por Telegram,
+en vez de dejarla huérfana.
 
-## The three modes
+# Wavelet MRA Haar 5m — Bot BingX + Telegram (sin TradingView de pago)
 
-Controlled entirely by whether `BINGX_API_KEY`/`BINGX_API_SECRET` are set
-and what `DRY_RUN` is:
+Bot que calcula la señal wavelet **él solo**, leyendo velas de BingX cada 5
+minutos — no necesitas plan de pago de TradingView. Según configuración:
 
-| Mode | API keys set? | `DRY_RUN` | What happens |
-|---|---|---|---|
-| **Signal-only** | No | (irrelevant) | Fetches real public market data, computes real signals, pushes them to Telegram. Never touches your BingX account. Good for pure manual trading. |
-| **Paper** | Yes | `true` (default) | Same as above, but also reads your real balance so position-sizing math is realistic — still never places an order. |
-| **Live** | Yes | `false` | Places real market entries and STOP_MARKET/TAKE_PROFIT_MARKET exits on your BingX account. |
+- **Modo manual** (`AUTO_TRADE=false`, por defecto): solo manda la señal a
+  Telegram con precio, SL y TP para que operes tú.
+- **Modo automático** (`AUTO_TRADE=true`): además ejecuta la orden en BingX
+  (perpetual swap, modo hedge) con sizing por riesgo, circuit breaker y
+  reconciliación de posiciones al arrancar y periódica.
 
-The bot refuses to start in a half-configured state (`DRY_RUN=false` with
-missing keys raises a config error immediately, rather than silently
-falling back to paper mode).
+Sigue existiendo el modo `SIGNAL_SOURCE=tradingview` con el webhook original
+por si en el futuro quieres pasar a Essential y usar tu Pine Script tal cual
+— ver la sección 6.
 
-## Scanning multiple symbols
+Ver `RESEARCH.md` para el análisis matemático de la estrategia: qué es
+realmente (y qué no) el filtro "wavelet", y bajo qué condiciones tiene
+alguna ventaja real.
 
-`SYMBOL_UNIVERSE` controls what gets scanned each cycle:
-
-- `all` — every active USDT-M perpetual swap on BingX, fetched live at
-  startup via the exchange's own market list (optionally narrowed by
-  `MIN_24H_VOLUME_USDT` and `SYMBOL_EXCLUDE`).
-- A comma-separated list — `BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT`.
-  One symbol is just a list of one. (`SYMBOL` still works as a fallback
-  for anyone upgrading from the earlier single-symbol version.)
-
-Each cycle fetches account-wide equity and **every** open position in two
-calls, then walks the universe in order: check any open position for a
-sweep-exit trigger, check trailing, and — only if the symbol is flat —
-evaluate the wavelet entry condition. The resolved universe and a
-per-cycle summary (symbols scanned, new entries, open positions, errors)
-are logged every cycle; check the Railway Deploy Logs after your first
-run to confirm the universe looks like what you expected — this specific
-code path (querying BingX's live market list) hasn't been exercised
-against the real API from where this was built, only unit-tested against
-a mocked structure, for the same sandbox-networking reason noted in
-Known Limitations.
-
-**`MAX_CONCURRENT_POSITIONS` is the important number here.** With one
-symbol, a concurrent-position cap is irrelevant — there's only ever one
-position possible. With `SYMBOL_UNIVERSE=all`, many symbols can trend
-into a signal in the same cycle (crypto pairs are often correlated, so
-this happens more than you'd think), and without a cap, a broad market
-move could open far more leveraged positions at once than intended. This
-cap is enforced **live across the whole scan**, not against a stale count
-from the start of the cycle — if 40 symbols fire in one pass and the cap
-is 3, exactly 3 get orders and the rest get a Telegram alert saying why
-they didn't. (Verified directly: see
-`tests/test_portfolio_strategy.py::test_concurrent_position_cap_holds_within_one_scan`,
-which fires 5 symbols simultaneously against caps of 1, 2, and 5 and
-checks the exact count of orders placed each time.)
-
-The number that actually matters for sizing your risk is the worst case
-these three settings imply together:
+## Estructura
 
 ```
-worst-case notional exposure ≈ MAX_CONCURRENT_POSITIONS × (QTY_PCT / 100) × LEVERAGE
-```
-
-At `MAX_CONCURRENT_POSITIONS=3`, `QTY_PCT=10`, `LEVERAGE=10` — this
-config's live-mode defaults below — that's **up to 3x account equity in
-notional exposure** if all three slots fill, before anything has moved
-against you. That's not a hedge on my part, it's the arithmetic this
-specific config implies; the three numbers are worth sizing together
-deliberately rather than tuning one in isolation. `MAX_DAILY_LOSS_PCT`
-(the kill switch) is account-wide and applies on top of this regardless
-of how many symbols are open.
-
-**Cycle time is real and scales with universe size.** BingX's rate limit
-as configured in ccxt gives a floor of about 100ms between requests, so a
-full scan of N symbols has a floor of roughly `N × 0.1s` before actual
-network latency — a few hundred symbols means the floor alone is
-30-40 seconds, and realistic round-trip time on top of that typically
-puts a genuinely "all symbols" scan in the range of a few minutes, not
-seconds. `POLL_SECONDS` is the wait *after* a scan finishes, not a
-guaranteed cycle length — actual cycle time is scan time + `POLL_SECONDS`,
-and the bot logs actual scan duration every cycle so you can see the real
-number rather than guess it. Set `MIN_24H_VOLUME_USDT` if you'd rather
-have a smaller, faster-cycling universe than the full exchange.
-
-
-
-```
-wavelet-mra-bot/
-├── main.py                    # entrypoint: wires everything, runs the poll loop
-├── bot/
-│   ├── config.py               # env var loading + validation
-│   ├── wavelet.py               # the entry indicator math (ported from Pine)
-│   ├── sweep_reversal.py        # the exit-trigger indicator (see below)
-│   ├── exchange.py              # ccxt/BingX wrapper: data, positions, orders, SL/TP
-│   ├── strategy.py              # PortfolioStrategy: scans the symbol universe each cycle
-│   ├── risk.py                   # SL/TP calc + daily kill switch
-│   ├── telegram_notify.py        # push notifications
-│   └── logger.py                  # stdout logging setup
-├── tests/
-│   ├── test_wavelet.py               # unit tests, incl. a no-lookahead check
-│   ├── test_sweep_reversal.py        # same, for the sweep-reversal port
-│   └── test_portfolio_strategy.py    # concurrent-position cap under simultaneous signals
+wavelet_bot/
+├── main.py               # servidor Flask: health, webhook opcional, arranque del scheduler
+├── signal_engine.py       # cálculo de la señal wavelet en Python (pandas) sobre velas de BingX
+├── poller.py              # scheduler: genera señales cada 5m + reconcilia cierres por SL/TP
+├── bingx_client.py        # cliente REST BingX swap v2/v3 (HMAC + klines públicas + income)
+├── telegram_notifier.py   # envío de mensajes a Telegram
+├── state_manager.py       # persistencia JSON + reconciliación + circuit breaker + cooldown
+├── config.py              # lee todo de variables de entorno
+├── pinescript/
+│   └── wavelet_mra_haar_5m.pine   # estrategia Pine v6 original (solo si usas TradingView)
+├── tests/                 # 44 tests (pytest), todo mockeado, sin tocar red real
 ├── requirements.txt
+├── Procfile
+├── railway.json
 ├── .env.example
-├── Procfile / railway.toml     # Railway deployment
-└── .python-version
+└── RESEARCH.md
 ```
 
-## The sweep-reversal exit filter (optional)
-
-`bot/sweep_reversal.py` ports a second indicator you shared separately —
-"Sweep Reversal Map [Herman]" — an ICT-style liquidity-sweep-and-structure-break
-detector. **Read this before enabling it:**
-
-- **Only the bearish half of that script was ever shared in this
-  conversation.** The bullish half in this repo is a *reconstructed
-  mirror*, inferred from the parallel `bullish*` variables the original
-  script already declares but whose actual code was never provided. It
-  has not been checked against the real thing. `bot/sweep_reversal.py`'s
-  docstring has the full detail.
-- It's wired in as an **exit trigger only** — when a position opened by
-  the wavelet system is open and this indicator confirms a reversal
-  *against* it, that's a second, independent signal that momentum may be
-  turning, worth surfacing. It is **never used to gate a new entry**:
-  entries stay decided entirely by the wavelet regime filter. The two
-  indicators test for different things (continuation vs. reversal), and
-  requiring both to agree for an entry would likely just starve the
-  system of trades rather than improve it — see `SWEEP_EXIT_ACTION` below
-  for what it does instead.
-- **Off by default** (`USE_SWEEP_EXIT_FILTER=false`). When enabled, it
-  additionally defaults to the least invasive response
-  (`SWEEP_EXIT_ACTION=alert_only` — Telegram only, no order sent).
-
-Three response modes, set via `SWEEP_EXIT_ACTION`:
-
-| Value | What happens |
-|---|---|
-| `alert_only` (default) | Telegram alert; no exchange call |
-| `tighten_stop` | Moves the stop-loss to breakeven (entry price) |
-| `close_position` | Closes the position immediately with a market order |
-
-Both halves of the port (bearish-as-shown and bullish-mirror) share one
-generic state-machine implementation (`_scan()` in `sweep_reversal.py`),
-so if you get the real bullish code later, patching it in should be a
-small diff rather than a rewrite.
-
-## Local setup
+## 1. Subir a GitHub
 
 ```bash
-git clone <your-new-repo-url>
-cd wavelet-mra-bot
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# edit .env — at minimum add your Telegram token/chat id to see signals
-
-python main.py
-```
-
-With no BingX keys set, it runs in signal-only mode immediately — a
-reasonable first thing to do before creating any exchange keys at all.
-
-## Setting up BingX API keys
-
-1. BingX → API Management → Create API Key.
-2. Enable **Perpetual Futures Trading** on the key. This is the single
-   most common setup mistake: a key without this permission authenticates
-   fine for reading data and then fails on order placement with an
-   authorization error (code 100004).
-3. Do **not** enable withdrawal permission on this key — the bot never
-   needs it, and leaving it off limits the blast radius if the key ever
-   leaks.
-4. Optionally restrict the key to your server's IP once you know it
-   (Railway's outbound IP — check your service's network settings).
-5. Put the key/secret in `.env` locally or in Railway's Variables tab —
-   never commit them (`.env` is already in `.gitignore`).
-
-BingX also offers **Demo Trading** (VST — virtual USDT) as an additional,
-separate practice account with its own balance, reachable from the normal
-BingX UI. It's a good extra layer to sanity-check order behavior with,
-independent of this bot's own `DRY_RUN` simulation. Wiring this bot
-directly to BingX's demo endpoint isn't included here — the demo
-environment isn't a standard sandbox flag, and integrating it well
-deserves its own testing rather than an unverified guess. `DRY_RUN=true`
-gives you the safety guarantee; BingX's own demo account gives you a
-second, independent way to test order mechanics if you want it.
-
-## Setting up Telegram
-
-1. Message **@BotFather** on Telegram → `/newbot` → follow the prompts →
-   copy the token into `TELEGRAM_BOT_TOKEN`.
-2. Send any message to your new bot.
-3. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a
-   browser and copy the `"chat":{"id": ...}` number into
-   `TELEGRAM_CHAT_ID`. (For a channel instead of a DM: add the bot as
-   admin and use the channel's negative chat id.)
-
-## Pushing to GitHub
-
-```bash
-cd wavelet-mra-bot
+cd wavelet_bot
 git init
 git add .
-git commit -m "Initial commit: wavelet MRA Haar bot"
-```
-
-Create a new **empty** repo on GitHub (no README/license, so there's no
-merge conflict), then:
-
-```bash
-git remote add origin https://github.com/<you>/<repo-name>.git
+git commit -m "Wavelet MRA Haar 5m bot — señal en Python, sin TradingView de pago"
 git branch -M main
+git remote add origin git@github.com:<tu-usuario>/wavelet-mra-bot.git
 git push -u origin main
 ```
 
-Double-check `.env` did **not** get committed (`git status` before your
-first commit, or `git log --all --full-history -- .env` after) — it's
-covered by `.gitignore`, but it's worth verifying once.
+`.env` y `state.json` están en `.gitignore` — nunca subas tus claves.
 
-## Deploying to Railway
+## 2. Desplegar en Railway
 
-1. Railway dashboard → **New Project** → **Deploy from GitHub repo** →
-   select the repo you just pushed.
-2. Open the service → **Variables** tab → add every variable from
-   `.env.example` with your real values (keep `DRY_RUN=true` for the
-   first deploy).
-3. Open **Settings** → confirm the **Start Command** is `python main.py`.
-   Railway usually picks this up from the `Procfile`/`railway.toml`
-   automatically, but if the deploy log shows it looking for a `web`
-   process or failing to start, set the Start Command explicitly there —
-   this is a common enough Railway/Python friction point that it's worth
-   checking directly rather than assuming.
-4. This is a background worker, not a web server — it never binds
-   `$PORT`. If Railway's dashboard flags a health-check warning because
-   of that, that's expected for this kind of service; you can disable
-   health checks for it under Settings if you want the warning gone.
-5. Deploy, then check the **Deploy Logs** tab for the "🤖 Bot iniciado"
-   Telegram message and matching log line.
-6. Once you're satisfied with paper-mode behavior, flip `DRY_RUN` to
-   `false` in Variables (this triggers a redeploy) — and watch the first
-   few live signals closely.
+1. Railway → New Project → Deploy from GitHub repo → selecciona el repo.
+2. Railway detecta `Procfile`/`railway.json` automáticamente (Nixpacks + Python).
+3. En **Variables**, copia todo lo de `.env.example` y rellena:
+   - `BINGX_API_KEY` / `BINGX_API_SECRET` (API key de BingX con permisos de
+     **futuros/trading**, sin permiso de retiro). Pégalas con cuidado: un
+     salto de línea al final rompe la cabecera HTTP (el bot ya las limpia
+     solo con `.strip()`, pero mejor pegarlas bien).
+   - `TELEGRAM_BOT_TOKEN` (de @BotFather) y `TELEGRAM_CHAT_ID` (de @userinfobot
+     o tu chat con el bot).
+   - `WEBHOOK_SECRET`: genera uno con `openssl rand -hex 24` (solo hace
+     falta si algún día usas el webhook de TradingView; con `SIGNAL_SOURCE=python`
+     no se usa, pero déjalo puesto por si acaso).
+   - `SYMBOLS=BTC-USDT` (o varios separados por coma: `BTC-USDT,ETH-USDT`).
+   - Deja `AUTO_TRADE=false` la primera semana. Solo señales, cero riesgo.
+4. Deploy. Railway te da una URL tipo `https://tu-app.up.railway.app`.
+5. Prueba: `curl https://tu-app.up.railway.app/` debe devolver
+   `{"status":"ok","signal_source":"python","symbols":["BTC-USDT"],...}`.
+6. Comprueba que el motor de señales lee bien BingX (esto SÍ necesita que
+   Railway pueda salir a internet, cosa que ya hace):
+   ```bash
+   curl https://tu-app.up.railway.app/signal-check/BTC-USDT
+   ```
+   Debería devolver el JSON con `is_trending`, `long_cond`, `short_cond`,
+   `close`, `approx`, `atr`, etc. de la última vela cerrada.
 
-## Configuration reference
+## 3. Nada que configurar en TradingView
 
-See `.env.example` for the full list with defaults — it's the source of
-truth. The ones most worth understanding before going live:
+Con `SIGNAL_SOURCE=python` (por defecto) el bot ya no depende de alertas de
+TradingView para nada — calcula la señal él mismo cada 5 minutos con las
+velas públicas de BingX. Puedes seguir usando el Pine Script en TradingView
+solo como referencia visual si quieres, pero no hace falta ninguna alerta.
 
-| Variable | What it controls |
-|---|---|
-| `DRY_RUN` | Master safety switch — `true` never places real orders |
-| `SYMBOL_UNIVERSE` | `all`, or a comma-separated symbol list — what gets scanned each cycle |
-| `MAX_CONCURRENT_POSITIONS` | Portfolio-wide cap on simultaneously open positions — see "Scanning multiple symbols" above |
-| `LEVERAGE` | Applied via BingX's set-leverage call before entries |
-| `QTY_PCT` | % of account equity used as position notional per trade |
-| `MAX_DAILY_LOSS_PCT` | Kill switch: halts new entries after this much drawdown in a UTC day |
-| `K_DOMINANCE` | How dominant the slow scale must be over the fast scale to call it "trending" — higher = fewer, more selective signals |
-| `COOLDOWN_BARS` | Minimum bars between signals, to avoid re-firing on the same move |
-| `USE_ATR_SL` | ATR-based SL/TP (adapts to volatility) vs. fixed percentage |
-| `USE_SWEEP_EXIT_FILTER` | Enables the second, exit-only indicator described below — off by default |
-| `SWEEP_EXIT_ACTION` | What it does when triggered: `alert_only` / `tighten_stop` / `close_position` |
+## 3b. Analizar TODAS las monedas de BingX
 
-## How the strategy works (short version)
+Por defecto el bot vigila solo lo que pongas en `SYMBOLS`. Si quieres que
+vigile **todo el universo de perpetuos USDT de BingX** en vez de una lista
+fija, pon en Railway:
 
-For each of 4 scales (1, 2, 4, 8 bars), it computes a "detail" value —
-the difference between the current N-bar average and the N-bar average
-from N bars ago, scaled by `1/sqrt(2)`. Squaring and summing those details
-over a lookback window gives an "energy" per scale; scales 1-2 are
-labeled "fine" (noise), scales 4-8 are "coarse" (trend). When coarse
-energy dominates fine energy by more than `K_DOMINANCE`, the market is
-called "trending," and a long/short signal fires on price crossing its
-own 8-bar average in the direction the coarse detail agrees with. Full
-math is in `bot/wavelet.py`, with a unit test that verifies the
-computation is causal (no look-ahead) — a live indicator that repaints on
-each new bar is worse than useless.
+```
+SYMBOLS=ALL
+SCAN_ALL_MAX_SYMBOLS=150      # tope de símbolos por ciclo (rate limit)
+SCAN_ALL_REFRESH_HOURS=6      # cada cuánto refresca la lista de símbolos
+SCAN_REPORT_ENABLED=true      # resumen periódico por Telegram
+SCAN_REPORT_INTERVAL_HOURS=4
+```
 
-## Known limitations
+En este modo, cada 5 minutos el bot calcula la señal en todos los símbolos
+descubiertos (con una pequeña pausa entre cada uno para no pasarse del
+límite de 500 peticiones/10s de BingX) y trata cada señal exactamente igual
+que si viniera de un solo símbolo — en modo manual, avisa por Telegram; en
+`AUTO_TRADE=true`, ejecuta, siempre respetando `MAX_CONCURRENT_POSITIONS`.
 
-- Targets BingX **one-way** position mode. If your account is in hedge
-  mode, switch it in BingX's position settings, or the flip-on-reversal
-  logic in `exchange.py` will need adjusting.
-- The trailing stop is software-managed (the bot recalculates and
-  re-places the stop order each poll) rather than an exchange-native
-  trailing order — simpler to reason about, but it only moves the stop
-  when the bot is actually running and polling.
-- Tested against synthetic data and unit tests in this environment; it
-  has **not** been run against BingX's live or demo API from here, since
-  this sandbox has no network path to `api.bingx.com` or
-  `api.telegram.org`. Test both connections yourself in paper mode before
-  trusting them.
-- One position per symbol at a time — no pyramiding/scaling into a
-  single symbol (this matches the original script's `pyramiding=0`).
-- `fetch_active_symbols()` (what `SYMBOL_UNIVERSE=all` resolves through)
-  is unit-tested against a mocked market structure but has not been run
-  against BingX's real market-list endpoint from where this was built —
-  same sandbox-networking limitation as everywhere else here. Check the
-  startup log line listing the resolved universe on your first deploy.
-- The sweep-reversal exit filter's bullish side is a reconstructed
-  mirror of shared bearish code, not verified against a real bullish
-  implementation — see the section above before enabling it.
+**Importante si vas a poner `AUTO_TRADE=true` con `SYMBOLS=ALL`**: baja
+`MAX_CONCURRENT_POSITIONS` y `RISK_PCT_PER_TRADE` — con cientos de símbolos
+vigilados a la vez, varias señales pueden dispararse en el mismo ciclo de 5
+minutos, y sin ese límite el bot podría abrir muchas posiciones de golpe.
 
-## Extending it
+Para **analizar sin arriesgar nada**, en cualquier momento puedes pedir un
+análisis puntual (útil para investigar el filtro, no solo para operar):
 
-- Two-way Telegram control (`/pause`, `/status`, `/close`) — the notifier
-  is deliberately minimal (send-only) so this is a clean add.
-- Multi-symbol support — `strategy.py` and `config.py` would need to
-  become per-symbol rather than singletons.
-- Swap `bot/exchange.py` for a different ccxt exchange id to target a
-  different venue with minimal other changes.
+```bash
+# Analiza todos los perpetuos USDT ahora mismo, sin ejecutar ni avisar
+curl "https://tu-app.up.railway.app/scan?quote=USDT&limit=150"
 
----
-*Not financial advice. Trading perpetual futures with leverage can lose
-more than your initial deposit. You are responsible for your own
-configuration, API key security, and trading decisions.*
+# Igual, pero además manda el resumen a tu Telegram
+curl "https://tu-app.up.railway.app/scan?quote=USDT&limit=150&notify=true"
+```
+
+Devuelve qué símbolos tienen una señal activa ahora mismo, cuáles están en
+régimen tendencial sin haber cruzado todavía, y cuántos fallaron al leer
+(símbolos ilíquidos o recién listados con pocas velas).
+
+## 4. Verificar en modo manual antes de arriesgar dinero
+
+Con `AUTO_TRADE=false`, cada señal solo llega a Telegram. Corre así **al
+menos 1-2 semanas** y compara las señales contra lo que habría pasado.
+Usa `/signal-check/<symbol>` cuando quieras para ver el estado actual del
+filtro sin esperar a que dispare.
+
+## 5. Pasar a real — checklist completo
+
+Antes de `AUTO_TRADE=true` con dinero real, en este orden:
+
+1. **Volume persistente en Railway montado** (sección 0). Sin esto, el
+   circuit breaker y el conteo de posiciones pueden perderse en un redeploy.
+2. **`BINGX_DEMO=false`** cuando estés listo — antes de eso, corre al menos
+   unos días con `BINGX_DEMO=true` para confirmar que las entradas,
+   SL/TP y cierres funcionan de principio a fin contra la cuenta VST. El
+   log de arranque te dice claramente contra qué entorno está pegando
+   (`bingx_env` en `/`).
+3. **`SYMBOLS` a pares líquidos**, no `ALL` al principio — `BTC-USDT,ETH-USDT,SOL-USDT`
+   o similares. `MIN_24H_VOLUME_USDT` ya filtra ilíquidos si usas `ALL`,
+   pero para tu primera vez en real, mejor una lista corta y conocida.
+4. **`RISK_PCT_PER_TRADE` bajo** (1% o menos) y **`LEVERAGE` moderado**
+   (5-10x) — no lo que uses en un experimento, lo que estés dispuesto a
+   perder mientras confirmas que todo funciona como esperas.
+5. **`HARD_MAX_TOTAL_POSITIONS` bajo** (3-5) las primeras semanas.
+6. Cambia `AUTO_TRADE=true` en Railway (redeploy automático).
+7. Verifica con `curl https://tu-app.up.railway.app/positions` que lo que
+   ves ahí coincide con lo que ves en la web de BingX.
+8. Vigila el circuit breaker: se activa solo tras `MAX_CONSECUTIVE_LOSSES`
+   pérdidas seguidas o `MAX_DAILY_DRAWDOWN_PCT`% de drawdown diario, y te
+   avisa por Telegram. Para reactivarlo manualmente:
+   ```bash
+   curl -X POST https://tu-app.up.railway.app/reset-breaker/<WEBHOOK_SECRET>
+   ```
+9. **Si algo se ve mal y quieres parar todo YA**, sin esperar a diagnosticar:
+   ```bash
+   curl -X POST https://tu-app.up.railway.app/emergency-stop/<WEBHOOK_SECRET>
+   ```
+   Esto pausa el trading y cierra TODAS las posiciones reales abiertas en
+   BingX (consultadas directamente al exchange), no solo las que el bot
+   creía tener localmente.
+10. El cierre normal (SL/TP) lo gestiona BingX solo. El bot verifica
+    justo tras cada entrada que el SL/TP se confirmó de verdad
+    (`has_stop_and_take_profit`) — si BingX lo rechazó en silencio, cierra
+    la posición al instante en vez de dejarla desprotegida. Y cada 2
+    minutos reconcilia por si una posición se cerró sola, calculando el
+    PnL real vía el endpoint de income.
+
+## 6. (Opcional) Volver al webhook de TradingView
+
+Si en el futuro tienes plan Essential+ y prefieres usar el Pine Script
+directamente:
+1. `SIGNAL_SOURCE=tradingview` y `ENABLE_SCHEDULER=false` en Railway.
+2. Configura la alerta en TradingView con condición **"Any alert() function
+   call"** sobre `pinescript/wavelet_mra_haar_5m.pine`, webhook URL
+   `https://tu-app.up.railway.app/webhook/<WEBHOOK_SECRET>`.
+
+## Notas de arquitectura (para que encaje con el resto de tu flota)
+
+- **Un solo worker** (`--workers 1` en Procfile/railway.json): el estado se
+  guarda en un JSON local, no hay lock distribuido. El scheduler corre en un
+  hilo de background dentro del mismo proceso — no necesitas un segundo
+  servicio en Railway.
+- **Firma HMAC**: se construye el query string ordenado UNA vez y se usa
+  igual para firmar y transmitir — evita el bug de mismatch orden-firma/
+  orden-transmisión que ya diste con `renewed-love`/`joyful-art`/`bot22`.
+- **Reconciliación**: al arrancar y cada 2 minutos, compara posiciones
+  locales vs. `/openApi/swap/v2/user/positions` y prioriza siempre al
+  exchange como fuente de verdad; cuando detecta que una posición se cerró
+  sola (SL/TP), consulta `/openApi/swap/v2/user/income` para el PnL real.
+- **positionSide**: el bot asume cuenta en modo **hedge** (LONG/SHORT
+  simultáneos posibles). Si tu cuenta BingX está en modo one-way, cambia
+  `positionSide` a `"BOTH"` en `bingx_client.place_market_order`.
+- Los endpoints de BingX (`stopLoss`/`takeProfit` embebidos, `/quote/klines`
+  v3, `/user/income`) están confirmados por documentación pública y SDKs de
+  terceros, pero **verifica en modo demo (`BINGX_DEMO=true` + endpoint VST)
+  antes de tocar dinero real**, porque BingX cambia parámetros de su API sin
+  previo aviso frecuentemente.
+- El motor de señales en Python (`signal_engine.py`) replica la fórmula
+  exacta del Pine (`haar_detail`, energía por escala, cruce sobre SMA(8),
+  ATR con RMA de Wilder) — está cubierto por tests que verifican el cálculo
+  contra ejemplos resueltos a mano.
+- **`scanner.py`** analiza N símbolos de una tirada (usado tanto por
+  `SYMBOLS=ALL` como por el endpoint `/scan`) con pausa entre peticiones
+  para respetar el límite compartido de datos de mercado de BingX (500
+  peticiones/10s por IP).
+- **Filtro de liquidez** (`MIN_24H_VOLUME_USDT`): en modo `SYMBOLS=ALL`, el
+  bot descarta símbolos con menos volumen de 24h que el umbral y prioriza
+  los más líquidos primero, en vez de vigilar alfabéticamente los primeros
+  N — el spread/slippage en alts ilíquidos puede comerse cualquier ventaja
+  del filtro antes de que se mueva el precio (ver `RESEARCH.md` sección 5).
+- **Verificación de SL/TP post-orden**: tras cada entrada, `has_stop_and_take_profit()`
+  confirma que BingX aceptó de verdad las órdenes condicionales. Si no,
+  cierra la posición al instante en vez de dejarla desprotegida.
+- **Tope duro de posiciones** (`HARD_MAX_TOTAL_POSITIONS`): se comprueba
+  contra las posiciones reales en BingX, no el JSON local, así que protege
+  incluso si el estado se perdió en un redeploy sin Volume.
+- **`/emergency-stop/<secret>`**: pausa el trading y cierra TODAS las
+  posiciones reales de golpe, consultadas directamente a BingX.
+- **`/positions`**: muestra las posiciones reales en BingX ahora mismo, sin
+  pasar por el estado local — para verificar rápido sin depender de que el
+  bot tenga razón sobre lo que cree tener abierto.

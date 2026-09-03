@@ -1,5 +1,6 @@
-ccxt>=4.4.0
-pandas>=2.2.0
-numpy>=1.26.0
-python-dotenv>=1.0.1
-requests>=2.31.0
+flask==3.0.3
+requests==2.32.3
+gunicorn==22.0.0
+pandas==2.2.2
+numpy==1.26.4
+APScheduler==3.10.4
