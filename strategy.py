@@ -1,166 +1,316 @@
 """
-Motor de la estrategia. Traducción literal de reversion_5m.pine.
+Scans a universe of symbols (one, a list, or every active USDT-M swap on
+BingX) each cycle. Entries are still decided per-symbol by the wavelet
+regime filter; the one thing that is genuinely PORTFOLIO-level is the
+concurrent-position cap — with many symbols eligible to fire at once,
+that cap is what keeps total exposure bounded instead of unbounded, and
+it is enforced across the whole cycle, not per-symbol in isolation (two
+symbols firing in the same cycle both see and respect the same count).
 
-Si algún día cambias uno, cambia el otro. Un bot que opera algo
-distinto de lo que backtesteaste no es un bot: es una sorpresa.
+One poll = one full scan:
+  1. fetch account equity + ALL open positions ONCE (not per-symbol)
+  2. update the daily kill switch from that equity
+  3. for each symbol in the universe, in order:
+       a. fetch its candles, drop the still-forming one
+       b. if it has an open position: sweep-exit check, then trailing-stop
+       c. compute the wavelet regime + crossover
+       d. if a fresh entry signal fires AND no position is already open on
+          it AND the portfolio isn't at the concurrent-position cap AND
+          the kill switch isn't tripped: place the order
+       e. always notify Telegram, whether or not an order was placed
 
-REGLA DE ORO DEL CÁLCULO: solo se usan velas CERRADAS. La última vela
-que devuelve el exchange está en curso y sus valores cambian hasta que
-cierra; usarla es la forma clásica de que el backtest y el bot no
-coincidan.
+Scanning "all" symbols is inherently slower than one — see README for the
+realistic wall-clock cost of a full-market cycle given BingX's rate limit.
 """
-from __future__ import annotations
+import logging
+import time
 
-from dataclasses import dataclass
+from .config import Config
+from .exchange import BingXExchange, ExchangeError
+from .risk import DailyKillSwitch, compute_sl_tp
+from .sweep_reversal import SweepReversalSignals
+from .telegram_notify import TelegramNotifier
+from .wavelet import WaveletRegime
 
-import config
-
-
-@dataclass
-class Signal:
-    symbol: str
-    side: str          # "BUY" (largo) | "SELL" (corto)
-    entry: float
-    sl: float
-    tp: float
-    rr: float
-    atr_pct: float
-    stretch: float
-    cost_cover: float  # cuántas veces cubre el ATR el coste de ida y vuelta
+log = logging.getLogger(__name__)
 
 
-def ema(values: list[float], length: int) -> list[float]:
-    if not values:
-        return []
-    k = 2.0 / (length + 1.0)
-    out = [values[0]]
-    for v in values[1:]:
-        out.append(v * k + out[-1] * (1.0 - k))
-    return out
+class SymbolState:
+    """Per-symbol mutable bookkeeping — cooldown timing, the last sweep
+    alert handled, and the current trailing-stop level. One of these is
+    kept per symbol in the universe for the life of the process."""
+
+    __slots__ = ("last_signal_ts", "last_sweep_alert_ts", "trail_stop_price")
+
+    def __init__(self):
+        self.last_signal_ts = None
+        self.last_sweep_alert_ts = None
+        self.trail_stop_price = None
 
 
-def atr(highs: list[float], lows: list[float], closes: list[float], length: int) -> list[float]:
-    """ATR de Wilder, igual que ta.atr de Pine."""
-    if len(closes) < 2:
-        return []
-    trs = [highs[0] - lows[0]]
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
+class PortfolioStrategy:
+    def __init__(self, config: Config, exchange: BingXExchange, notifier: TelegramNotifier):
+        self.config = config
+        self.exchange = exchange
+        self.notifier = notifier
+        self.regime = WaveletRegime(config.lookback_energy, config.k_dominance)
+        self.kill_switch = DailyKillSwitch(config.max_daily_loss_pct)
+
+        self.sweep = None
+        if config.use_sweep_exit_filter:
+            self.sweep = SweepReversalSignals(
+                swing_length=config.sweep_swing_length,
+                atr_length=config.sweep_atr_length,
+                min_penetration=config.sweep_min_penetration,
+                structure_length=config.sweep_structure_length,
+                max_confirmation_bars=config.sweep_max_confirmation_bars,
+                min_displacement=config.sweep_min_displacement,
+            )
+
+        self.symbols = self._resolve_universe()
+        self.state = {symbol: SymbolState() for symbol in self.symbols}
+
+        self._fetch_limit = max(300, config.lookback_energy + 80)
+        log.info("Universe resolved to %d symbol(s): %s", len(self.symbols), self._preview_symbols())
+
+    def _preview_symbols(self) -> str:
+        if len(self.symbols) <= 8:
+            return ", ".join(self.symbols)
+        return ", ".join(self.symbols[:8]) + f", … (+{len(self.symbols) - 8} more)"
+
+    def _resolve_universe(self) -> list:
+        raw = self.config.symbol_universe.strip()
+        exclude = [s.strip() for s in self.config.symbol_exclude.split(",") if s.strip()]
+
+        if raw.lower() == "all":
+            symbols = self.exchange.fetch_active_symbols(
+                min_volume_usdt=self.config.min_24h_volume_usdt, exclude=exclude
+            )
+        else:
+            symbols = [s.strip() for s in raw.split(",") if s.strip() and s.strip() not in exclude]
+
+        if not symbols:
+            raise SystemExit(
+                "Symbol universe resolved to zero symbols — check SYMBOL_UNIVERSE, "
+                "SYMBOL_EXCLUDE, and MIN_24H_VOLUME_USDT."
+            )
+        return symbols
+
+    # ------------------------------------------------------------------ loop
+    def run_once(self) -> None:
+        equity = self.exchange.fetch_equity_usdt() if self.exchange.has_keys else 0.0
+        halted = self.kill_switch.update(equity) if self.exchange.has_keys else False
+
+        open_positions = self.exchange.fetch_all_open_positions() if self.exchange.has_keys else []
+        open_by_symbol = {p["symbol"]: p for p in open_positions}
+        concurrent_count = len(open_positions)
+
+        start = time.monotonic()
+        opened_this_cycle = 0
+        errors = 0
+
+        for symbol in self.symbols:
+            try:
+                opened = self._evaluate_symbol(
+                    symbol,
+                    equity=equity,
+                    halted=halted,
+                    current_position=open_by_symbol.get(symbol),
+                    concurrent_count=concurrent_count + opened_this_cycle,
+                )
+                if opened:
+                    opened_this_cycle += 1
+            except Exception:
+                errors += 1
+                log.exception("Error evaluating %s — continuing with the rest of the scan.", symbol)
+
+        elapsed = time.monotonic() - start
+        log.info(
+            "Scan complete: %d symbol(s) in %.1fs, %d new entr%s, %d open position(s), %d error(s).",
+            len(self.symbols),
+            elapsed,
+            opened_this_cycle,
+            "y" if opened_this_cycle == 1 else "ies",
+            concurrent_count + opened_this_cycle,
+            errors,
         )
-        trs.append(tr)
-    out = [trs[0]]
-    for tr in trs[1:]:
-        out.append((out[-1] * (length - 1) + tr) / length)
-    return out
 
+    # --------------------------------------------------------- per symbol
+    def _evaluate_symbol(
+        self, symbol: str, equity: float, halted: bool, current_position, concurrent_count: int
+    ) -> bool:
+        """Returns True if a new live position was opened on this symbol."""
+        state = self.state[symbol]
 
-def evaluate(symbol: str, candles: list[dict]) -> tuple[Signal | None, str]:
-    """
-    Devuelve (señal, motivo). El motivo explica por qué NO hay señal,
-    que en un escáner es más útil que el silencio: sin él, "no pasa
-    nada" y "está roto" se parecen demasiado.
-    """
-    need = max(config.MA_LEN, config.ATR_LEN) + config.MAX_BARS_STRETCH + 5
-    if len(candles) < need:
-        return None, "pocas velas"
+        if not current_position:
+            state.last_sweep_alert_ts = None
+            state.trail_stop_price = None
 
-    # Se descarta la última: está en curso.
-    c = candles[:-1]
-    closes = [x["close"] for x in c]
-    highs = [x["high"] for x in c]
-    lows = [x["low"] for x in c]
-    opens = [x["open"] for x in c]
+        df = self.exchange.fetch_ohlcv_df(symbol, self.config.timeframe, limit=self._fetch_limit)
+        if len(df) < 3:
+            log.warning("Not enough candles returned for %s (%s) — skipping.", symbol, len(df))
+            return False
+        closed = df.iloc[:-1]
 
-    ma_series = ema(closes, config.MA_LEN)
-    atr_series = atr(highs, lows, closes, config.ATR_LEN)
-    if not ma_series or not atr_series:
-        return None, "sin indicadores"
+        if self.sweep is not None and current_position:
+            self._run_sweep_exit_check(symbol, state, closed, current_position)
 
-    close = closes[-1]
-    ma = ma_series[-1]
-    a = atr_series[-1]
-    if a <= 0 or close <= 0:
-        return None, "atr cero"
+        try:
+            sig = self.regime.compute(closed, atr_length=self.config.atr_length)
+        except ValueError:
+            return False  # not enough history yet for this symbol (e.g. a new listing)
+        merged = closed.join(sig)
+        last = merged.iloc[-1]
+        last_ts = merged.index[-1]
 
-    atr_pct = a / close * 100.0
-    cover = atr_pct / config.COST_ROUNDTRIP_PCT if config.COST_ROUNDTRIP_PCT > 0 else 0.0
+        if current_position and self.config.use_trail:
+            self._maybe_update_trailing(symbol, state, current_position, last)
 
-    # EL FILTRO QUE MANDA. Va primero a propósito: sin recorrido no hay
-    # negocio, por mucho que el patrón sea de libro.
-    if atr_pct < config.MIN_ATR_PCT or cover < config.MIN_COST_COVER:
-        return None, f"sin amplitud ({atr_pct:.2f}%, {cover:.0f}x)"
+        if current_position:
+            return False  # never stack a second entry on a symbol already open
 
-    # Ratio de eficiencia de fondo: recorrido neto / suma de movimientos.
-    # Alto = línea recta = no es terreno de reversión.
-    er_len = min(180, len(closes) - 1)
-    if er_len > 20:
-        neto = abs(closes[-1] - closes[-1 - er_len])
-        total = sum(abs(closes[i] - closes[i - 1]) for i in range(len(closes) - er_len, len(closes)))
-        er_long = neto / total if total > 0 else 0.0
-        if er_long > config.MAX_ER_LONG:
-            return None, f"vertical (ER {er_long:.2f} > {config.MAX_ER_LONG})"
+        if self.config.use_vol_filter:
+            vol_sma = closed["volume"].rolling(self.config.vol_len).mean()
+            vol_ok = bool(closed["volume"].iloc[-1] > vol_sma.iloc[-1] * self.config.vol_mult)
+        else:
+            vol_ok = True
 
-    stretch = (close - ma) / a
+        cooldown_ok = self._cooldown_ok(state, merged, last_ts)
+        long_cond = bool(last["is_trending"] and vol_ok and last["cross_up"] and last["h8"] > 0 and cooldown_ok)
+        short_cond = bool(last["is_trending"] and vol_ok and last["cross_down"] and last["h8"] < 0 and cooldown_ok)
 
-    # El estiramiento tiene que ser RÁPIDO: hace N velas aún no lo estaba.
-    idx_prev = -1 - config.MAX_BARS_STRETCH
-    if abs(idx_prev) > len(closes) or abs(idx_prev) > len(ma_series):
-        return None, "historial corto"
-    prev_stretch = (closes[idx_prev] - ma_series[idx_prev]) / atr_series[idx_prev]
-    was_flat = abs(prev_stretch) < config.STRETCH_ATR * 0.5
+        if not (long_cond or short_cond):
+            return False
 
-    over_up = stretch >= config.STRETCH_ATR and was_flat
-    over_dn = stretch <= -config.STRETCH_ATR and was_flat
-    if not (over_up or over_dn):
-        return None, f"sin estirón ({stretch:+.2f} ATR)"
+        state.last_signal_ts = last_ts
+        side = "long" if long_cond else "short"
+        price = float(last["close"])
+        atr_val = float(last["atr"])
 
-    # Vela de agotamiento: la primera que empuja en contra.
-    exhaust_up = over_up and closes[-1] < opens[-1] and closes[-1] < closes[-2]
-    exhaust_dn = over_dn and closes[-1] > opens[-1] and closes[-1] > closes[-2]
-    if not (exhaust_up or exhaust_dn):
-        return None, "estirado, sin vela de agotamiento"
+        sl, tp = compute_sl_tp(
+            side, price, atr_val,
+            self.config.use_atr_sl, self.config.atr_mult_sl, self.config.atr_mult_tp,
+            self.config.sl_percent, self.config.tp_percent,
+        )
 
-    if exhaust_up:  # corto contra la subida
-        sl = max(highs[-1], highs[-2]) + a * config.SL_ATR
-        risk = sl - close
-        tp = ma if config.TP_MODE == "MEAN" else close - risk * config.RR_FIXED
-        rr = (close - tp) / risk if risk > 0 else 0.0
-        side = "SELL"
-    else:           # largo contra la caída
-        sl = min(lows[-1], lows[-2]) - a * config.SL_ATR
-        risk = close - sl
-        tp = ma if config.TP_MODE == "MEAN" else close + risk * config.RR_FIXED
-        rr = (tp - close) / risk if risk > 0 else 0.0
-        side = "BUY"
+        live_order_sent = False
+        opened = False
+        skip_reason = None
 
-    if risk <= 0:
-        return None, "riesgo no válido"
-    if rr < config.MIN_RR:
-        return None, f"R:R insuficiente ({rr:.2f})"
+        if halted:
+            skip_reason = "kill switch diario activo"
+            log.warning("%s: kill switch active — %s signal not traded.", symbol, side)
+        elif concurrent_count >= self.config.max_concurrent_positions:
+            skip_reason = f"límite de {self.config.max_concurrent_positions} posiciones simultáneas alcanzado"
+            log.info("%s: %s signal skipped — at MAX_CONCURRENT_POSITIONS.", symbol, side)
+        elif self.config.can_trade_live:
+            try:
+                notional = max(equity, 0.0) * (self.config.qty_pct / 100)
+                self.exchange.enter_position(symbol, side, notional, price, sl, tp)
+                live_order_sent = True
+                opened = True
+                state.trail_stop_price = sl
+            except ExchangeError:
+                pass  # already logged and telegrammed inside exchange.py
+            except Exception as e:
+                log.exception("Unexpected error entering position on %s", symbol)
+                self.notifier.send_error(f"Unexpected error entering {side} on {symbol}: {e}")
 
-    return (
-        Signal(
-            symbol=symbol,
-            side=side,
-            entry=close,
-            sl=sl,
-            tp=tp,
-            rr=rr,
-            atr_pct=atr_pct,
-            stretch=stretch,
-            cost_cover=cover,
-        ),
-        "ok",
-    )
+        self.notifier.send_signal(
+            side=side, symbol=symbol, price=price, sl=sl, tp=tp,
+            timeframe=self.config.timeframe, mode_label=self.config.mode_label,
+            live_order_sent=live_order_sent, skip_reason=skip_reason,
+        )
+        return opened
 
+    def _cooldown_ok(self, state: SymbolState, merged, last_ts) -> bool:
+        if state.last_signal_ts is None:
+            return True
+        try:
+            bars_since = merged.index.get_loc(last_ts) - merged.index.get_loc(state.last_signal_ts)
+        except KeyError:
+            return True
+        return bars_since >= self.config.cooldown_bars
 
-def position_size(equity: float, entry: float, sl: float) -> float:
-    """Tamaño para arriesgar RISK_PCT del capital si salta el stop."""
-    risk_per_unit = abs(entry - sl)
-    if risk_per_unit <= 0 or entry <= 0:
-        return 0.0
-    risk_cash = equity * config.RISK_PCT / 100.0
-    return risk_cash / risk_per_unit
+    def _maybe_update_trailing(self, symbol: str, state: SymbolState, position: dict, last) -> None:
+        side = position.get("side")
+        entry = float(position.get("entryPrice") or 0)
+        price = float(last["close"])
+        atr_val = float(last["atr"]) if last["atr"] == last["atr"] else 0.0  # NaN check
+        if not entry or not atr_val:
+            return
+
+        trigger = self.config.trail_trigger_atr * atr_val
+        offset = self.config.trail_offset_atr * atr_val
+
+        if side == "long":
+            in_profit_enough = price >= entry + trigger
+            candidate_stop = price - offset
+            improves = state.trail_stop_price is None or candidate_stop > state.trail_stop_price
+        else:
+            in_profit_enough = price <= entry - trigger
+            candidate_stop = price + offset
+            improves = state.trail_stop_price is None or candidate_stop < state.trail_stop_price
+
+        if in_profit_enough and improves:
+            state.trail_stop_price = candidate_stop
+            self.exchange.update_trailing_stop(symbol, side, candidate_stop)
+
+    # ------------------------------------------------------- sweep exit
+    def _run_sweep_exit_check(self, symbol: str, state: SymbolState, closed, position: dict) -> None:
+        try:
+            sweep_sig = self.sweep.compute(closed)
+        except ValueError:
+            return
+        except Exception:
+            log.exception("Sweep-reversal computation failed for %s — skipping this cycle.", symbol)
+            return
+
+        sweep_last = closed.join(sweep_sig).iloc[-1]
+        self._check_sweep_exit(symbol, state, sweep_last, position)
+
+    def _check_sweep_exit(self, symbol: str, state: SymbolState, sweep_last, position: dict) -> None:
+        side = position.get("side")
+        contrary = (side == "long" and bool(sweep_last["bearish_confirmed"])) or (
+            side == "short" and bool(sweep_last["bullish_confirmed"])
+        )
+        if not contrary:
+            return
+
+        bar_ts = sweep_last.name
+        if state.last_sweep_alert_ts == bar_ts:
+            return
+        state.last_sweep_alert_ts = bar_ts
+
+        price = float(sweep_last["close"])
+        kind = "bajista" if side == "long" else "alcista"
+        reason = f"Sweep-reversal {kind} confirmado en contra de la posición {side} abierta en {symbol}."
+        action = self.config.sweep_exit_action
+        log.info("Sweep-reversal exit trigger on %s: side=%s action=%s price=%.6f", symbol, side, action, price)
+
+        if action == "close_position":
+            try:
+                self.exchange.close_position(symbol, reason=reason)
+                self.notifier.send_exit(symbol, side, price, reason + " Posición cerrada automáticamente.")
+            except Exception as e:
+                log.exception("Failed to auto-close on sweep-reversal signal for %s", symbol)
+                self.notifier.send_error(f"Sweep-reversal pidió cerrar {side} en {symbol} pero falló: {e}")
+
+        elif action == "tighten_stop":
+            entry = float(position.get("entryPrice") or price)
+            try:
+                self.exchange.update_trailing_stop(symbol, side, entry)
+                self.notifier.send(
+                    f"🟠 <b>Sweep-reversal en contra</b> — {symbol} ({side})\n"
+                    f"{reason}\nStop movido a breakeven (<code>{entry:.6f}</code>)."
+                )
+            except Exception as e:
+                log.exception("Failed to tighten stop on sweep-reversal signal for %s", symbol)
+                self.notifier.send_error(f"Sweep-reversal pidió mover el stop en {symbol} pero falló: {e}")
+
+        else:  # alert_only — the default
+            self.notifier.send(
+                f"🟠 <b>Alerta de reversión (sweep)</b> — {symbol} ({side})\n"
+                f"{reason}\nPrecio: <code>{price:.6f}</code>\n"
+                f"Sin acción automática (SWEEP_EXIT_ACTION=alert_only)."
+            )
