@@ -1,52 +1,37 @@
 """
-state_manager.py
-
-Simple JSON state persistence with an atomic write (write to a temp file in
-the same directory, fsync, then os.replace). This avoids a half-written
-state file if the process is killed mid-save - e.g. on a Railway redeploy
-or restart.
-
-Note: Railway's container filesystem is ephemeral across redeploys unless
-STATE_FILE_PATH points at a mounted Volume. Even so, main.py always
-reconciles against BingX's live position data on startup rather than
-trusting this file blindly, so a lost state file degrades gracefully
-instead of causing a duplicate/orphaned position.
+state_manager.py — mismo patrón que el bot wavelet: nada se persiste
+en disco, las posiciones abiertas se reconstruyen siempre desde BingX.
 """
 
-import json
-import logging
-import os
-import tempfile
-
-logger = logging.getLogger("state")
+from dataclasses import dataclass, field
 
 
+@dataclass
 class StateManager:
-    def __init__(self, path: str):
-        self.path = path
-        directory = os.path.dirname(os.path.abspath(path)) or "."
-        os.makedirs(directory, exist_ok=True)
+    last_signal_time: dict = field(default_factory=dict)
+    leverage_set: set = field(default_factory=set)
+    known_positions: dict = field(default_factory=dict)
 
-    def load(self) -> dict:
-        if not os.path.exists(self.path):
-            return {}
-        try:
-            with open(self.path, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to load state file (%s), starting fresh: %s", self.path, e)
-            return {}
+    def can_signal(self, symbol: str, candle_time_ms: int, cooldown_bars: int, timeframe_ms: int) -> bool:
+        last = self.last_signal_time.get(symbol)
+        if last is None:
+            return True
+        return (candle_time_ms - last) / timeframe_ms >= cooldown_bars
 
-    def save(self, state: dict):
-        directory = os.path.dirname(os.path.abspath(self.path)) or "."
-        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".state_", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(state, f, indent=2, default=str)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, self.path)  # atomic on POSIX filesystems
-        except Exception:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
+    def mark_signal(self, symbol: str, candle_time_ms: int) -> None:
+        self.last_signal_time[symbol] = candle_time_ms
+
+    def leverage_already_set(self, symbol: str) -> bool:
+        return symbol in self.leverage_set
+
+    def mark_leverage_set(self, symbol: str) -> None:
+        self.leverage_set.add(symbol)
+
+
+def timeframe_to_ms(timeframe: str) -> int:
+    unit = timeframe[-1].lower()
+    value = int(timeframe[:-1])
+    mult = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}.get(unit)
+    if mult is None:
+        raise ValueError(f"Timeframe no soportado: {timeframe}")
+    return value * mult

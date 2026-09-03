@@ -1,5 +1,8 @@
+.env
 __pycache__/
 *.pyc
-.env
-*.json
-!railway.json
+*.pyo
+.venv/
+venv/
+*.log
+.DS_Store
