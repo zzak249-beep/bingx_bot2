@@ -13,6 +13,7 @@ import os
 import threading
 
 import config
+import telegram_notifier
 
 log = logging.getLogger("state")
 
@@ -45,6 +46,27 @@ def _load_raw():
 
 
 def _save_raw(state):
+    parent = os.path.dirname(config.STATE_FILE)
+    if parent and not os.path.isdir(parent):
+        # STATE_FILE apunta a un directorio que no existe -- lo más probable
+        # es STATE_FILE=/data/... sin el Volume de Railway montado (README
+        # sección 0). Se crea igual para NO reventar aquí: este método se
+        # llama justo después de registrar una entrada YA ejecutada en
+        # BingX con dinero real, y perder esa llamada por un directorio
+        # inexistente dejaría la posición sin registrar y sin avisar. Pero
+        # el directorio recién creado es del contenedor efímero, no del
+        # Volume -- el estado NO sobrevivirá al próximo redeploy hasta que
+        # el Volume esté de verdad montado ahí.
+        os.makedirs(parent, exist_ok=True)
+        _msg = (
+            f"⚠️ STATE_FILE='{config.STATE_FILE}': el directorio no existía y se "
+            "creó al vuelo (probablemente el Volume de Railway no está montado "
+            "-- ver README sección 0). El estado NO sobrevivirá al próximo "
+            "redeploy hasta que lo montes de verdad."
+        )
+        log.warning(_msg)
+        telegram_notifier.send(_msg)
+
     tmp = config.STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2, default=str)
@@ -161,6 +183,15 @@ class StateManager:
     def check_circuit_breaker(self, current_equity: float) -> (bool, str):
         """Devuelve (permitido, motivo_si_no_permitido)."""
         self.refresh_daily_anchor(current_equity)
+
+        # CIRCUIT_BREAKER_ENABLED=false: se sigue registrando equity diaria y
+        # pérdidas consecutivas (útil para /status), pero no se bloquea nada
+        # por ello. Un halt manual (/emergency-stop) SÍ se sigue respetando
+        # -- es el único freno automático que queda si esto está desactivado.
+        if not config.CIRCUIT_BREAKER_ENABLED:
+            if self.state.get("trading_halted"):
+                return False, self.state.get("halt_reason", "parada manual activa")
+            return True, None
 
         if self.state.get("trading_halted"):
             return False, self.state.get("halt_reason", "circuit breaker activo")

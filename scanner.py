@@ -9,8 +9,9 @@ para *analizar*, no para operar. Útil para:
     si el edge aparece en varios símbolos correlacionados o es un fluke de
     uno solo
 
-Respeta el rate limit compartido de BingX para datos de mercado (500
-peticiones / 10s por IP): mete una pequeña pausa entre símbolos.
+Respeta el rate limit compartido de BingX para datos de mercado (2000
+peticiones / 10s por IP -- BingX lo subió desde 500/10s; verificado
+septiembre 2026): mete una pequeña pausa entre símbolos.
 """
 import logging
 import time
@@ -19,7 +20,7 @@ import signal_engine
 
 log = logging.getLogger("scanner")
 
-REQUEST_PACING_SECONDS = 0.08  # ~12 req/s -> deja margen de sobra bajo el límite de BingX
+REQUEST_PACING_SECONDS = 0.08  # ~12 req/s -> deja margen de sobra bajo el límite de BingX (200 req/s)
 
 
 def _wavelet_params(config):

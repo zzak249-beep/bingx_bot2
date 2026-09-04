@@ -45,19 +45,6 @@ def _resolve_symbols(bx):
         log.exception("No se pudo listar todos los símbolos de BingX, se usa la caché anterior si hay")
         return _symbols_cache["symbols"]
 
-    # Filtro por nombre ANTES que por volumen: un volumen de 24h alto no
-    # hace "seguro" a un meme-coin (puede ser especulación pura, con
-    # spreads reales altos y riesgo de manipulación/deslistado).
-    if config.MEME_BLOCKLIST_PATTERNS:
-        before = len(all_symbols)
-        all_symbols = [
-            s for s in all_symbols
-            if not any(pattern in s.upper() for pattern in config.MEME_BLOCKLIST_PATTERNS)
-        ]
-        blocked = before - len(all_symbols)
-        if blocked:
-            log.info("Filtro de nombre: %d símbolos excluidos por MEME_BLOCKLIST_PATTERNS", blocked)
-
     # Filtra por liquidez y prioriza los más líquidos primero -- en vez de
     # coger los primeros N alfabéticamente (que podían ser microcaps con
     # spread altísimo), nos quedamos con los N de más volumen real.

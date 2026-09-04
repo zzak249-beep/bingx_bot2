@@ -48,25 +48,18 @@ HARD_MAX_TOTAL_POSITIONS = int(os.getenv("HARD_MAX_TOTAL_POSITIONS", "5"))
 # en modo SYMBOLS=ALL. Filtra alts ilíquidos donde el spread/slippage real
 # se come cualquier ventaja del filtro antes de que se mueva el precio
 # (ver RESEARCH.md sección 5). No aplica si SYMBOLS es una lista explícita.
-# OJO: un volumen alto NO implica que un activo sea "seguro" -- muchos
-# meme-coins mueven volumen especulativo enorme sin ser aptos para un bot
-# automático (spreads reales altos, riesgo de manipulación/deslistado).
-# Por eso el valor por defecto es alto y hay además un filtro de nombre.
-MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "20000000"))
-
-# Excluye símbolos cuyo nombre contenga alguno de estos fragmentos
-# (case-insensitive), pensado para filtrar memecoins y tokens especulativos
-# que pueden tener volumen alto sin ser aptos para trading automático de
-# régimen/tendencia. Lista de partida, no exhaustiva -- amplíala si ves
-# otros casos como los de tu propia experiencia (BROCCOLI, BANANA, HOLO...).
-MEME_BLOCKLIST_PATTERNS = [
-    s.strip().upper() for s in os.getenv(
-        "MEME_BLOCKLIST_PATTERNS",
-        "BROCCOLI,BANANA,PEPE,DOGE,SHIB,FLOKI,WIF,BONK,MEME,INU,ELON,MOON,SAFE,BABY,CUM,PUMP,GASOLINE"
-    ).split(",") if s.strip()
-]
+MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "2000000"))
 
 # --- Circuit breaker ---
+# CIRCUIT_BREAKER_ENABLED=false (por defecto ahora): el bot NUNCA pausa el
+# trading solo por pérdidas consecutivas o drawdown diario. Sigue contando
+# consecutive_losses y daily_start_equity para que /status los muestre, pero
+# check_circuit_breaker() ya no bloquea nada con eso -- ver state_manager.py.
+# Los únicos frenos que quedan activos son HARD_MAX_TOTAL_POSITIONS (tope de
+# posiciones simultáneas) y /emergency-stop (botón de pánico manual). Pon
+# CIRCUIT_BREAKER_ENABLED=true en Railway si quieres recuperar el freno
+# automático sin tocar código.
+CIRCUIT_BREAKER_ENABLED = _bool("CIRCUIT_BREAKER_ENABLED", "false")
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))
 

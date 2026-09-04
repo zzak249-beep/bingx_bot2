@@ -174,3 +174,100 @@ rentabilidad neta que cualquier ajuste de `k_dominance` o `lookback_energy`.
    filtro (más escalas, Daubechies real, etc.) arregla comisión+spread+
    slippage en activos ilíquidos — eso hay que resolverlo con selección de
    universo y sizing, no con más sofisticación en la señal.
+
+## 7. Verificación externa adicional (septiembre 2026)
+
+Búsqueda dirigida sobre tres preguntas concretas que quedaban abiertas en
+este documento: (a) ¿hay evidencia empírica real de que un filtro tipo
+"energía gruesa vs. fina" mejore un sistema de por sí, más allá del
+argumento teórico de la sección 2? (b) ¿qué tan fiable es la literatura
+académica que sí reporta resultados con wavelets en trading? (c) ¿sigue
+siendo válida la capa de ejecución contra BingX que usa este bot?
+
+### 7.1 Evidencia real del filtro de régimen (Efficiency Ratio de Kaufman)
+
+Dado que el filtro "wavelet" de este bot es matemáticamente primo hermano
+del Efficiency Ratio de Kaufman (sección 1), vale mirar qué pasa cuando
+*alguien lo prueba de verdad* en vez de solo argumentarlo. Un backtest
+publicado por Alvarez Quant Trading, aplicando un filtro de ER como umbral
+de entrada sobre dos estrategias de reversión a la media, encontró mejoras
+en casi todas las métricas relevantes a la vez (exposición, CAGR, drawdown
+máximo, Sharpe, % de aciertos) — pero el mismo filtro **no funcionó** en
+una tercera estrategia probada. La lectura correcta no es "el filtro
+funciona" ni "no funciona", sino que su efecto depende del sistema al que
+se acopla y hay que probarlo empíricamente en cada caso, exactamente lo que
+ya recomienda la sección 3 de este documento. Un matiz importante: el uso
+*original* de Kaufman para el ER es como filtro estático de selección de
+instrumento (calculado una vez sobre el histórico completo, para decidir
+qué activos operar), no como semáforo dinámico barra a barra — que es como
+lo usa este bot (y como lo usa la mayoría de implementaciones modernas). No
+invalida el enfoque, pero es un recordatorio de que "inspirado en Kaufman"
+y "lo que Kaufman validó" no son lo mismo.
+
+### 7.2 La literatura de "wavelets + trading" tiene un problema sistemático de sobreajuste
+
+Varios papers académicos que combinan wavelets con trading (denoising +
+LSTM, wavelets + genética sobre MACD, etc.) reportan retornos anualizados
+del 200%, 300%, incluso 700%+ en backtest. Esto **no es una señal de que la
+técnica funcione** — es la firma clásica de sobreajuste: ese nivel de
+retorno sostenido no existe en ningún mercado líquido real durante periodos
+largos, y ese tipo de papers casi nunca modela comisión+slippage+ejecución
+realista ni valida de verdad fuera de muestra. Es la misma trampa que ya
+señala la sección 3 de este documento sobre el hilo de X original ("$80 →
+$4.900"), solo que con más aparato matemático encima — el aparato
+matemático no protege contra el sobreajuste, y a veces lo camufla mejor.
+Como contraejemplo de cómo *sí* se debería abordar esto: un trabajo sobre
+trading de cripto con RL propone tratar el sobreajuste como una hipótesis
+a testear explícitamente (estimar la probabilidad de que un modelo esté
+sobreajustado y descartarlo) en vez de reportar un solo backtest bonito —
+ese es el estándar contra el que deberías medir cualquier mejora que le
+hagas a este bot, incluida la que ya recomienda la sección 3.2 (comparar
+contra baseline sin filtro, fuera de muestra).
+
+Si en algún momento quieres ir más allá de la aproximación Haar actual
+(diferencia de SMAs, la más burda de todas las wavelets) hacia una DWT real
+con Daubechies/Symlets — que es literalmente lo que vendía el hilo de X
+original — la librería `PyWavelets` (`pywt.wavedec`/`pywt.waverec`) es el
+camino estándar en Python. Vale como experimento, pero no esperes que
+cambie la conclusión de fondo: la lógica de "compara energía gruesa vs.
+fina" ya está capturada, aunque toscamente, por la versión Haar actual: una
+DWT más sofisticada probablemente afina el filtro marginalmente, no lo
+transforma en algo cualitativamente distinto.
+
+### 7.3 Capa de ejecución (BingX): sigue vigente, con un dato actualizado
+
+Se verificó contra documentación y wrappers de terceros actuales que el
+formato de `bingx_client.py` para adjuntar `stopLoss`/`takeProfit` (JSON
+serializado como string dentro de los parámetros del propio `POST` de la
+orden, con `type`/`stopPrice`/`workingType`) sigue siendo el patrón
+correcto de la API nativa de BingX, y que `positionSide: LONG/SHORT` es
+correcto **solo si tu cuenta está en modo hedge** — en modo one-way BingX
+espera `positionSide: BOTH` y rechazaría la orden. Esto ya estaba
+documentado como advertencia en el README de este proyecto; con
+`AUTO_TRADE=true` real vale la pena confirmarlo una vez en BingX (Cuenta →
+Preferencias → Modo de posición) antes de dejarlo desatendido.
+
+Dato que sí cambió: el rate limit compartido de los endpoints de datos de
+mercado que cita este documento y `scanner.py` (500 peticiones/10s) quedó
+desactualizado — BingX lo subió a 2.000 peticiones/10s a lo largo de 2025.
+El pacing actual de `scanner.py` (`REQUEST_PACING_SECONDS`) seguía siendo
+conservador incluso bajo el límite viejo, así que no hay urgencia de
+tocarlo, pero si algún día quieres escanear más símbolos por ciclo en modo
+`SYMBOLS=ALL`, hay bastante más margen del que sugería el comentario
+original.
+
+### 7.4 Conclusión de esta ronda
+
+Nada de esto cambia la recomendación de fondo de este documento (sección
+4): el filtro de régimen es una idea razonable con algo de respaldo
+empírico real pero nada garantizado, y el valor más fiable de todo el
+sistema sigue siendo la disciplina de riesgo — sizing por %, SL/TP por ATR,
+verificación de que el SL/TP se adjuntó de verdad, tope duro de posiciones.
+Vale la pena decirlo explícitamente porque es relevante para la decisión
+tomada en esta misma sesión de desactivar el circuit breaker automático
+(pérdidas consecutivas / drawdown diario): de los cuatro mecanismos de
+disciplina que este bot implementa, ahora quedan tres activos (sizing,
+SL/TP verificado, tope duro de posiciones) y uno queda como opt-in
+(`CIRCUIT_BREAKER_ENABLED=true` para recuperarlo). No es una corrección de
+rumbo, es información para que la decisión siga siendo la tuya con el
+panorama completo delante.

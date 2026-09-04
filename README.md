@@ -96,11 +96,21 @@ git push -u origin main
      solo con `.strip()`, pero mejor pegarlas bien).
    - `TELEGRAM_BOT_TOKEN` (de @BotFather) y `TELEGRAM_CHAT_ID` (de @userinfobot
      o tu chat con el bot).
-   - `WEBHOOK_SECRET`: genera uno con `openssl rand -hex 24` (solo hace
-     falta si algún día usas el webhook de TradingView; con `SIGNAL_SOURCE=python`
-     no se usa, pero déjalo puesto por si acaso).
+   - `WEBHOOK_SECRET`: genera uno con `openssl rand -hex 24`. **Es
+     obligatorio en cuanto `AUTO_TRADE=true` y `BINGX_DEMO=false`** —
+     protege `/emergency-stop` y `/reset-breaker`, y si está vacío con esa
+     combinación el bot **no arranca** (`sys.exit` nada más levantar),
+     aunque uses `SIGNAL_SOURCE=python` y no toques el webhook de
+     TradingView para nada. Un `WEBHOOK_SECRET` vacío en real+auto es la
+     causa más probable de "no hace nada": el proceso entero no llega a
+     levantar en Railway y por tanto tampoco manda nada a Telegram.
    - `SYMBOLS=BTC-USDT` (o varios separados por coma: `BTC-USDT,ETH-USDT`).
-   - Deja `AUTO_TRADE=false` la primera semana. Solo señales, cero riesgo.
+   - El `RAILWAY_VARIABLES.env` de este repo ya viene con `AUTO_TRADE=true`,
+     `BINGX_DEMO=false` y un `WEBHOOK_SECRET` ya generado, listo para
+     operar con dinero real desde el primer deploy. Si prefieres validar
+     primero en manual o en demo (recomendable si es tu primera vez con
+     este bot en concreto), cambia `AUTO_TRADE=false` y/o `BINGX_DEMO=true`
+     en Railway antes de pegarlo.
 4. Deploy. Railway te da una URL tipo `https://tu-app.up.railway.app`.
 5. Prueba: `curl https://tu-app.up.railway.app/` debe devolver
    `{"status":"ok","signal_source":"python","symbols":["BTC-USDT"],...}`.
@@ -170,8 +180,13 @@ filtro sin esperar a que dispare.
 
 Antes de `AUTO_TRADE=true` con dinero real, en este orden:
 
-1. **Volume persistente en Railway montado** (sección 0). Sin esto, el
-   circuit breaker y el conteo de posiciones pueden perderse en un redeploy.
+1. **Volume persistente en Railway montado en `/data`** (sección 0). El
+   `RAILWAY_VARIABLES.env` de este repo ya trae `STATE_FILE=/data/state.json`
+   listo para eso. Si despliegas sin crear el Volume, el bot ya no revienta
+   (crea el directorio al vuelo y te avisa por Telegram la primera vez),
+   pero el estado NO sobrevive a un redeploy hasta que el Volume esté
+   montado de verdad — créalo ANTES del primer deploy en real para no
+   depender de esa red de seguridad.
 2. **`BINGX_DEMO=false`** cuando estés listo — antes de eso, corre al menos
    unos días con `BINGX_DEMO=true` para confirmar que las entradas,
    SL/TP y cierres funcionan de principio a fin contra la cuenta VST. El
@@ -183,13 +198,22 @@ Antes de `AUTO_TRADE=true` con dinero real, en este orden:
 4. **`RISK_PCT_PER_TRADE` bajo** (1% o menos) y **`LEVERAGE` moderado**
    (5-10x) — no lo que uses en un experimento, lo que estés dispuesto a
    perder mientras confirmas que todo funciona como esperas.
-5. **`HARD_MAX_TOTAL_POSITIONS` bajo** (3-5) las primeras semanas.
-6. Cambia `AUTO_TRADE=true` en Railway (redeploy automático).
+5. **`HARD_MAX_TOTAL_POSITIONS` bajo** (3-5) las primeras semanas. Con
+   `CIRCUIT_BREAKER_ENABLED=false` (el valor por defecto ahora) este tope
+   es, junto con `/emergency-stop`, el único freno automático que queda
+   contra un descontrol -- vale la pena mantenerlo bajo mientras confirmas
+   que todo va como esperas, incluso con las demás protecciones ya en real.
+6. Cambia `AUTO_TRADE=true` en Railway (redeploy automático) -- si usaste
+   el `RAILWAY_VARIABLES.env` de este repo tal cual, ya viene así.
 7. Verifica con `curl https://tu-app.up.railway.app/positions` que lo que
    ves ahí coincide con lo que ves en la web de BingX.
-8. Vigila el circuit breaker: se activa solo tras `MAX_CONSECUTIVE_LOSSES`
-   pérdidas seguidas o `MAX_DAILY_DRAWDOWN_PCT`% de drawdown diario, y te
-   avisa por Telegram. Para reactivarlo manualmente:
+8. **Circuit breaker (opt-in, desactivado por defecto):** con
+   `CIRCUIT_BREAKER_ENABLED=false` el bot YA NO se pausa solo por
+   `MAX_CONSECUTIVE_LOSSES` pérdidas seguidas ni por `MAX_DAILY_DRAWDOWN_PCT`%
+   de drawdown diario -- sigue operando pase lo que pase, mientras
+   `HARD_MAX_TOTAL_POSITIONS` lo permita. Si quieres recuperar ese freno
+   automático, pon `CIRCUIT_BREAKER_ENABLED=true` en Railway (redeploy) sin
+   tocar código. Con el freno activo, para reactivarlo tras dispararse:
    ```bash
    curl -X POST https://tu-app.up.railway.app/reset-breaker/<WEBHOOK_SECRET>
    ```
@@ -222,6 +246,36 @@ directamente:
   guarda en un JSON local, no hay lock distribuido. El scheduler corre en un
   hilo de background dentro del mismo proceso — no necesitas un segundo
   servicio en Railway.
+- **Disponibilidad 24/7**: `railway.json` usa `restartPolicyType: "ALWAYS"`
+  en vez de `ON_FAILURE` con un tope de reintentos — con `ON_FAILURE` y
+  reintentos agotados, Railway deja el servicio caído hasta un deploy
+  manual (visto en incidentes reales de otros usuarios de Railway,
+  septiembre 2026); `ALWAYS` sigue reintentando con backoff exponencial
+  indefinidamente. También se subió `--timeout` de gunicorn (30s → 120s)
+  porque un `/scan` manual sobre muchos símbolos podía superar los 30s y
+  gunicorn mataba el worker a mitad de petición -- eso también corta el
+  scheduler en background, ya que comparte proceso. Y se añadió
+  `healthcheckPath: "/"` para que Railway no sustituya un deploy sano por
+  uno roto.
+- **Circuit breaker opt-in** (`CIRCUIT_BREAKER_ENABLED`, `false` por
+  defecto): `state_manager.check_circuit_breaker()` sigue registrando
+  pérdidas consecutivas y equity diaria para `/status`, pero ya no bloquea
+  entradas por eso salvo que lo actives. Un halt manual (`/emergency-stop`)
+  SÍ se sigue respetando siempre, esté el flag activo o no -- es el único
+  freno que no se puede desactivar por variable de entorno, a propósito.
+- **Avisos de Telegram para abrir a mano**: cualquier señal que NO se
+  ejecuta automáticamente (modo manual, circuit breaker si está activo,
+  tope de posiciones alcanzado, fallo de BingX, etc.) manda el precio/SL/TP
+  completos por Telegram con una invitación explícita a abrirla tú --
+  antes, el aviso de tope de posiciones y el de circuit breaker no traían
+  esos datos.
+- **`STATE_FILE` sin Volume montado**: si la carpeta de `STATE_FILE` no
+  existe (Volume de Railway no montado todavía), `state_manager.py` la crea
+  al vuelo la primera vez en vez de reventar -- justo después de registrar
+  una entrada ya ejecutada en BingX es el peor momento para perder esa
+  llamada -- y avisa una sola vez por Telegram de que el estado no
+  sobrevivirá al próximo redeploy hasta que el Volume esté de verdad
+  montado.
 - **Firma HMAC**: se construye el query string ordenado UNA vez y se usa
   igual para firmar y transmitir — evita el bug de mismatch orden-firma/
   orden-transmisión que ya diste con `renewed-love`/`joyful-art`/`bot22`.
@@ -231,7 +285,10 @@ directamente:
   sola (SL/TP), consulta `/openApi/swap/v2/user/income` para el PnL real.
 - **positionSide**: el bot asume cuenta en modo **hedge** (LONG/SHORT
   simultáneos posibles). Si tu cuenta BingX está en modo one-way, cambia
-  `positionSide` a `"BOTH"` en `bingx_client.place_market_order`.
+  `positionSide` a `"BOTH"` en `bingx_client.place_market_order` -- BingX
+  rechazaría toda entrada si esto no coincide con el modo real de tu
+  cuenta, así que confírmalo una vez en BingX (Cuenta → Preferencias →
+  Modo de posición) antes de dejarlo desatendido.
 - Los endpoints de BingX (`stopLoss`/`takeProfit` embebidos, `/quote/klines`
   v3, `/user/income`) están confirmados por documentación pública y SDKs de
   terceros, pero **verifica en modo demo (`BINGX_DEMO=true` + endpoint VST)

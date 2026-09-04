@@ -41,6 +41,7 @@ def format_entry_signal(alert: dict, executed: bool, qty: float = None, error: s
         lines.append(f"✅ Ejecutado en BingX (qty: {qty})")
     elif error:
         lines.append(f"⚠️ NO ejecutado — {error}")
+        lines.append("👉 Puedes abrirla tú a mano con el precio/SL/TP de arriba si te convence.")
     else:
         lines.append("ℹ️ Modo manual: abre la posición tú mismo si te convence.")
     return "\n".join(lines)
