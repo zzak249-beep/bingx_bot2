@@ -35,6 +35,7 @@ from apscheduler.triggers.cron import CronTrigger
 import csv
 import os
 
+import atrous
 import config
 import scanner
 import signal_engine
@@ -124,10 +125,13 @@ SIGNALS_LOG = os.path.join(
 
 _LOG_COLS = ["ts_señal", "fecha_utc", "symbol", "side", "timeframe",
              "price", "sl", "tp", "atr", "is_trending", "ejecutada",
-             "motivo_no_ejecutada"]
+             "motivo_no_ejecutada",
+             # à trous EN SOMBRA: se anota, no decide. Ver atrous.py.
+             "at_pendiente", "at_macro", "at_acuerdo", "at_ruido", "at_retardo"]
 
 
-def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = ""):
+def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = "",
+                    ctx: dict | None = None):
     """
     Guarda TODAS las señales, ejecutadas o no.
 
@@ -163,6 +167,8 @@ def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = ""):
                 "is_trending": sig.get("is_trending"),
                 "ejecutada": int(bool(ejecutada)),
                 "motivo_no_ejecutada": motivo,
+                **{k: (ctx or {}).get(k) for k in
+                   ("at_pendiente", "at_macro", "at_acuerdo", "at_ruido", "at_retardo")},
             })
     except Exception:
         # El registro NUNCA puede tumbar el bot ni bloquear una entrada.
@@ -227,12 +233,26 @@ def job_generate_signals(main_module, bx, state):
                 continue  # ya procesamos esta vela (evita duplicar en restart)
 
             alert = _build_alert(symbol, sig)
+
+            # à trous EN SOMBRA. Se calcula y se anota; NO cambia ninguna
+            # decisión. Activarla como criterio invalidaría la muestra de
+            # operaciones ya medidas. En 8 semanas se compara si separa
+            # ganadoras de perdedoras y entonces se decide CON DATOS.
+            ctx = None
+            try:
+                ctx = atrous.contexto(
+                    [float(x) for x in df["close"].tolist()],
+                    alert["positionSide"])
+            except Exception:
+                log.debug("%s: no se pudo calcular el contexto à trous", symbol)
+
             log.info("Señal generada para %s: %s", symbol, alert)
             state.set_last_signal_ts(symbol, sig["timestamp"])
 
             if halted:
                 registrar_senal(alert, sig, False,
-                                f"circuit breaker: {state.state.get('halt_reason')}")
+                                f"circuit breaker: {state.state.get('halt_reason')}",
+                                ctx)
                 telegram_notifier.send(
                     telegram_notifier.format_entry_signal(
                         alert,
@@ -251,7 +271,8 @@ def job_generate_signals(main_module, bx, state):
                 ejecutada = state.open_count() > antes
                 registrar_senal(
                     alert, sig, ejecutada,
-                    "" if ejecutada else "sin hueco o rechazada en _handle_entry")
+                    "" if ejecutada else "sin hueco o rechazada en _handle_entry",
+                    ctx)
         except Exception:
             log.exception("Error generando señal para %s", symbol)
         finally:
