@@ -1,805 +1,1179 @@
 """
-Wavelet MRA Haar 5m — Webhook receiver para TradingView -> BingX + Telegram.
+Bot Wavelet MRA — BingX.
 
-Flujo:
-  TradingView (alert() del Pine, formato JSON) --POST--> /webhook/<WEBHOOK_SECRET>
-  -> valida y parsea el JSON
-  -> si AUTO_TRADE=true: ejecuta en BingX (con circuit breaker + sizing)
-  -> en todos los casos: manda la señal a Telegram (para operar manualmente
-     si AUTO_TRADE=false, o como confirmación si AUTO_TRADE=true)
-  -> persiste el estado para reconciliación tras un restart de Railway
+Descomposición multiescala causal + cruce sobre la aproximación, con el
+filtro de régimen corregido (energía normalizada por escala).
 
-ÁMBITO: esta cuenta de BingX la comparten varios bots de la flota y
-operativa manual del usuario. Todo lo que este bot GESTIONA (contar para
-los topes, cerrar por falta de SL, la parada de emergencia) se limita por
-defecto a las posiciones que él mismo abrió y registró en el estado. Lo
-ajeno se informa, no se toca.
-
-Configura la alerta en TradingView con "Webhook URL":
-  https://<tu-app>.up.railway.app/webhook/<WEBHOOK_SECRET>
-y como mensaje: {{strategy.order.alert_message}}  (o deja que sea el propio
-JSON que genera `alert(json_..., alert.freq_once_per_bar_close)` del script;
-en ese caso usa "Any alert() function call" al crear la alerta).
+Hereda toda la infraestructura ya probada en producción: margen
+aislado, límite global de posiciones, pérdida diaria máxima,
+reconciliación contra el exchange, diario de operaciones reales,
+verificación tras respuesta perdida y redondeo a la precisión del
+contrato.
 """
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
 import logging
-import sys
+import os
+import time
 
-from flask import Flask, jsonify, request
+import httpx
 
-import bingx_client
 import config
-import telegram_notifier
-from state_manager import StateManager
+import funding
+import guardas as gd
+import journal
+import polymarket as pm
+import strategy
+import tca
+from bingx import BingX, BingXError
+from notify import State, Telegram
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    level=getattr(logging, getattr(config, "LOG_LEVEL", "INFO"), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("main")
+if getattr(config, "LOG_LEVEL", "INFO") != "DEBUG":
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-app = Flask(__name__)
-bx = bingx_client.BingXClient()
-state = StateManager()
+log = logging.getLogger("bot")
 
-log.info(
-    "=" * 70 + "\nENTORNO BINGX: %s | AUTO_TRADE=%s\n" + "=" * 70,
-    "DEMO / VST (dinero simulado)" if config.BINGX_DEMO else "⚠️ PRODUCCIÓN — DINERO REAL ⚠️",
-    config.AUTO_TRADE,
-)
 
-# --------------------------------------------------------------------------- #
-# GUARDIA DE ARRANQUE PARA DINERO REAL. Con AUTO_TRADE=true y BINGX_DEMO=false
-# el bot puede abrir/cerrar posiciones reales. Los endpoints /emergency-stop y
-# /reset-breaker son el ÚNICO freno manual que existe, y ambos dependen de
-# WEBHOOK_SECRET -- si está vacío, esas rutas son inalcanzables (Flask no
-# admite un segmento de URL vacío) y no hay forma de pararlo desde fuera sin
-# tocar variables de Railway y esperar un redeploy. Se rehúsa a arrancar en
-# real sin ese freno en vez de descubrirlo el día que algo va mal.
-if config.AUTO_TRADE and not config.BINGX_DEMO and not config.WEBHOOK_SECRET:
-    log.critical(
-        "AUTO_TRADE=true y BINGX_DEMO=false (dinero real) pero WEBHOOK_SECRET "
-        "está vacío -- /emergency-stop y /reset-breaker quedarían inutilizables. "
-        "Define WEBHOOK_SECRET en Railway (ej. `openssl rand -hex 24`) antes de arrancar en real."
-    )
-    sys.exit(1)
 
-# Aviso si el estado (posiciones, circuit breaker, cooldown) no está en una
-# ruta que sobreviva a un redeploy. Railway borra el disco del contenedor en
-# cada redeploy salvo que STATE_FILE apunte a un Volume montado (ver README
-# sección 0). Una ruta relativa como "state.json" NUNCA sobrevive.
-if config.AUTO_TRADE and not config.BINGX_DEMO and not config.STATE_FILE.startswith("/"):
-    _msg = (
-        f"⚠️ STATE_FILE='{config.STATE_FILE}' es una ruta relativa -- se perderá en el "
-        "próximo redeploy (circuit breaker y cooldown se resetearán a cero). Monta un "
-        "Volume en Railway y pon STATE_FILE=/data/state.json (o la ruta del Volume)."
-    )
-    log.warning(_msg)
-    telegram_notifier.send(_msg)
+_DEFAULTS = {
+    "LOOKBACK_ENERGY": 40, "APPROX_LEN": 8, "ATR_LEN": 14,
+    "NORMALIZE_SCALES": True, "DOMINANCE_THRESHOLD": 1.30,
+    "ALLOW_LONG": True, "ALLOW_SHORT": True,
+    "USE_VOL_FILTER": True, "VOL_LEN": 20, "VOL_MULT": 1.2,
+    "MRA_LEVELS": 4, "CROSS_SOURCE": "trend",
+    "USE_PERSISTENCE": True, "MIN_PERSISTENCE": 0.60, "RECV_WINDOW": 5000,
+    "POST_ONLY": True, "FEE_MAKER_PCT": 0.02, "FEE_TAKER_PCT": 0.05,
+    "USE_TCA": True, "MIN_TCA_SAMPLES": 10, "TCA_BLACKLIST_MULT": 2.0,
+    "ACCOUNT_DAILY_LOSS": True, "RANK_CANDIDATES": True,
+    "USE_DD_BRAKE": True, "DD_BRAKE_PCT": 10.0, "DD_RESUME_PCT": 5.0,
+    "DD_BRAKE_FACTOR": 0.5,
+    "USE_HTF_FILTER": True, "HTF_MA_LEN": 200,
+    "USE_TRAILING": False, "TRAIL_ATR": 2.0, "TRAIL_START_R": 1.0,
+    "SL_ATR": 1.5, "TP_ATR": 2.5, "MAX_TRADE_MINUTES": 120,
+    "USE_TIME_EXIT": True, "TIME_EXIT_ONLY_LOSING": True,
+    "COST_ROUNDTRIP_PCT": 0.25, "MIN_ATR_PCT": 0.5, "MIN_COST_COVER": 6.0,
+    "MAX_COST_IN_R": 0.20, "MAX_RISK_PCT": 4.0,
+    "MIN_QUOTE_VOLUME_24H": 2_000_000.0, "TIMEFRAME": "5m",
+    "SCAN_INTERVAL_SEC": 60, "MAX_SYMBOLS": 400, "SCAN_CONCURRENCY": 8,
+    "SYMBOL_WHITELIST": [], "EXCLUDE_PREFIXES": ["NC"],
+    "RISK_PCT": 0.5, "MAX_CONCURRENT": 1, "MAX_TOTAL_POSITIONS": 3,
+    "LEVERAGE": 2, "MARGIN_MODE": "ISOLATED",
+    "MAX_CONSECUTIVE_LOSSES": 3, "COOLDOWN_MINUTES": 120,
+    "MAX_DAILY_LOSS_R": 3.0, "COOLDOWN_BARS": 4,
+    "ENTRY_TYPE": "LIMIT", "LIMIT_OFFSET_PCT": 0.05, "LIMIT_TTL_MIN": 10,
+    "SIGNAL_COOLDOWN_MIN": 60, "WATCHLIST_MIN": 30,
+    "DAILY_SUMMARY": True, "DAILY_SUMMARY_HOUR_UTC": 7,
+    "HEARTBEAT_HOURS": 12, "IDLE_ALERT_DAYS": 5, "ZOMBIE_ALERT_HOURS": 6, "BTC_CONTEXT": True, "FUNDING_ALERTS": True, "FUNDING_EXTREMO": 0.05,
+    "FUNDING_ALERT_MIN": 120, "CARRY_MAX_DIAS_COBERTURA": 3.0, "SALDO_ESTIMADO": 135.0, "BTC_FILTER": False, "BTC_MIN_24H": -3.0,
+    "TIMEFRAMES": ["5m"], "MIN_RISK_PCT": 0.0,
+    "PM_ENABLED": True, "PM_BASE": "BTC", "PM_REPORT_MIN": 180,
+    "PM_REFRESH_MIN": 15, "PM_BLOCK_ON_EVENT": False,
+    "PM_MIN_LIQUIDITY": 5000.0, "PM_MIN_VOLUME": 20000.0,
+    "PM_TRUST_LO": 0.15, "PM_TRUST_HI": 0.85, "PM_MIN_LADDER": 4,
+    "PM_EVENT_HOURS": 6.0, "PM_EVENT_LO": 0.20, "PM_EVENT_HI": 0.80,
+    "PM_VRP_HIGH": 1.25, "PM_VRP_LOW": 0.80, "PM_TIMEOUT": 12,
+    "GUARD_ENABLED": True, "GUARD_BLOQUEAR_SLTP": True,
+    "GUARD_COLCHON": 0.95, "GUARD_MAX_RIESGO_PCT": 3.0,
+    "GUARD_MIN_RATIO": 1.0, "GUARD_AVISO_MIN": 30,
+    "STATE_PATH": "/data/state_wavelet.json", "LOG_LEVEL": "INFO",
+}
 
-if not config.BINGX_DEMO and config.AUTO_TRADE:
-    telegram_notifier.send(
-        "🔴 *Bot arrancado en PRODUCCIÓN con AUTO_TRADE=true* — las órdenes "
-        "que ejecute serán con dinero real."
-    )
 
-# Reconciliación al arrancar (best-effort; si BingX no está configurado,
-# se registra el error y el bot sigue en modo señal/Telegram).
-if config.BINGX_API_KEY:
+def _desde_entorno(nombre: str, valor):
+    """
+    Lee PM_* del entorno de Railway.
+
+    config.py no conoce estos ajustes, así que ensure_config les pondría el
+    valor por defecto y las variables del raw editor no harían nada. Esto
+    evita tener que tocar config.py: un archivo menos que coordinar.
+    """
+    bruto = os.getenv(nombre)
+    if bruto is None:
+        return valor
+    bruto = bruto.strip()
     try:
-        state.reconcile(bx)
-    except Exception:
-        log.exception("Reconciliación inicial falló, continuando de todas formas")
-
-    # Valida que los símbolos de SYMBOLS existen en BingX -- si hay un typo
-    # (ej. "BTCUSDT" en vez de "BTC-USDT"), es mejor avisar ahora que
-    # descubrirlo por un error silencioso repetido cada 5 minutos.
-    _invalid_symbols = []
-    for _sym in config.SYMBOLS:
-        try:
-            _filters = bx.get_symbol_filters(_sym)
-            if not _filters:
-                _invalid_symbols.append(_sym)
-        except Exception:
-            log.exception("No se pudo validar el símbolo %s al arrancar", _sym)
-            _invalid_symbols.append(_sym)
-    if _invalid_symbols:
-        _msg = f"⚠️ Símbolos en SYMBOLS que BingX no reconoce: {_invalid_symbols}. Revisa el formato (BASE-QUOTE, ej. BTC-USDT)."
-        log.warning(_msg)
-        telegram_notifier.send(_msg)
-
-# --------------------------------------------------------------------------- #
-# Generador de señales propio (no depende de TradingView). Se activa por
-# defecto (SIGNAL_SOURCE=python). Si prefieres seguir usando el webhook de
-# TradingView, pon SIGNAL_SOURCE=tradingview y ENABLE_SCHEDULER=false.
-# --------------------------------------------------------------------------- #
-_scheduler = None
-if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
-    import poller
-    import sys as _sys
-    _scheduler = poller.start(_sys.modules[__name__], bx, state)
+        if isinstance(valor, bool):
+            return bruto.lower() in ("1", "true", "yes", "si", "sí", "on")
+        if isinstance(valor, int):
+            return int(float(bruto))
+        if isinstance(valor, float):
+            return float(bruto)
+    except ValueError:
+        log.warning("%s='%s' no se pudo leer, se usa %r", nombre, bruto, valor)
+        return valor
+    return bruto
 
 
-# --------------------------------------------------------------------------- #
-def _live_positions():
-    """Todas las posiciones abiertas en la cuenta (incluye las ajenas)."""
-    return [
-        p for p in bx.get_positions()
-        if float(p.get("positionAmt", p.get("positionSize", 0)) or 0) != 0
+def ensure_config() -> list[str]:
+    """Un config.py antiguo no puede tumbar un bot con dinero real."""
+    faltan = []
+    for nombre, valor in _DEFAULTS.items():
+        if not hasattr(config, nombre):
+            if nombre.startswith("PM_") or nombre.startswith("GUARD_"):
+                valor = _desde_entorno(nombre, valor)
+            setattr(config, nombre, valor)
+            faltan.append(nombre)
+    return faltan
+
+
+def fmt_signal(sig: strategy.Signal, live: bool) -> str:
+    cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
+    lado = "LARGO" if sig.side == "BUY" else "CORTO"
+    nombre = sig.symbol.split("-")[0]
+    partes = [
+        f"{cabecera} · {lado} <b>{nombre}</b>  (wavelet MRA)",
+        f"Entrada <code>{sig.entry:.8g}</code>",
+        f"SL <code>{sig.sl:.8g}</code>  ·  TP <code>{sig.tp:.8g}</code>",
+        f"Riesgo {sig.riesgo_pct:.2f}%  ·  coste {sig.coste_r:.2f} R "
+        + (f"({sig.coste_pct:.3f}% medido en {sig.coste_ops} ops)"
+           if getattr(sig, "coste_ops", 0) else
+           f"({getattr(sig, 'coste_pct', config.COST_ROUNDTRIP_PCT):.3f}% estimado)"),
+        f"Dominancia {sig.ratio:.2f} (umbral {sig.umbral:.2f}) · "
+        f"ER tendencia {getattr(sig, 'persist', 0):.2f} · h8 {sig.h8:+.4f}",
+        f"ATR {sig.atr_pct:.2f}% · {getattr(sig, 'timeframe', config.TIMEFRAME)}"
+        + (f" · BTC {sig.btc_24h:+.1f}% 24h" if getattr(sig, "btc_24h", None) is not None else ""),
     ]
+    if getattr(sig, "funding", None) is not None:
+        partes.append(
+            f"Funding {sig.funding:+.4f}%/8h — {funding.sesgo(sig.funding)}"
+        )
+    snap = getattr(sig, "pm", None)
+    if snap and snap.get("ok") and snap.get("vrp"):
+        partes.append(
+            f"Polymarket VRP {snap['vrp']:.2f} — {pm.sesgo(snap)}"
+            + (f" · P(BTC sube) {snap['p_sube']:.0%}" if snap.get("p_sube") else "")
+            + (f" · ⏳ evento en {snap['evento_horas']:.1f}h" if snap.get("evento_activo") else "")
+        )
+    return chr(10).join(partes)
 
 
-# --------------------------------------------------------------------------- #
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify(
-        status="ok",
-        bingx_env=("demo/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL"),
-        bingx_base_url=bx.base_url,
-        auto_trade=config.AUTO_TRADE,
-        signal_source=config.SIGNAL_SOURCE,
-        symbols=("ALL (perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS),
-        open_positions=state.open_count(),
-        halted=state.state.get("trading_halted"),
-    )
+class Bot:
+    def __init__(self) -> None:
+        self.state = State(config.STATE_PATH)
+        self.client = httpx.AsyncClient()
+        self.api = BingX(self.client)
+        self.tg = Telegram(self.client)
+        self.symbols: list[str] = []
+        self.volumes: dict[str, float] = {}
+        self.live = config.is_live()
+        self.last_heartbeat = time.time()
+        self.last_watchlist = 0.0
+        self.btc_24h: float | None = None
+        self.funding: dict[str, float] = {}
+        self._pendientes_aviso: list = []
+        # Signal de cada limitada en vuelo (no cabe en el JSON del estado)
+        self._sig_pendiente: dict = {}
+        self.riesgo_factor = 1.0      # freno de drawdown
+        self.cuenta_r_hoy: float | None = None
+        self._cuenta: dict = {}
+        self._cuenta_ts = 0.0
+        self.last_funding_alert = 0.0
+        self.btc_ts = 0.0
+        self.pm_snap: dict = {}
+        self.pm_ts = 0.0
+        self.last_pm_alert = 0.0
+        self.sem = asyncio.Semaphore(config.SCAN_CONCURRENCY)
+        self.journal = journal.Journal(
+            os.path.join(os.path.dirname(config.STATE_PATH) or "/data", "operaciones_wavelet.csv")
+        )
 
+    async def start(self) -> None:
+        faltan = ensure_config()
+        # Los PM_* NUNCA están en config.py: se inyectan a propósito para no
+        # tener que coordinar un archivo más. Sacarlos por ERROR entrena a
+        # ignorar los ERROR de verdad, que es como se pierde el que importa.
+        pm_faltan = [n for n in faltan if n.startswith("PM_")]
+        otros = [n for n in faltan if not n.startswith("PM_")]
+        if pm_faltan:
+            log.info("Polymarket: %d ajustes desde _DEFAULTS/entorno "
+                     "(esperado, no es un fallo)", len(pm_faltan))
+        if otros:
+            log.error("config.py desactualizado, faltaban: %s", ", ".join(otros))
+        log.info("Modo: %s", config.describe())
+        await self.tg.send(
+            "🤖 <b>Bot Wavelet MRA iniciado</b>" + chr(10)
+            + config.describe() + chr(10)
+            + f"Dominancia ≥{config.DOMINANCE_THRESHOLD} "
+            + ("(normalizada por escala)" if config.NORMALIZE_SCALES else "(SIN normalizar — modo original)") + chr(10)
+            + f"Cruce sobre SMA({config.APPROX_LEN}) con la escala gruesa a favor" + chr(10)
+            + f"Timeframe {config.TIMEFRAME} · riesgo {config.RISK_PCT}% · "
+            + f"SL {config.SL_ATR} ATR / TP {config.TP_ATR} ATR" + chr(10)
+            + f"Entrada {config.ENTRY_TYPE}"
+            + (" POST-ONLY" if config.POST_ONLY else " (taker si cruza)")
+            + f" · comisión ida y vuelta {tca.comision_ida_vuelta():.3f}%" + chr(10)
+            + ("TCA por símbolo activo" if config.USE_TCA else "TCA apagado")
+            + f" · límite diario "
+            + ("de CUENTA" if config.ACCOUNT_DAILY_LOSS else "por bot")
+            + f" {config.MAX_DAILY_LOSS_R}R"
+            + (f" · freno de drawdown al {config.DD_BRAKE_PCT}%"
+               if config.USE_DD_BRAKE else "") + chr(10)
+            + ("Guardas pre-orden ON (SL/TP, margen, riesgo)"
+               if config.GUARD_ENABLED else "⚠️ GUARDAS PRE-ORDEN APAGADAS") + chr(10)
+            + ("Polymarket: contexto ON"
+               + (" · freno por evento ACTIVO" if config.PM_BLOCK_ON_EVENT
+                  else " · freno por evento en REGISTRO")
+               if config.PM_ENABLED else "Polymarket apagado")
+        )
+        await self.refresh_symbols()
+        while True:
+            try:
+                await self.reconcile()
+                await self.maybe_watchlist()
+                await self.maybe_funding()
+                await self.maybe_polymarket()
+                await self.manage_open()
+                await self.maybe_daily_summary()
+                await self.maybe_idle_alert()
+                await self.maybe_heartbeat()
+                await self.scan_once()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Fallo en el ciclo: %s", exc)
+            await asyncio.sleep(config.SCAN_INTERVAL_SEC)
 
-@app.route("/status", methods=["GET"])
-def status():
-    """Diagnóstico más completo: próximas ejecuciones del scheduler,
-    posiciones abiertas conocidas y estado del circuit breaker."""
-    jobs = []
-    if _scheduler:
-        for job in _scheduler.get_jobs():
-            jobs.append({
-                "id": job.id,
-                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
-            })
-
-    # Cuenta compartida: distinguir lo nuestro de lo ajeno es justo lo que
-    # hacía falta para diagnosticar por qué el bot no abría.
-    nuestras = set(state.state.get("positions", {}).keys())
-    try:
-        vivas = {p.get("symbol") for p in _live_positions()}
-    except Exception as e:
-        vivas, err = set(), str(e)
-    else:
-        err = None
-
-    return jsonify(
-        auto_trade=config.AUTO_TRADE,
-        signal_source=config.SIGNAL_SOURCE,
-        symbols=config.SYMBOLS,
-        scheduler_jobs=jobs,
-        open_positions=state.state.get("positions", {}),
-        consecutive_losses=state.state.get("consecutive_losses"),
-        trading_halted=state.state.get("trading_halted"),
-        halt_reason=state.state.get("halt_reason"),
-        daily_start_equity=state.state.get("daily_start_equity"),
-        daily_date=state.state.get("daily_date"),
-        posiciones_propias_vivas=sorted(nuestras & vivas),
-        posiciones_ajenas_en_la_cuenta=sorted(vivas - nuestras),
-        error_leyendo_bingx=err,
-    )
-
-
-@app.route("/signal-check/<symbol>", methods=["GET"])
-def signal_check(symbol):
-    """Diagnóstico: calcula la señal actual para un símbolo sin ejecutar
-    nada, para verificar que el motor de señales lee bien BingX."""
-    import signal_engine
-    import poller as _poller
-    try:
-        rows = bx.get_klines(symbol.upper(), interval="5m", limit=config.WAVELET_LOOKBACK_ENERGY + 60)
-        df = signal_engine.klines_to_df(rows)
-        sig = signal_engine.compute_signal(df, _poller._params(), last_signal_ts=state.get_last_signal_ts(symbol.upper()))
-        return jsonify(symbol=symbol.upper(), bars=len(df), signal=sig)
-    except Exception as e:
-        return jsonify(error=str(e)), 500
-
-
-@app.route("/scan", methods=["GET"])
-def scan():
-    """Analiza TODAS las monedas de BingX (o las que estén en SYMBOLS) con
-    el filtro wavelet, sin ejecutar ni notificar nada -- solo para mirar.
-    Parámetros opcionales: ?quote=USDT (default) y ?limit=N (símbolos máx.).
-    Puede tardar varios segundos/minutos si escaneas todo el universo.
-    """
-    import poller as _poller
-    import scanner as _scanner
-
-    quote = request.args.get("quote", "USDT").upper()
-    limit = int(request.args.get("limit", config.SCAN_ALL_MAX_SYMBOLS))
-    notify = request.args.get("notify", "false").lower() == "true"
-
-    try:
-        if config.SYMBOLS and not config.SCAN_ALL_SYMBOLS:
-            symbols = config.SYMBOLS
-        else:
-            symbols = bx.get_all_symbols(quote_filter=quote)[:limit]
-    except Exception as e:
-        return jsonify(error=f"no se pudo listar símbolos: {e}"), 500
-
-    results = _scanner.scan_symbols(bx, config, symbols)
-    ranked = _scanner.rank_results(results)
-
-    if notify:
-        telegram_notifier.send(_scanner.format_scan_summary(ranked))
-
-    return jsonify(symbols_requested=len(symbols), **ranked)
-
-
-@app.route("/webhook/<secret>", methods=["POST"])
-def webhook(secret):
-    if not config.WEBHOOK_SECRET or secret != config.WEBHOOK_SECRET:
-        log.warning("Intento de webhook con secret inválido")
-        return jsonify(error="unauthorized"), 401
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        # TradingView a veces manda el JSON como texto plano
+    async def refresh_symbols(self) -> None:
         try:
-            import json as _json
-            payload = _json.loads(request.data.decode("utf-8"))
-        except Exception:
-            log.error("Payload no parseable: %s", request.data)
-            return jsonify(error="invalid json"), 400
-
-    log.info("Alerta recibida: %s", payload)
-
-    signal = payload.get("signal")
-    try:
-        if signal == "entry":
-            _handle_entry(payload)
-        elif signal == "exit":
-            _handle_exit(payload)
-        else:
-            log.warning("Tipo de señal desconocido: %s", signal)
-            return jsonify(error="unknown signal type"), 400
-    except Exception as e:
-        log.exception("Error procesando la alerta")
-        telegram_notifier.send(f"🚨 Error procesando alerta: `{e}`\nPayload: `{payload}`")
-        return jsonify(error=str(e)), 500
-
-    return jsonify(status="processed"), 200
-
-
-# --------------------------------------------------------------------------- #
-def _handle_entry(alert: dict):
-    tv_symbol = alert["symbol"]
-    symbol = config.tv_symbol_to_bingx(tv_symbol)
-    position_side = alert["positionSide"]          # LONG / SHORT
-    price = float(alert["price"])
-    sl = float(alert["sl"])
-    tp = float(alert["tp"])
-
-    if not config.AUTO_TRADE:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(alert, executed=False)
-        )
-        return
-
-    if state.get_open(symbol):
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False, error=f"ya hay posición abierta en {symbol}"
-            )
-        )
-        return
-
-    if state.open_count() >= config.MAX_CONCURRENT_POSITIONS:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False, error="límite de posiciones concurrentes alcanzado"
-            )
-        )
-        return
-
-    # Tope de seguridad ABSOLUTO contra las posiciones REALES en BingX que
-    # son DE ESTE BOT (no el estado local a secas, que puede haberse perdido
-    # si Railway reinició el contenedor sin un Volume persistente).
-    #
-    # Antes esto contaba TODAS las posiciones de la cuenta. Con otros bots
-    # de la flota y operativa manual compartiendo cuenta, bastaban unas
-    # pocas posiciones ajenas para dejar este bot bloqueado sin motivo.
-    try:
-        propias = state.count_own_live_positions(bx)
-    except Exception as e:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo verificar posiciones reales en BingX: {e}")
-        )
-        return
-    if propias >= config.HARD_MAX_TOTAL_POSITIONS:
-        telegram_notifier.send(
-            f"⛔ Tope de seguridad alcanzado: {propias} posiciones de ESTE bot abiertas en "
-            f"BingX (límite HARD_MAX_TOTAL_POSITIONS={config.HARD_MAX_TOTAL_POSITIONS}). "
-            f"Entrada en {symbol} bloqueada."
-        )
-        return
-
-    # No abrir encima de una posición ajena en el mismo símbolo: en hedge se
-    # fusionarían en una sola posición y ninguno de los dos bots sabría ya
-    # cuál es la suya.
-    try:
-        ajenas_mismo_simbolo = [
-            p for p in _live_positions()
-            if p.get("symbol") == symbol and not state.is_ours(symbol)
-        ]
-    except Exception:
-        ajenas_mismo_simbolo = []
-    if ajenas_mismo_simbolo:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False,
-                error=f"ya hay una posición en {symbol} que NO es de este bot (otro bot o manual)",
-            )
-        )
-        return
-
-    try:
-        equity = bx.get_balance()
-    except Exception as e:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo leer balance: {e}")
-        )
-        return
-
-    allowed, reason = state.check_circuit_breaker(equity)
-    if not allowed:
-        telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
-        return
-
-    # Sizing. Dos modos:
-    #   - por RIESGO (default): qty = (equity x RISK_PCT) / distancia_al_SL.
-    #     La pérdida si salta el stop es constante; el margen varía.
-    #   - por MARGEN FIJO (MARGIN_PER_TRADE_USDT > 0): nocional =
-    #     margen x LEVERAGE. El margen es constante; el riesgo varía y
-    #     queda acotado por MAX_RISK_PCT_ABS.
-    risk_amount = equity * (config.RISK_PCT_PER_TRADE / 100)
-    stop_distance = abs(price - sl)
-    if stop_distance <= 0:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(alert, executed=False, error="distancia a SL inválida")
-        )
-        return
-
-    # FRENO 3: stop demasiado estrecho. Con qty = riesgo / distancia, un
-    # stop muy pegado dispara el nocional (RIVER: stop al 0.76% -> 396 USDT
-    # de nocional sobre 150 de equity) y ademas deja el coste pesando
-    # demasiado sobre el resultado.
-    stop_pct = stop_distance / price * 100.0
-    if config.MIN_STOP_DISTANCE_PCT and stop_pct < config.MIN_STOP_DISTANCE_PCT:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False,
-                error=(f"stop demasiado estrecho: {stop_pct:.2f}% del precio "
-                       f"(mínimo {config.MIN_STOP_DISTANCE_PCT}%). Con un stop así "
-                       f"el nocional se dispara y el coste se come el resultado"),
-            )
-        )
-        return
-    if config.MARGIN_PER_TRADE_USDT > 0:
-        qty = bx.round_qty(symbol, (config.MARGIN_PER_TRADE_USDT * config.LEVERAGE) / price)
-        riesgo_real = qty * stop_distance
-        riesgo_pct = (riesgo_real / equity * 100) if equity > 0 else 999.0
-        if riesgo_pct > config.MAX_RISK_PCT_ABS:
-            telegram_notifier.send(
-                telegram_notifier.format_entry_signal(
-                    alert, executed=False,
-                    error=(f"margen fijo {config.MARGIN_PER_TRADE_USDT} USDT x "
-                           f"{config.LEVERAGE}x arriesgaría {riesgo_pct:.2f}% del equity "
-                           f"en este stop (tope {config.MAX_RISK_PCT_ABS}%)"),
-                )
-            )
+            syms = await self.api.symbols()
+        except Exception as exc:  # noqa: BLE001
+            log.error("No se pudo listar símbolos: %s", exc)
             return
-        log.info("%s: margen fijo %.2f USDT x%s -> qty=%s (riesgo %.2f%% del equity)",
-                 symbol, config.MARGIN_PER_TRADE_USDT, config.LEVERAGE, qty, riesgo_pct)
-    else:
-        qty = bx.round_qty(symbol, risk_amount / stop_distance)
-    if qty <= 0:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(alert, executed=False, error="qty tras redondeo de precisión es 0")
-        )
-        return
+        if config.SYMBOL_WHITELIST:
+            syms = [s for s in syms if s.split("-")[0].upper() in config.SYMBOL_WHITELIST]
+        try:
+            self.volumes = await self.api.tickers_24h()
+            antes = len(syms)
+            syms = [s for s in syms if self.volumes.get(s, 0.0) >= config.MIN_QUOTE_VOLUME_24H]
+            log.info("Liquidez: %d de %d superan %.0f USDT", len(syms), antes, config.MIN_QUOTE_VOLUME_24H)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Sin filtro de liquidez (%s)", exc)
+        self.symbols = syms[: config.MAX_SYMBOLS]
+        log.info("Universo: %d símbolos", len(self.symbols))
 
-    # Suelo de nocional. El sizing por riesgo da nocional = riesgo / stop%,
-    # así que en símbolos de stop ancho salían posiciones de céntimos donde
-    # las comisiones se comen cualquier resultado. Si el nocional queda por
-    # debajo del mínimo, se SUBE la cantidad -- pero eso aumenta el riesgo
-    # real por encima de RISK_PCT_PER_TRADE, así que se comprueba contra
-    # MAX_RISK_PCT_ABS y, si lo supera, se descarta la señal en vez de
-    # operarla con un riesgo no autorizado.
-    notional = qty * price
-    if (not config.MARGIN_PER_TRADE_USDT) and config.MIN_NOTIONAL_USDT and notional < config.MIN_NOTIONAL_USDT:
-        qty_minima = bx.round_qty_up(symbol, config.MIN_NOTIONAL_USDT / price)
-        riesgo_forzado = qty_minima * stop_distance
-        riesgo_pct = (riesgo_forzado / equity * 100) if equity > 0 else 999.0
+    def in_cooldown(self) -> bool:
+        return time.time() < float(self.state.data.get("cooldown_until", 0))
 
-        if riesgo_pct > config.MAX_RISK_PCT_ABS:
-            telegram_notifier.send(
-                telegram_notifier.format_entry_signal(
-                    alert, executed=False,
-                    error=(f"para llegar al mínimo de {config.MIN_NOTIONAL_USDT} USDT haría falta "
-                           f"arriesgar {riesgo_pct:.2f}% del equity (tope {config.MAX_RISK_PCT_ABS}%). "
-                           f"Stop demasiado ancho en este símbolo"),
-                )
+    async def contexto_btc(self) -> float | None:
+        """Variación de BTC en 24h. Se refresca cada 15 minutos."""
+        if not config.BTC_CONTEXT:
+            return None
+        if time.time() - self.btc_ts < 900 and self.btc_24h is not None:
+            return self.btc_24h
+        try:
+            velas = await self.api.klines("BTC-USDT", "1h", limit=30)
+            if len(velas) >= 25:
+                self.btc_24h = (velas[-1]["close"] - velas[-25]["close"]) / velas[-25]["close"] * 100.0
+                self.btc_ts = time.time()
+        except Exception:  # noqa: BLE001
+            pass
+        return self.btc_24h
+
+    def dia_actual(self) -> str:
+        return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+
+    def limite_diario_alcanzado(self) -> bool:
+        """
+        Stop de pérdida DIARIA. Distinto del circuit breaker por rachas:
+        seis pérdidas alternadas con dos ganancias pequeñas no disparan
+        una racha de tres, y el día acaba igual de mal. Se reinicia solo
+        al cambiar de día UTC.
+        """
+        if config.MAX_DAILY_LOSS_R <= 0:
+            return False
+        d = self.state.data
+        if d.get("dia_r") != self.dia_actual():
+            d["dia_r"] = self.dia_actual()
+            d["r_hoy"] = 0.0
+            self.state.save()
+            return False
+        return float(d.get("r_hoy", 0.0)) <= -abs(config.MAX_DAILY_LOSS_R)
+
+    def sumar_r_dia(self, r: float) -> None:
+        d = self.state.data
+        if d.get("dia_r") != self.dia_actual():
+            d["dia_r"] = self.dia_actual()
+            d["r_hoy"] = 0.0
+        d["r_hoy"] = float(d.get("r_hoy", 0.0)) + r
+        self.state.save()
+
+    async def snapshot(self, forzar: bool = False) -> dict:
+        """
+        Saldo y patrimonio, cacheados 30 s.
+
+        Antes se pedía el saldo CUATRO veces por ciclo (freno, límite de
+        cuenta, sizing y funding). Con SCAN_INTERVAL_SEC=60 son 4
+        llamadas por minuto a un endpoint privado, sin ninguna razón:
+        el saldo no cambia entre dos de esas llamadas.
+        """
+        if not forzar and self._cuenta and time.time() - self._cuenta_ts < 30:
+            return self._cuenta
+        try:
+            self._cuenta = await self.api.cuenta()
+            self._cuenta_ts = time.time()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudo leer la cuenta: %s", exc)
+        return self._cuenta or {"disponible": 0.0, "equity": 0.0}
+
+    async def actualizar_freno(self) -> None:
+        """
+        Freno de drawdown sobre el tamaño.
+
+        RISK_PCT es un porcentaje del saldo, así que en drawdown se
+        sigue arriesgando lo mismo de un capital menor — el error se
+        compone. Al caer más de DD_BRAKE_PCT desde el pico, el riesgo se
+        multiplica por DD_BRAKE_FACTOR, y NO se restaura hasta recuperar
+        hasta DD_RESUME_PCT del pico. La histéresis es a propósito: sin
+        ella el factor parpadearía en el umbral.
+        """
+        if not config.USE_DD_BRAKE or not self.live:
+            self.riesgo_factor = 1.0
+            return
+        # PATRIMONIO, no margen disponible: availableMargin baja al
+        # abrir una posición porque el margen queda bloqueado, así que
+        # usarlo aquí dispara el freno en falso a la primera operación.
+        saldo = (await self.snapshot()).get("equity", 0.0)
+        if saldo <= 0:
+            return
+        d = self.state.data
+        pico = float(d.get("equity_pico", 0) or 0)
+        if saldo > pico:
+            pico = saldo
+            d["equity_pico"] = pico
+            self.state.save()
+        dd = (pico - saldo) / pico * 100.0 if pico > 0 else 0.0
+        frenado = bool(d.get("freno_activo", False))
+
+        if not frenado and dd >= config.DD_BRAKE_PCT:
+            d["freno_activo"] = True
+            self.state.save()
+            await self.tg.send(
+                f"🛞 <b>Freno de drawdown activado</b>" + chr(10)
+                + f"Caída del {dd:.1f}% desde el pico ({pico:.2f} → {saldo:.2f} USDT)." + chr(10)
+                + f"Riesgo por operación: {config.RISK_PCT}% → "
+                  f"{config.RISK_PCT * config.DD_BRAKE_FACTOR}%." + chr(10)
+                + f"<i>Se restaura al recuperar hasta un {config.DD_RESUME_PCT}% del pico.</i>"
             )
+        elif frenado and dd <= config.DD_RESUME_PCT:
+            d["freno_activo"] = False
+            self.state.save()
+            await self.tg.send(
+                f"🟢 <b>Freno liberado</b> · drawdown {dd:.1f}%, riesgo de vuelta "
+                f"al {config.RISK_PCT}%."
+            )
+        self.riesgo_factor = (config.DD_BRAKE_FACTOR
+                              if d.get("freno_activo") else 1.0)
+
+    async def limite_cuenta_alcanzado(self) -> bool:
+        """
+        Límite de pérdida diaria sobre TODA LA CUENTA.
+
+        MAX_DAILY_LOSS_R es por bot. Con dos bots en real sobre la misma
+        cuenta, eso permite perder el doble de lo declarado sin que
+        ninguno se pare. Aquí se lee el PnL realizado de la cuenta desde
+        las 00:00 UTC y se convierte a R con el riesgo de referencia.
+
+        La conversión es aproximada: cada operación arriesga
+        RISK_PCT del saldo, así que 1R ≈ saldo x RISK_PCT/100. Si los
+        bots usan riesgos distintos, esto sobreestima o subestima. Es
+        deliberadamente conservador y mejor que no tener freno.
+        """
+        if not config.ACCOUNT_DAILY_LOSS or not self.live:
+            return False
+        pnl = await self.api.realized_pnl_hoy()
+        if pnl is None:
+            return False   # sin datos: manda el contador propio
+        saldo = (await self.snapshot()).get("equity", 0.0)
+        riesgo_ref = saldo * config.RISK_PCT / 100.0
+        if riesgo_ref <= 0:
+            return False
+        self.cuenta_r_hoy = pnl / riesgo_ref
+        if self.cuenta_r_hoy > -abs(config.MAX_DAILY_LOSS_R):
+            return False
+        if self.state.data.get("aviso_cuenta") != self.dia_actual():
+            self.state.data["aviso_cuenta"] = self.dia_actual()
+            self.state.save()
+            await self.tg.send(
+                f"🛑 <b>Límite diario DE LA CUENTA alcanzado</b>" + chr(10)
+                + f"{pnl:+.2f} USDT realizados hoy = {self.cuenta_r_hoy:.2f} R "
+                  f"(límite {config.MAX_DAILY_LOSS_R} R)." + chr(10)
+                + "<i>Incluye lo cerrado por los demás bots de esta cuenta. "
+                  "No se abre nada más hasta mañana (UTC).</i>"
+            )
+        return True
+
+    async def maybe_polymarket(self) -> None:
+        """
+        Contexto de Polymarket: distribución implícita de BTC y ventanas de
+        evento macro. NO opera allí — con 1,80% de comisión taker y el
+        oráculo 2-5 s por detrás del exchange, ese libro no tiene nada que
+        tú no tengas antes y más barato. Lo que sí es gratis es LEERLO.
+
+        El refresco y el aviso van por separado a propósito: los datos se
+        quieren frescos para el gate, pero el mensaje cada tres horas.
+        """
+        if not config.PM_ENABLED:
+            return
+        if time.time() - self.pm_ts < config.PM_REFRESH_MIN * 60:
+            return
+        self.pm_ts = time.time()
+
+        velas = await self._velas("BTC-USDT")
+        if not velas:
+            log.info("Polymarket: sin velas de BTC, se pospone")
+            return
+        cierres = pm.cierres_de(velas)
+        snap = await pm.snapshot(config, spot=cierres[-1], cierres=cierres,
+                                 timeframe=config.TIMEFRAME, base=config.PM_BASE)
+        self.pm_snap = snap
+        if not snap.get("ok"):
+            log.warning("Polymarket: %s", snap.get("motivo"))
+            return
+        log.info("Polymarket: %d peldanos · VRP %.2f · evento %s",
+                 snap.get("peldanos", 0), snap.get("vrp", 0),
+                 snap.get("evento_horas") if snap.get("evento_activo") else "no")
+
+        if time.time() - self.last_pm_alert < config.PM_REPORT_MIN * 60:
+            return
+        self.last_pm_alert = time.time()
+        texto = pm.format_telegram(snap, config.PM_BASE)
+        if not config.PM_BLOCK_ON_EVENT:
+            texto += chr(10) + "<i>Freno por evento DESACTIVADO: solo registro.</i>"
+        await self.tg.send(texto)
+
+    def pm_bloquea(self) -> tuple[bool, str]:
+        """
+        Único punto donde Polymarket puede tocar una decisión, y SÓLO hacia
+        NO abrir. Nunca abre, nunca cambia el lado, nunca cambia el tamaño.
+        Con PM_BLOCK_ON_EVENT=false devuelve siempre (False, "").
+        """
+        if not config.PM_ENABLED or not config.PM_BLOCK_ON_EVENT:
+            return False, ""
+        s = self.pm_snap
+        if not s.get("ok") or not s.get("evento_activo"):
+            return False, ""
+        return True, f"evento macro en {s.get('evento_horas', 0):.1f} h"
+
+    async def _velas(self, sym: str, tf: str | None = None) -> list[dict] | None:
+        async with self.sem:
+            try:
+                return await self.api.klines(sym, tf or config.TIMEFRAME, limit=400)
+            except Exception:  # noqa: BLE001
+                return None
+
+    async def scan_once(self) -> None:
+        if self.in_cooldown():
+            return
+        btc = await self.contexto_btc()
+        if config.BTC_FILTER and btc is not None and btc < config.BTC_MIN_24H:
+            log.info("BTC %.1f%% en 24h: por debajo del mínimo, no se abre", btc)
             return
 
-        log.info("%s: nocional %.2f < mínimo %.2f USDT -- qty %s -> %s (riesgo %.2f%% del equity)",
-                 symbol, notional, config.MIN_NOTIONAL_USDT, qty, qty_minima, riesgo_pct)
-        qty = qty_minima
-        notional = qty * price
-
-    # FRENO 2: tope de nocional por posicion. El sizing por riesgo no tiene
-    # techo por si mismo: si la distancia al stop tiende a cero, el nocional
-    # tiende a infinito. RIVER acabo con 2.6x el patrimonio en un simbolo.
-    if config.MAX_NOTIONAL_PCT_EQUITY:
-        tope_notional = equity * config.MAX_NOTIONAL_PCT_EQUITY / 100.0
-        if notional > tope_notional:
-            telegram_notifier.send(
-                telegram_notifier.format_entry_signal(
-                    alert, executed=False,
-                    error=(f"nocional {notional:.0f} USDT = "
-                           f"{notional/equity:.1f}x el equity ({equity:.0f}); "
-                           f"tope {config.MAX_NOTIONAL_PCT_EQUITY:.0f}% "
-                           f"({tope_notional:.0f} USDT). Stop demasiado estrecho "
-                           f"para el tamaño que exige"),
+        pm_stop, pm_motivo = self.pm_bloquea()
+        if pm_stop:
+            log.info("Sin aperturas: %s", pm_motivo)
+            if self.aviso_en_frio("bot", "pm_evento"):
+                await self.tg.send(
+                    f"⏳ <b>Aperturas en pausa</b> · {pm_motivo}" + chr(10)
+                    + f"<i>{str(self.pm_snap.get('evento'))[:110]}</i>" + chr(10)
+                    + "<i>Las posiciones abiertas no se tocan: solo no se abren nuevas.</i>"
                 )
-            )
             return
 
-    # Fija el leverage ANTES de calcular el margen requerido, y usa el valor
-    # que BingX confirma en la respuesta -- no config.LEVERAGE a ciegas.
-    # Algunos símbolos (sobre todo en SYMBOLS=ALL, altcoins poco comunes)
-    # tienen un tope de apalancamiento propio menor al pedido; si se asume
-    # que se aplicó el LEVERAGE de config y BingX en realidad usó menos, el
-    # cálculo local de margen sale bien pero BingX exige mucho más margen
-    # real al mandar la orden -- de ahí los rechazos "insufficient margin"
-    # aunque el chequeo local decía que sobraba equity.
-    actual_leverage = config.LEVERAGE
-    try:
-        lev_resp = bx.set_leverage(symbol, position_side, config.LEVERAGE)
-        confirmed = None
-        if isinstance(lev_resp, dict):
-            confirmed = lev_resp.get("leverage") or lev_resp.get("longLeverage") or lev_resp.get("shortLeverage")
-        if confirmed:
-            actual_leverage = float(confirmed)
-            if actual_leverage != config.LEVERAGE:
-                log.warning(
-                    "%s: BingX confirmó leverage=%s (pedido %s) -- se recalcula el margen con el real",
-                    symbol, actual_leverage, config.LEVERAGE,
+        await self.actualizar_freno()
+        if await self.limite_cuenta_alcanzado():
+            return
+
+        if self.limite_diario_alcanzado():
+            if self.state.data.get("aviso_dia") != self.dia_actual():
+                self.state.data["aviso_dia"] = self.dia_actual()
+                self.state.save()
+                await self.tg.send(
+                    f"🛑 <b>Límite de pérdida diaria alcanzado</b>\n"
+                    f"{float(self.state.data.get('r_hoy', 0)):.2f} R hoy "
+                    f"(límite {config.MAX_DAILY_LOSS_R} R).\n"
+                    f"No se abren más posiciones hasta mañana (UTC)."
                 )
-            # FRENO 1. MAS apalancamiento del pedido es el caso peligroso, y
-            # es justo el que no se contemplaba: acerca la liquidacion Y
-            # ADEMAS hace que required_margin (que divide por el real) salga
-            # MENOR, o sea que relaja la comprobacion de seguridad justo
-            # cuando el riesgo sube. RIVER se abrio a 19x con la liquidacion
-            # a ~4.8%, se movio 4.40% en contra y perdio el 101% del margen.
-            if config.REJECT_HIGHER_LEVERAGE and actual_leverage > config.LEVERAGE:
-                log.error("%s: BingX aplicó %sx (pedido %sx) -- NO se opera",
-                          symbol, actual_leverage, config.LEVERAGE)
-                telegram_notifier.send(
-                    telegram_notifier.format_entry_signal(
-                        alert, executed=False,
-                        error=(f"BingX aplicó {actual_leverage:.0f}x en vez de "
-                               f"{config.LEVERAGE}x. Liquidación quedaría a "
-                               f"~{100/actual_leverage:.1f}% en contra. "
-                               f"Baja el apalancamiento de {symbol} a mano en BingX"),
+            return
+        # Las pendientes OCUPAN hueco: una limitada en vuelo puede
+        # ejecutarse en cualquier momento, así que contar solo las
+        # abiertas permitiría abrir el doble de exposición prevista.
+        abiertas = (len(self.state.data.get("open", {}))
+                    + len(self.state.data.get("pending", {})))
+        # NO se corta el escaneo aunque no haya hueco: avisar y ejecutar
+        # son cosas distintas. Si el bot no puede entrar, la señal sigue
+        # existiendo y quieres verla — para operarla a mano o para saber
+        # qué se está perdiendo.
+        hay_hueco = abiertas < config.MAX_CONCURRENT
+
+        candidatos = 0
+        senales: list[strategy.Signal] = []
+        motivos: dict[str, int] = {}
+        for sym in self.symbols:
+            if (sym in self.state.data.get("open", {})
+                    or sym in self.state.data.get("pending", {})):
+                continue
+            # Cada timeframe se evalúa por separado: el patrón puede
+            # completarse en 5m y no en 15m, o al revés.
+            sig = None
+            motivo = "sin datos"
+            tf_señal = config.TIMEFRAME
+            for tf in config.TIMEFRAMES:
+                velas = await self._velas(sym, tf)
+                if not velas:
+                    continue
+                s_tf, m_tf = strategy.evaluate(sym, velas)
+                if s_tf is not None:
+                    sig, motivo, tf_señal = s_tf, m_tf, tf
+                    break
+                motivo = m_tf
+            if sig is None:
+                # Se agrupa por CLASE de motivo, no por el texto exacto:
+                # "sin señal (contador en 1...)" y "(contador en 0...)"
+                # son el mismo caso y separarlos escondería el patrón.
+                clave = motivo.split("(")[0].strip()
+                motivos[clave] = motivos.get(clave, 0) + 1
+                log.debug("%s: %s", sym, motivo)
+                continue
+            candidatos += 1
+            sig.timeframe = tf_señal
+            sig.btc_24h = btc
+            sig.funding = self.funding.get(sym)
+            sig.pm = self.pm_snap or None
+            senales.append(sig)
+
+        # RANKING. Con 400 símbolos y un hueco, ejecutar la primera que
+        # dispara hace que el ORDEN DEL UNIVERSO decida qué operas: azar
+        # disfrazado de sistema. Se ordena por coste ascendente (el
+        # único término cierto), luego persistencia y dominancia.
+        if config.RANK_CANDIDATES and len(senales) > 1:
+            senales.sort(key=strategy.calidad)
+            mejor = senales[0]
+            log.info("Ranking: %d candidatas, mejor %s (coste %.2fR)",
+                     len(senales), mejor.symbol, mejor.coste_r)
+
+        for sig in senales:
+            ejecutada = await self.handle_signal(sig, hay_hueco)
+            if ejecutada:
+                abiertas += 1
+                hay_hueco = abiertas < config.MAX_CONCURRENT
+
+        if config.RANK_CANDIDATES and len(senales) > 1:
+            resto = ", ".join(
+                f"{x.symbol.split('-')[0]} {x.coste_r:.2f}R" for x in senales[1:6])
+            log.info("Descartadas por ranking: %s", resto)
+
+        await self.volcar_avisos()
+        detalle = " · ".join(f"{k}: {v}" for k, v in sorted(motivos.items(), key=lambda x: -x[1])[:5])
+        log.info("Ciclo completo · %d símbolos · %d señales | %s", len(self.symbols), candidatos, detalle)
+
+        # Si el embudo se corta SIEMPRE en el mismo sitio, eso no es el
+        # mercado: es un filtro mal calibrado. Se avisa una vez al día.
+        if motivos:
+            top = max(motivos.items(), key=lambda x: x[1])
+            if top[1] >= len(self.symbols) * 0.9:
+                hoy = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+                if self.state.data.get("warned_funnel") != hoy:
+                    self.state.data["warned_funnel"] = hoy
+                    self.state.save()
+                    await self.tg.send(
+                        f"🔻 <b>El embudo se corta siempre en el mismo punto</b>" + chr(10)
+                        + f"<code>{top[0]}</code> descarta {top[1]} de {len(self.symbols)} símbolos."
+                        + chr(10)
+                        + "<i>Si es «sin amplitud», recuerda que el umbral que manda no es "
+                          "MIN_ATR_PCT sino el mayor de los dos: MIN_COST_COVER x "
+                          "COST_ROUNDTRIP_PCT. Si es «sin dominancia», el régimen está "
+                          "demasiado exigente para este mercado.</i>"
                     )
-                )
-                return
-    except Exception as e:
-        log.warning("No se pudo fijar/confirmar leverage para %s (%s) -- se asume config.LEVERAGE=%s",
-                    symbol, e, config.LEVERAGE)
 
-    # Comprobación de margen: evita mandar una orden que BingX rechazaría
-    # por fondos insuficientes (o que consumiría casi todo el margen
-    # disponible sin que quede colchón para el resto de posiciones).
-    required_margin = (qty * price) / max(actual_leverage, 1)
-    if required_margin > equity * 0.95:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False,
-                error=f"margen insuficiente (necesita ~{required_margin:.2f} USDT con leverage {actual_leverage}x, equity {equity:.2f} USDT)",
-            )
-        )
-        return
+    async def handle_signal(self, sig: strategy.Signal, hay_hueco: bool = True) -> bool:
+        """
+        Devuelve si se ABRIÓ posición. El aviso se manda siempre (con
+        enfriamiento por símbolo), ejecute o no: son dos cosas
+        independientes y mezclarlas hacía que en LIVE, con el hueco
+        lleno, no te enteraras de las señales.
+        """
+        log.info("SEÑAL %s %s entrada=%.8g sl=%.8g ratio=%.2f", sig.symbol, sig.side, sig.entry, sig.sl, sig.ratio)
 
-    # Apertura protegida: abre, lee el tamaño REAL rellenado, verifica el
-    # SL/TP contra openOrders y, si no consigue dejar un stop puesto, CIERRA
-    # la posición. Antes esto eran tres llamadas sueltas sin marcha atrás:
-    # si el SL fallaba, la posición se quedaba abierta y desnuda.
-    res = bx.open_protected_position(
-        symbol=symbol,
-        position_side=position_side,
-        quantity=qty,
-        stop_loss=sl,
-        take_profit=tp,
-        leverage=None,          # ya fijado y confirmado arriba
-        margin_mode="ISOLATED",
-    )
+        # AVISO — siempre, con enfriamiento para no repetir cada ciclo.
+        ultimos = self.state.data.setdefault("last_signal", {})
+        previo = float(ultimos.get(sig.symbol, 0) or 0)
+        if time.time() - previo >= config.SIGNAL_COOLDOWN_MIN * 60:
+            ultimos[sig.symbol] = time.time()
+            self.state.save()
+            # Las señales que NO se pueden ejecutar se agrupan en un
+            # solo mensaje por ciclo. Cinco avisos idénticos en el mismo
+            # minuto (pasó: 1920 mensajes sin leer) no informan cinco
+            # veces, enseñan a ignorar el chat.
+            if not hay_hueco or not self.live:
+                self._pendientes_aviso.append(sig)
+                return False
 
-    if not res.get("ok"):
-        motivo = res.get("error") or "fallo desconocido en la apertura"
-        if res.get("closed"):
-            motivo += " — la posición se cerró, no quedó desprotegida"
-        elif res.get("quantity"):
-            motivo += " — ⚠️ POSICIÓN POSIBLEMENTE ABIERTA SIN STOP, REVISA BINGX"
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(alert, executed=False, error=motivo)
-        )
-        log.error("Entrada NO completada en %s %s: %s", symbol, position_side, motivo)
-        return
+            nota = ""
+            if self.live and not hay_hueco:
+                nota = f"\n<i>Sin hueco libre ({config.MAX_CONCURRENT} posición máx.): el bot no la abre.</i>"
+            elif not self.live:
+                nota = "\n<i>Modo SIGNAL: el bot no la abre.</i>"
+            entregado = await self.tg.send(fmt_signal(sig, live=False) + nota)
+            if not entregado:
+                log.error("SEÑAL %s NO entregada por Telegram", sig.symbol)
 
-    state.record_open(symbol, position_side, res["quantity"], price, sl, tp)
-    telegram_notifier.send(
-        telegram_notifier.format_entry_signal(alert, executed=True, qty=res["quantity"])
-    )
-    if not res.get("has_tp"):
-        telegram_notifier.send(f"⚠️ *{symbol}*: abierta con SL pero SIN TP confirmado.")
+        if not self.live or not hay_hueco:
+            return False
 
-
-def _handle_exit(alert: dict):
-    tv_symbol = alert["symbol"]
-    symbol = config.tv_symbol_to_bingx(tv_symbol)
-    position_side = alert["positionSide"]
-
-    if not config.AUTO_TRADE:
-        telegram_notifier.send(telegram_notifier.format_exit_signal(alert, executed=False))
-        return
-
-    pos = state.get_open(symbol)
-    if not pos:
-        # puede que ya se haya cerrado por SL/TP directamente en BingX; solo avisamos
-        telegram_notifier.send(
-            telegram_notifier.format_exit_signal(
-                alert, executed=False, error="no había posición registrada localmente (¿cerrada ya por SL/TP?)"
-            )
-        )
-        return
-
-    try:
-        exit_price = float(alert.get("price", 0))
-        # Verificado: un 'ok' de la API no garantiza que la posición quede a
-        # cero (puede ejecutarse parcialmente). Si no se cierra, no se
-        # registra el cierre ni se contabiliza el PnL.
-        cerrada = bx.close_position_and_verify(symbol, position_side)
-        if not cerrada:
-            telegram_notifier.send(
-                f"🚨 *{symbol}*: la señal de salida no consiguió cerrar la posición. "
-                f"CIÉRRALA A MANO EN BINGX."
-            )
-            return
-        entry_price = pos["entry_price"]
-        pnl = (exit_price - entry_price) if position_side == "LONG" else (entry_price - exit_price)
-    except Exception as e:
-        log.exception("Fallo cerrando orden en BingX")
-        telegram_notifier.send(
-            telegram_notifier.format_exit_signal(alert, executed=False, error=str(e))
-        )
-        return
-
-    state.record_close(symbol, pnl=pnl)
-    telegram_notifier.send(telegram_notifier.format_exit_signal(alert, executed=True))
-
-
-# --------------------------------------------------------------------------- #
-@app.route("/reset-breaker/<secret>", methods=["POST"])
-def reset_breaker(secret):
-    """Endpoint manual para reactivar el trading tras un circuit breaker.
-
-    Reancla además el equity de referencia del día al equity actual: sin
-    eso, un reset con la cuenta ya caída vuelve a disparar el breaker en la
-    siguiente señal, porque el drawdown se sigue midiendo contra el equity
-    de ANTES de la caída.
-    """
-    if secret != config.WEBHOOK_SECRET:
-        return jsonify(error="unauthorized"), 401
-    try:
-        equity = bx.get_balance()
-    except Exception:
-        log.exception("No se pudo leer el balance al resetear el breaker")
-        equity = None
-    state.manual_reset_breaker(reanclar_equity=equity)
-    telegram_notifier.send(
-        f"✅ Circuit breaker reseteado manualmente."
-        + (f" Ancla diaria movida a {equity:.4f} USDT." if equity else "")
-    )
-    return jsonify(status="reset", daily_start_equity=equity), 200
-
-
-@app.route("/emergency-stop/<secret>", methods=["POST"])
-def emergency_stop(secret):
-    """Botón de pánico: pausa el trading YA y cierra posiciones.
-
-    Por defecto cierra SOLO las posiciones de este bot. La versión anterior
-    cerraba TODAS las de la cuenta, incluidas las de otros bots de la flota
-    y las manuales del usuario -- una parada de emergencia de un bot no
-    debería liquidar operativa ajena.
-
-    Para cerrar todo de verdad (incluida la operativa ajena), hay que
-    pedirlo explícitamente: ?scope=all
-    """
-    if secret != config.WEBHOOK_SECRET:
-        return jsonify(error="unauthorized"), 401
-
-    scope = request.args.get("scope", "own").lower()
-
-    state.state["trading_halted"] = True
-    state.state["halt_reason"] = "PARADA DE EMERGENCIA manual"
-    state._save()
-
-    try:
-        live_positions = _live_positions()
-    except Exception as e:
-        telegram_notifier.send(f"🚨 Parada de emergencia: no se pudo leer posiciones de BingX: {e}")
-        return jsonify(error=str(e)), 500
-
-    if scope == "all":
-        objetivo = live_positions
-    else:
-        objetivo = [p for p in live_positions if state.is_ours(p.get("symbol"))]
-
-    omitidas = [p.get("symbol") for p in live_positions if p not in objetivo]
-
-    closed, failed = [], []
-    for p in objetivo:
-        sym = p.get("symbol")
-        side = p.get("positionSide", "LONG")
+        client_id = f"wav{sig.symbol.split('-')[0][:6]}{int(time.time())}"
         try:
-            if bx.close_position_and_verify(sym, side):
-                state.record_close(sym)
-                closed.append(sym)
+            cta = await self.snapshot(forzar=True)
+            equity = cta.get("equity", 0.0)
+            disponible = cta.get("disponible", 0.0)
+            if equity <= 0:
+                await self.tg.send(f"⚠️ {sig.symbol} sin ejecutar: saldo 0")
+                return False
+            qty = self.api.round_qty(
+                sig.symbol,
+                strategy.position_size(equity, sig.entry, sig.sl, self.riesgo_factor))
+            minimo = self.api.min_qty(sig.symbol)
+            if qty <= 0 or (minimo > 0 and qty < minimo):
+                riesgo_min = minimo * abs(sig.entry - sig.sl)
+                pct = (riesgo_min / equity * 100.0) if equity > 0 else 0.0
+                await self.tg.send(
+                    f"⚠️ <b>{sig.symbol}</b> sin ejecutar: tamaño {qty} bajo el lote mínimo ({minimo}).\n"
+                    f"Harían falta <b>{pct:.2f}%</b> de riesgo "
+                    f"(ahora {config.RISK_PCT * self.riesgo_factor:.2f}%)."
+                )
+                return False
+            vivas = await self.api.open_positions()
+            # Límite global: posiciones de TODA la cuenta, no solo de este bot.
+            # En un desplome las alts se mueven juntas, así que lo que importa
+            # es la exposición total y no cuántas abrió cada bot por su lado.
+            n_total = sum(1 for p in vivas if float(p.get("positionAmt", 0) or 0) != 0)
+            if n_total >= config.MAX_TOTAL_POSITIONS:
+                await self.tg.send(
+                    f"⚠️ <b>{sig.symbol}</b> sin abrir: ya hay <b>{n_total}</b> posiciones "
+                    f"en la cuenta (límite global {config.MAX_TOTAL_POSITIONS}).\n"
+                    f"<i>Puede haberlas abierto otro bot. En una caída las alts se mueven "
+                    f"juntas, así que el riesgo se suma aunque los símbolos difieran.</i>"
+                )
+                return False
+            if any(str(p.get("symbol")) == sig.symbol and float(p.get("positionAmt", 0) or 0) != 0 for p in vivas):
+                return False
+
+            # ¿Cabe el margen? El riesgo se calcula sobre el patrimonio,
+            # pero la orden se paga con el margen LIBRE. Sin esta
+            # comprobación BingX rechaza por fondos y parece un fallo.
+            margen_necesario = qty * sig.entry / max(config.LEVERAGE, 1)
+            if margen_necesario > disponible * 0.95:
+                if self.aviso_en_frio(sig.symbol, "margen"):
+                    await self.tg.send(
+                        f"⚠️ <b>{sig.symbol.split('-')[0]}</b> sin abrir: haría falta "
+                        f"{margen_necesario:.2f} USDT de margen y hay {disponible:.2f} libres.\n"
+                        f"<i>Patrimonio {equity:.2f}. La diferencia está bloqueada "
+                        f"en posiciones abiertas.</i>"
+                    )
+                return False
+
+            await self.api.set_margin_mode(sig.symbol, config.MARGIN_MODE)
+
+            await self.api.set_leverage(sig.symbol, "LONG" if sig.side == "BUY" else "SHORT", config.LEVERAGE)
+            sl_r = self.api.round_price(sig.symbol, sig.sl)
+            tp_r = self.api.round_price(sig.symbol, sig.tp) if sig.tp else sl_r * 100
+
+            # ÚLTIMA PUERTA ANTES DE MANDAR NADA. Comprueba que en un CORTO el
+            # stop queda POR ENCIMA de la entrada y el objetivo por debajo. En
+            # joyful-art (08/09/2026) salió al revés: sl por debajo en un SHORT,
+            # o sea el stop donde está tu beneficio. Aquí no puede salir así.
+            # Sin TP declarado no se revisa la orientación: no hay qué comparar.
+            if sig.tp:
+                gv = gd.revisar(config, sig.symbol, sig.side,
+                                "LONG" if sig.side == "BUY" else "SHORT",
+                                qty=qty, entry=sig.entry, sl=sl_r, tp=tp_r,
+                                leverage=config.LEVERAGE,
+                                disponible=disponible, equity=equity)
+                if not gv.ok:
+                    log.warning("%s NO enviada: %s", sig.symbol, gv.motivo)
+                    if self.aviso_en_frio(sig.symbol, "guarda"):
+                        await self.tg.send(gd.formato_telegram(sig.symbol, sig.side, gv))
+                    return False
+                for aviso in gv.avisos:
+                    log.warning("%s: %s", sig.symbol, aviso)
+
+            if config.ENTRY_TYPE == "LIMIT":
+                ajuste = config.LIMIT_OFFSET_PCT / 100.0
+                precio = self.api.round_price(sig.symbol, sig.entry * ((1 + ajuste) if sig.side == "SELL" else (1 - ajuste)))
+                await self.api.limit_order(sig.symbol, sig.side, qty, precio, sl_r, tp_r, client_id)
             else:
-                failed.append((sym, "no llegó a cero tras varios intentos"))
-        except Exception as e:
-            log.exception("Fallo cerrando %s en parada de emergencia", sym)
-            failed.append((sym, str(e)))
+                await self.api.market_order(sig.symbol, sig.side, qty, sl_r, tp_r, client_id)
+        except BingXError as exc:
+            texto = str(exc).lower()
+            if config.POST_ONLY and ("post" in texto or "immediately match" in texto
+                                     or "would match" in texto or "maker" in texto):
+                # La limitada habría cruzado el spread. Rechazarla es lo
+                # correcto: ejecutarla habría pagado comisión taker y el
+                # coste real ya no sería el que asume la estrategia.
+                log.info("%s: post-only rechazada (habría cruzado)", sig.symbol)
+                if self.aviso_en_frio(sig.symbol, "postonly"):
+                    await self.tg.send(
+                        f"↩️ <b>{sig.symbol.split('-')[0]}</b> no abierta: la limitada "
+                        f"habría cruzado el spread y pagado comisión taker.\n"
+                        f"<i>POST_ONLY la rechaza a propósito. Si pasa mucho, sube "
+                        f"LIMIT_OFFSET_PCT (ahora {config.LIMIT_OFFSET_PCT}%).</i>"
+                    )
+                return False
+            await self.tg.send(f"❌ BingX rechazó {sig.symbol}: {exc}")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            if await self.api.order_exists(sig.symbol, client_id):
+                await self.tg.send(f"⚠️ {sig.symbol}: fallo de red pero la orden SÍ existe. Se registra.")
+            else:
+                await self.tg.send(f"❌ Error en {sig.symbol}: {exc}")
+                return False
 
-    msg = (
-        f"🛑 *PARADA DE EMERGENCIA* (alcance: {'TODA la cuenta' if scope == 'all' else 'solo este bot'})"
-        f" — trading pausado.\nCerradas: {closed or 'ninguna'}"
-    )
-    if omitidas:
-        msg += f"\nNo tocadas (ajenas a este bot): {omitidas}"
-    if failed:
-        msg += f"\n⚠️ Fallaron: {failed} — CIÉRRALAS A MANO EN BINGX AHORA."
-    telegram_notifier.send(msg)
+        registro = {
+            "side": sig.side, "entry": sig.entry, "sl": sig.sl,
+            "sl_inicial": sig.sl, "qty": qty, "client_id": client_id,
+        }
+        if config.ENTRY_TYPE == "LIMIT":
+            # UNA LIMITADA PUEDE NO EJECUTARSE NUNCA. Darla por abierta
+            # bloquea el hueco con una posición inexistente, y luego
+            # reconcile cuenta un cierre INVENTADO que alimenta el
+            # circuit breaker. Peor: la orden sigue viva en el exchange
+            # y puede llenarse horas después, cuando la señal que la
+            # justificaba ya no existe. Vive en 'pending' hasta que el
+            # exchange confirme posición, y caduca a los LIMIT_TTL_MIN.
+            registro["sent_at"] = time.time()
+            registro["_sig"] = None  # el Signal no es serializable en JSON
+            self._sig_pendiente[sig.symbol] = sig
+            self.state.data.setdefault("pending", {})[sig.symbol] = registro
+            self.state.save()
+            await self.tg.send(
+                f"📨 <b>{sig.symbol.split('-')[0]}</b> limitada enviada a "
+                f"<code>{precio:.8g}</code> · caduca en {config.LIMIT_TTL_MIN} min"
+            )
+            return True
 
-    return jsonify(status="stopped", scope=scope, closed=closed,
-                   skipped=omitidas, failed=failed), 200
+        registro["opened_at"] = time.time()
+        self.state.data.setdefault("open", {})[sig.symbol] = registro
+        self.journal.abrir(sig, qty, "LIVE")
+        self.state.data["last_trade_ts"] = time.time()
+        self.state.save()
+        await self.tg.send(fmt_signal(sig, live=True))
+        return True
+
+    async def maybe_watchlist(self) -> None:
+        """
+        Aviso periódico con las que están cerca del patrón.
+
+        Las señales llegan cuando ya se dispararon. Esto enseña lo que
+        viene: las que tienen el contador en 1 de 2 ya tocaron suelo una
+        vez y están a un cruce de disparar. Es la diferencia entre
+        enterarte y verlo venir.
+        """
+        if config.WATCHLIST_MIN <= 0:
+            return
+        if time.time() - self.last_watchlist < config.WATCHLIST_MIN * 60:
+            return
+        self.last_watchlist = time.time()
+
+        cerca = []
+        for sym in self.symbols:
+            velas = await self._velas(sym)
+            if not velas:
+                continue
+            w = strategy.watch_status(velas)
+            if not w or not w["dominante"]:
+                continue
+            if w["atr_pct"] >= config.MIN_ATR_PCT:
+                cerca.append((sym, w))
+
+        if not cerca:
+            log.info("Vigilancia: ningún símbolo en régimen dominante")
+            return
+
+        # Ordenadas por cercanía al cruce: el precio pegado a su
+        # aproximación es el que está a punto de cruzarla.
+        cerca.sort(key=lambda t: abs(t[1]["dist_aprox"]))
+        lineas = ["👀 <b>En régimen dominante — vigilando</b> (" + str(len(cerca)) + ")" + chr(10)]
+        for sym, w in cerca[:12]:
+            base = sym.split("-")[0]
+            marca = "🟡" if abs(w["dist_aprox"]) < 0.3 else "·"
+            direccion = "▲" if w["h8"] > 0 else "▼"
+            lineas.append(
+                marca + " <b>" + base + "</b>  "
+                + f"dominancia {w['ratio']:.2f} · ER {w.get('persist', 0):.2f}  {direccion}  "
+                + f"a {w['dist_aprox']:+.2f} ATR de la aproximación  ·  "
+                + f"ATR {w['atr_pct']:.2f}%"
+            )
+        lineas.append("")
+        lineas.append("🟡 pegado a la aproximación: el cruce puede llegar en cualquier vela")
+        await self.tg.send(chr(10).join(lineas))
+
+    async def maybe_funding(self) -> None:
+        """
+        Avisa del funding extremo. NO monta carry: con este saldo no
+        compensa (dos céntimos al día a tasa normal, trece días para
+        cubrir la comisión). Avisa cuando sí compensaría y, sobre todo,
+        señala dónde hay posicionamiento amontonado — que es donde una
+        cascada encuentra combustible.
+        """
+        if not config.FUNDING_ALERTS:
+            return
+        if time.time() - self.last_funding_alert < config.FUNDING_ALERT_MIN * 60:
+            return
+        try:
+            tasas = await self.api.funding_rates()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Funding no disponible: %s", exc)
+            return
+        if not tasas:
+            return
+        self.funding = tasas
+        self.last_funding_alert = time.time()
+
+        saldo = 0.0
+        if self.live:
+            saldo = (await self.snapshot()).get("equity", 0.0)
+        if saldo <= 0:
+            saldo = config.SALDO_ESTIMADO
+
+        extremos = [
+            funding.evaluar(s, r, saldo)
+            for s, r in tasas.items()
+            if abs(r) >= config.FUNDING_EXTREMO and s in set(self.symbols)
+        ]
+        texto = funding.format_extremos(extremos, saldo)
+        if texto:
+            await self.tg.send(texto)
+        else:
+            log.info("Funding: ningún símbolo por encima de %.3f%%", config.FUNDING_EXTREMO)
+
+    def aviso_en_frio(self, symbol: str, clave: str) -> bool:
+        """
+        ¿Toca avisar de esto, o ya se avisó hace poco?
+
+        Sin enfriamiento, una señal que no se puede ejecutar se vuelve a
+        detectar en cada ciclo y manda el mismo mensaje cada minuto.
+        """
+        avisos = self.state.data.setdefault("avisos", {})
+        k = symbol + ":" + clave
+        previo = float(avisos.get(k, 0) or 0)
+        if time.time() - previo < config.SIGNAL_COOLDOWN_MIN * 60:
+            return False
+        avisos[k] = time.time()
+        self.state.save()
+        return True
+
+    async def volcar_avisos(self) -> None:
+        """
+        Un solo mensaje con todas las señales del ciclo que no se
+        ejecutaron, en vez de uno por cada una.
+        """
+        pend = self._pendientes_aviso
+        self._pendientes_aviso = []
+        if not pend:
+            return
+        # Enfriamiento por símbolo: si ya se avisó de este hace poco, no
+        # se repite aunque vuelva a aparecer en el ciclo siguiente.
+        nuevos = [s for s in pend if self.aviso_en_frio(s.symbol, "senal")]
+        if not nuevos:
+            return
+
+        motivo = ("modo SIGNAL" if not self.live else
+                  f"hueco lleno ({config.MAX_CONCURRENT} máx.)")
+        lineas = [f"🔔 <b>{len(nuevos)} señal(es)</b> — no ejecutadas: {motivo}", ""]
+        for sig in nuevos[:12]:
+            lado = "🟢 LARGO" if sig.side == "BUY" else "🔴 CORTO"
+            base = sig.symbol.split("-")[0]
+            lineas.append(
+                f"{lado} <b>{base}</b>  entrada <code>{sig.entry:.8g}</code>  "
+                + f"SL <code>{sig.sl:.8g}</code>  TP <code>{sig.tp:.8g}</code>"
+            )
+            lineas.append(
+                f"    riesgo {sig.riesgo_pct:.2f}% · coste {sig.coste_r:.2f}R · "
+                + f"dominancia {sig.ratio:.2f}"
+                + (f" · funding {sig.funding:+.3f}%" if getattr(sig, "funding", None) is not None else "")
+            )
+        if len(nuevos) > 12:
+            lineas.append(f"… y {len(nuevos) - 12} más")
+        await self.tg.send(chr(10).join(lineas))
+
+    async def reconcile(self) -> None:
+        """
+        Detecta las posiciones que se cerraron EN EL EXCHANGE (stop o
+        take profit) y que el bot no vio, y lleva el ciclo de vida de
+        las órdenes limitadas.
+
+        CORRE TAMBIÉN EN SIGNAL. Antes salía antes de mirar nada cuando
+        el bot no estaba en LIVE, así que un state.json heredado —o el
+        paso de LIVE a SIGNAL— dejaba posiciones "abiertas" eternamente
+        bloqueando MAX_CONCURRENT, con el bot mandando "no ejecutada:
+        máximo alcanzado" en cada ciclo.
+        """
+        if not self.live:
+            fantasmas = (list(self.state.data.get("open", {}).keys())
+                         + list(self.state.data.get("pending", {}).keys()))
+            if fantasmas:
+                self.state.data["open"] = {}
+                self.state.data["pending"] = {}
+                self.state.save()
+                await self.tg.send(
+                    "🧹 <b>Estado limpiado</b>" + chr(10)
+                    + "En modo SIGNAL no puede haber posiciones reales, y había: "
+                    + ", ".join(x.split("-")[0] for x in fantasmas) + "." + chr(10)
+                    + "<i>Bloqueaban el hueco sin existir.</i>"
+                )
+            return
+
+        try:
+            posiciones = await self.api.open_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("No se pudieron leer las posiciones: %s", exc)
+            return
+
+        vivos = {
+            str(p.get("symbol", "")): p for p in posiciones
+            if float(p.get("positionAmt", 0) or 0) != 0
+        }
+
+        # ── Limitadas: pendiente -> abierta, o caducada ───────────────
+        for symbol, pend in list(self.state.data.get("pending", {}).items()):
+            if symbol in vivos:
+                real = vivos[symbol]
+                entrada_real = float(real.get("avgPrice", 0) or 0) or float(pend["entry"])
+                pos = dict(pend)
+                pos["entry_real"] = entrada_real
+                pos["opened_at"] = time.time()
+                pos["qty"] = abs(float(real.get("positionAmt", 0) or 0)) or pend.get("qty", 0)
+                self.state.data.setdefault("open", {})[symbol] = pos
+                self.state.data["pending"].pop(symbol, None)
+                self.state.data["last_trade_ts"] = time.time()
+                self.state.save()
+                desliz = ((entrada_real - float(pend["entry"])) / float(pend["entry"]) * 100.0
+                          if pend.get("entry") else 0.0)
+                sig_guardado = self._sig_pendiente.pop(symbol, None)
+                if sig_guardado is not None:
+                    self.journal.abrir(sig_guardado, pos["qty"], "LIVE", entrada_real)
+                await self.tg.send(
+                    f"📌 <b>{symbol.split('-')[0]}</b> limitada EJECUTADA a "
+                    f"<code>{entrada_real:.8g}</code> "
+                    f"(esperaba {float(pend['entry']):.8g} · {desliz:+.3f}%)"
+                )
+                continue
+
+            edad_min = (time.time() - float(pend.get("sent_at", time.time()))) / 60.0
+            if edad_min >= config.LIMIT_TTL_MIN:
+                try:
+                    await self.api.cancel_by_client_id(symbol, pend.get("client_id", ""))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("No se pudo cancelar la limitada de %s: %s", symbol, exc)
+                self.state.data["pending"].pop(symbol, None)
+                self._sig_pendiente.pop(symbol, None)
+                self.state.save()
+                await self.tg.send(
+                    f"⌛ <b>{symbol.split('-')[0]}</b> limitada caducada a los "
+                    f"{config.LIMIT_TTL_MIN} min sin ejecutarse. Cancelada y hueco liberado."
+                )
+
+        # ── Cierres que ocurrieron en el exchange ─────────────────────
+        for symbol, pos in list(self.state.data.get("open", {}).items()):
+            if symbol in vivos:
+                continue
+            velas = await self._velas(symbol)
+            entrada = float(pos.get("entry_real") or pos["entry"])
+            ultimo = velas[-1]["close"] if velas else entrada
+            riesgo = abs(entrada - float(pos.get("sl_inicial", pos["sl"])))
+            # EL SIGNO IMPORTA. Antes se calculaba (ultimo - entrada)
+            # sin mirar el lado, así que en los CORTOS la R salía
+            # invertida: una ganancia se contaba como pérdida, y al
+            # revés. Eso corrompía wins/losses, el circuit breaker y el
+            # acumulador de pérdida diaria a la vez.
+            bruto = (ultimo - entrada) if pos["side"] == "BUY" else (entrada - ultimo)
+            r_real = bruto / riesgo if riesgo > 0 else 0.0
+            gano = r_real > 0
+            minutos = int((time.time() - float(pos.get("opened_at", time.time()))) / 60)
+            self.journal.cerrar(symbol, "sl/tp", ultimo, r_real, minutos)
+            self.sumar_r_dia(r_real)
+            await self.tg.send(
+                f"{'✅' if gano else '🛑'} <b>{symbol.split('-')[0]}</b> cerrada en el exchange"
+                + chr(10)
+                + f"Entrada {entrada:.8g} → {ultimo:.8g}  ({r_real:+.2f} R)"
+            )
+            self.register_close(symbol, gano)
+
+        # ── Huérfanas: posiciones de la cuenta que este bot no abrió ──
+        mias = set(self.state.data.get("open", {})) | set(self.state.data.get("pending", {}))
+        ajenas = [s for s in vivos if s not in mias]
+        if ajenas and self.aviso_en_frio("cuenta", "ajenas"):
+            await self.tg.send(
+                "⚠️ <b>Posiciones en la cuenta que este bot no controla</b>" + chr(10)
+                + ", ".join(s.split("-")[0] for s in ajenas) + chr(10)
+                + f"<i>Cuentan para el límite global ({config.MAX_TOTAL_POSITIONS}). "
+                  f"Si son de otro bot, esto es la interferencia de cuenta compartida.</i>"
+            )
+
+        # ── Posición ZOMBI ────────────────────────────────────────────
+        limite = config.ZOMBIE_ALERT_HOURS * 3600
+        for symbol, pos in list(self.state.data.get("open", {}).items()):
+            edad = time.time() - float(pos.get("opened_at", time.time()))
+            if edad < limite:
+                continue
+            if self.aviso_en_frio(symbol, "zombi"):
+                await self.tg.send(
+                    f"🧟 <b>{symbol.split(chr(45))[0]}</b> lleva {edad/3600:.1f} h abierta." + chr(10)
+                    + f"La estrategia contempla como máximo {config.MAX_TRADE_MINUTES} min." + chr(10)
+                    + "<i>Comprueba en BingX si el SL y el TP siguen ahí. "
+                      "No la cierro yo: esa decisión es tuya.</i>"
+                )
+
+    async def maybe_idle_alert(self) -> None:
+        """
+        Inactividad ECONÓMICA. La infraestructura puede estar viva, los
+        logs sin errores y el exchange respondiendo mientras hace
+        semanas que no se opera. Vigilar el proceso no lo detecta: hay
+        que vigilar el resultado.
+        """
+        if not self.live or config.IDLE_ALERT_DAYS <= 0:
+            return
+        ultimo = float(self.state.data.get("last_trade_ts", 0) or 0)
+        if not ultimo:
+            return
+        dias = (time.time() - ultimo) / 86400.0
+        if dias < config.IDLE_ALERT_DAYS:
+            return
+        if self.aviso_en_frio("bot", "idle"):
+            await self.tg.send(
+                f"😴 <b>{dias:.0f} días sin ninguna operación en LIVE</b>" + chr(10)
+                + f"Universo {len(self.symbols)} símbolos · dominancia ≥{config.DOMINANCE_THRESHOLD}."
+                + chr(10)
+                + "<i>Los logs no dan errores: si esto es un fallo, es económico. "
+                  "Mira el embudo del último ciclo antes de aflojar nada.</i>"
+            )
+
+    async def manage_open(self) -> None:
+        """
+        SL y TP viven en el exchange desde la propia orden de entrada.
+        Aquí solo se vigila el reloj: una señal de cruce que a las N
+        velas no ha ido a ninguna parte ya no es la señal que se operó.
+        Y solo se corta lo que NO va a favor — cortar las ganadoras por
+        tiempo fue un error medido en el bot de reversión.
+        """
+        abiertas = self.state.data.get("open", {})
+        if not abiertas:
+            return
+        limite = config.max_trade_seconds()
+        ahora = time.time()
+        for symbol, pos in list(abiertas.items()):
+            edad = ahora - float(pos.get("opened_at", ahora))
+            velas = await self._velas(symbol)
+            if not velas:
+                continue
+            precio = velas[-1]["close"]
+            entrada = float(pos.get("entry_real") or pos["entry"])
+
+            # Salida por CRUCE CONTRARIO sobre la misma serie que generó
+            # la entrada. Antes solo existía el reloj, así que una señal
+            # que se giraba se mantenía hasta agotar los minutos.
+            motivo_salida = None
+            if strategy.exit_cross(velas, pos["side"]):
+                motivo_salida = "cruce"
+            elif edad >= limite:
+                a_favor = precio > entrada if pos["side"] == "BUY" else precio < entrada
+                if config.TIME_EXIT_ONLY_LOSING and a_favor:
+                    log.info("%s pasa del límite pero va a favor: se deja correr", symbol)
+                    continue
+                motivo_salida = "tiempo"
+            if motivo_salida is None:
+                continue
+            if self.live:
+                try:
+                    await self.api.close_position(symbol, pos["side"], float(pos.get("qty", 0)))
+                except Exception as exc:  # noqa: BLE001
+                    await self.tg.send(f"⚠️ No se pudo cerrar {symbol} por tiempo: {exc}")
+                    continue
+            riesgo = abs(entrada - float(pos.get("sl_inicial", pos["sl"])))
+            bruto = (precio - entrada) if pos["side"] == "BUY" else (entrada - precio)
+            r_real = bruto / riesgo if riesgo > 0 else 0.0
+            minutos = int(edad / 60)
+            self.journal.cerrar(symbol, motivo_salida, precio, r_real, minutos)
+            self.sumar_r_dia(r_real)
+            self.register_close(symbol, r_real > 0)
+            await self.tg.send(
+                f"🏁 <b>{symbol.split(chr(45))[0]}</b> cerrada por {motivo_salida} "
+                f"tras {minutos} min ({r_real:+.2f} R)"
+            )
+
+    def register_close(self, symbol: str, won: bool) -> None:
+        d = self.state.data
+        d["closed_trades"] = d.get("closed_trades", 0) + 1
+        if won:
+            d["wins"] = d.get("wins", 0) + 1
+            d["consecutive_losses"] = 0
+        else:
+            d["losses"] = d.get("losses", 0) + 1
+            d["consecutive_losses"] = d.get("consecutive_losses", 0) + 1
+            if d["consecutive_losses"] >= config.MAX_CONSECUTIVE_LOSSES:
+                d["cooldown_until"] = time.time() + config.COOLDOWN_MINUTES * 60
+                d["consecutive_losses"] = 0
+                asyncio.create_task(self.tg.send(
+                    f"⏸️ <b>Circuit breaker</b> · {config.MAX_CONSECUTIVE_LOSSES} pérdidas seguidas, "
+                    f"pausa de {config.COOLDOWN_MINUTES} min."
+                ))
+        d.get("open", {}).pop(symbol, None)
+        self.state.save()
+
+    def stats_text(self) -> str:
+        d = self.state.data
+        n = d.get("closed_trades", 0)
+        w = d.get("wins", 0)
+        wr = (w / n * 100.0) if n else 0.0
+        return (
+            f"Cerradas: <b>{n}</b> · aciertos {w} ({wr:.0f}%)\n"
+            f"Abiertas: {len(d.get('open', {}))} · racha: {d.get('consecutive_losses', 0)}"
+        )
+
+    async def maybe_daily_summary(self) -> None:
+        if not config.DAILY_SUMMARY:
+            return
+        ahora = dt.datetime.now(dt.timezone.utc)
+        hoy = ahora.strftime("%Y-%m-%d")
+        if ahora.hour != config.DAILY_SUMMARY_HOUR_UTC or self.state.data.get("last_summary") == hoy:
+            return
+        self.state.data["last_summary"] = hoy
+        self.state.save()
+        extra = ""
+        if self.riesgo_factor != 1.0:
+            extra = (f"\n🛞 Freno activo: riesgo al "
+                     f"{config.RISK_PCT * self.riesgo_factor:.2f}%")
+        if self.cuenta_r_hoy is not None:
+            extra += f"\nCuenta hoy: {self.cuenta_r_hoy:+.2f} R (todos los bots)"
+        if self.pm_snap.get("ok") and self.pm_snap.get("vrp"):
+            extra += (f"\n🔮 Polymarket VRP {self.pm_snap['vrp']:.2f} "
+                      f"({pm.sesgo(self.pm_snap)})")
+        await self.tg.send(
+            f"📊 <b>Resumen diario · Wavelet MRA</b> · {hoy}\n{config.describe()}\n\n"
+            f"{self.stats_text()}\nUniverso: {len(self.symbols)} símbolos" + extra
+        )
+        await self.tg.send(tca.informe())
+
+    async def maybe_heartbeat(self) -> None:
+        if config.HEARTBEAT_HOURS <= 0:
+            return
+        if time.time() - self.last_heartbeat < config.HEARTBEAT_HOURS * 3600:
+            return
+        self.last_heartbeat = time.time()
+        await self.tg.send(f"💓 Vivo (wavelet MRA) · {self.stats_text()}")
 
 
-@app.route("/positions", methods=["GET"])
-def positions():
-    """Posiciones REALES en BingX ahora mismo (consulta directa al
-    exchange, no el JSON local), separadas en propias y ajenas."""
+async def main() -> None:
+    bot = Bot()
     try:
-        live = _live_positions()
-    except Exception as e:
-        return jsonify(error=str(e)), 500
-    propias = [p for p in live if state.is_ours(p.get("symbol"))]
-    ajenas = [p for p in live if not state.is_ours(p.get("symbol"))]
-    return jsonify(count=len(live), propias=propias, ajenas=ajenas)
-
-
-@app.route("/diagnose", methods=["GET"])
-def diagnose():
-    """Por qué NO se abren operaciones, puerta por puerta.
-
-    Recorre los mismos filtros que _handle_entry, en el mismo orden, y
-    dice cuál está cerrado. Evita tener que deducirlo por ausencia de
-    órdenes, que es lo que obliga a mirar cinco archivos distintos.
-    """
-    puertas = []
-
-    if not config.AUTO_TRADE:
-        puertas.append({"puerta": "AUTO_TRADE", "bloquea": True,
-                        "detalle": "AUTO_TRADE=false -> solo señales, no se ejecuta nada"})
-    if not (config.BINGX_API_KEY and config.BINGX_API_SECRET):
-        puertas.append({"puerta": "credenciales", "bloquea": True,
-                        "detalle": "faltan BINGX_API_KEY / BINGX_API_SECRET"})
-    if config.BINGX_DEMO:
-        puertas.append({"puerta": "BINGX_DEMO", "bloquea": False,
-                        "detalle": "operando contra saldo de práctica (VST)"})
-
-    halted = bool(state.state.get("trading_halted"))
-    if halted:
-        puertas.append({
-            "puerta": "circuit_breaker", "bloquea": True,
-            "detalle": state.state.get("halt_reason"),
-            "como_liberar": "POST /reset-breaker/<WEBHOOK_SECRET> "
-                            "(subir MAX_DAILY_DRAWDOWN_PCT NO lo libera: "
-                            "trading_halted está persistido en el estado)",
-        })
-
-    propias = state.open_count()
-    if propias >= config.MAX_CONCURRENT_POSITIONS:
-        puertas.append({"puerta": "MAX_CONCURRENT_POSITIONS", "bloquea": True,
-                        "detalle": f"{propias} >= {config.MAX_CONCURRENT_POSITIONS}"})
-
-    try:
-        vivas_propias = state.count_own_live_positions(bx)
-        if vivas_propias >= config.HARD_MAX_TOTAL_POSITIONS:
-            puertas.append({"puerta": "HARD_MAX_TOTAL_POSITIONS", "bloquea": True,
-                            "detalle": f"{vivas_propias} >= {config.HARD_MAX_TOTAL_POSITIONS}"})
-    except Exception as e:
-        vivas_propias = None
-        puertas.append({"puerta": "lectura_posiciones", "bloquea": True,
-                        "detalle": f"no se pudo consultar BingX: {e}"})
-
-    equity = None
-    try:
-        equity = bx.get_balance()
-        # El suelo de nocional puede rechazar TODAS las señales si el
-        # equity es pequeño: para llegar al mínimo habría que arriesgar
-        # más de MAX_RISK_PCT_ABS.
-        if config.MARGIN_PER_TRADE_USDT > 0:
-            puertas.append({
-                "puerta": "MARGIN_PER_TRADE_USDT", "bloquea": False,
-                "detalle": (f"margen fijo {config.MARGIN_PER_TRADE_USDT} USDT x "
-                            f"{config.LEVERAGE}x = "
-                            f"{config.MARGIN_PER_TRADE_USDT * config.LEVERAGE:.0f} USDT "
-                            f"de posición; MIN_NOTIONAL_USDT y el sizing por riesgo "
-                            f"quedan ignorados"),
-            })
-        elif config.MIN_NOTIONAL_USDT and equity:
-            puertas.append({
-                "puerta": "MIN_NOTIONAL_USDT", "bloquea": False,
-                "detalle": (f"mínimo {config.MIN_NOTIONAL_USDT} USDT por operación; "
-                            f"se descarta la señal si llegar ahí exige arriesgar "
-                            f">{config.MAX_RISK_PCT_ABS}% del equity ({equity:.2f} USDT)"),
-            })
-    except Exception as e:
-        puertas.append({"puerta": "balance", "bloquea": True,
-                        "detalle": f"no se pudo leer el balance: {e}"})
-
-    jobs = []
-    if _scheduler:
-        for job in _scheduler.get_jobs():
-            jobs.append({"id": job.id,
-                         "next_run": job.next_run_time.isoformat() if job.next_run_time else None})
-    else:
-        puertas.append({"puerta": "scheduler", "bloquea": True,
-                        "detalle": f"no arrancó (SIGNAL_SOURCE={config.SIGNAL_SOURCE}, "
-                                   f"ENABLE_SCHEDULER={config.ENABLE_SCHEDULER})"})
-
-    bloqueantes = [p for p in puertas if p["bloquea"]]
-    return jsonify(
-        puede_abrir=(len(bloqueantes) == 0),
-        bloqueado_por=[p["puerta"] for p in bloqueantes],
-        puertas=puertas,
-        equity=equity,
-        posiciones_propias=propias,
-        posiciones_propias_vivas=vivas_propias,
-        scheduler_jobs=jobs,
-    )
-
-
-@app.route("/unprotected", methods=["GET"])
-def unprotected():
-    """Posiciones abiertas SIN stop en la cuenta. Solo informa: este bot no
-    cierra nada ajeno. Útil para revisar de un vistazo qué está expuesto."""
-    try:
-        live = _live_positions()
-    except Exception as e:
-        return jsonify(error=str(e)), 500
-    salida = []
-    for p in live:
-        sym = p.get("symbol")
-        side = str(p.get("positionSide", "")).upper()
-        has_sl, has_tp = bx.protection_status(sym, side)
-        if not has_sl:
-            salida.append({
-                "symbol": sym, "positionSide": side,
-                "quantity": abs(float(p.get("positionAmt", 0) or 0)),
-                "has_tp": has_tp, "de_este_bot": state.is_ours(sym),
-            })
-    return jsonify(count=len(salida), sin_stop=salida)
+        await bot.start()
+    finally:
+        await bot.client.aclose()
 
 
 if __name__ == "__main__":
-    import os
-
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    asyncio.run(main())
