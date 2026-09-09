@@ -142,7 +142,17 @@ SIGNALS_LOG = os.path.join(
 
 _LOG_COLS = ["ts_señal", "fecha_utc", "symbol", "side", "timeframe",
              "price", "sl", "tp", "atr", "is_trending", "ejecutada",
-             "motivo_no_ejecutada", "orientacion_ok"]
+             "motivo_no_ejecutada", "orientacion_ok", "coste_r"]
+
+
+def _coste_r_alerta(alert: dict) -> float:
+    """Coste de ida y vuelta expresado en R. El único término cierto."""
+    try:
+        px = float(alert["price"])
+        dist = abs(px - float(alert["sl"]))
+        return (config.COST_ROUNDTRIP_PCT / 100.0 * px) / dist if dist > 0 else 99.0
+    except (KeyError, TypeError, ValueError):
+        return 99.0
 
 
 def _cabecera_existente(ruta: str):
@@ -203,6 +213,7 @@ def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = "",
             "ejecutada": int(bool(ejecutada)),
             "motivo_no_ejecutada": motivo,
             "orientacion_ok": int(bool(orientacion_ok)),
+            "coste_r": round(_coste_r_alerta(alert), 4),
         }
         with open(SIGNALS_LOG, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=columnas, extrasaction="ignore")
@@ -264,6 +275,7 @@ def job_generate_signals(main_module, bx, state):
         )
 
     invertidas = 0
+    candidatas = []
 
     for symbol in symbols:
         try:
@@ -328,19 +340,47 @@ def job_generate_signals(main_module, bx, state):
                     )
                 )
             else:
-                # Se registra ANTES de intentar la entrada: si _handle_entry
-                # falla o la rechaza, la señal queda igualmente anotada.
-                antes = state.open_count()
-                main_module._handle_entry(alert)
-                ejecutada = state.open_count() > antes
-                registrar_senal(
-                    alert, sig, ejecutada,
-                    "" if ejecutada else "sin hueco o rechazada en _handle_entry")
+                # NO se ejecuta aquí. Se acumula y al final del ciclo se
+                # ordenan por COSTE. Con MAX_CONCURRENT_POSITIONS=1 y siete
+                # señales en el mismo minuto, ejecutar la primera hace que
+                # decida el ORDEN DEL UNIVERSO —que es el volumen de 24h—,
+                # o sea azar disfrazado de sistema.
+                candidatas.append((alert, sig))
         except Exception:
             log.exception("Error generando señal para %s", symbol)
         finally:
             if config.SCAN_ALL_SYMBOLS:
                 time.sleep(scanner.REQUEST_PACING_SECONDS)
+
+    # ── Ranking y ejecución ──────────────────────────────────────────
+    # El coste en R es el único término CIERTO de la ecuación: la ventaja
+    # es una estimación, la comisión no. Se ejecuta primero lo más barato.
+    def _coste_r(par):
+        al, sg = par
+        try:
+            atr = float(sg.get("atr") or 0)
+            px = float(al["price"])
+            dist = abs(px - float(al["sl"]))
+            if dist <= 0:
+                return 99.0
+            return (config.COST_ROUNDTRIP_PCT / 100.0 * px) / dist
+        except (KeyError, TypeError, ValueError):
+            return 99.0
+
+    if candidatas:
+        candidatas.sort(key=_coste_r)
+        log.info("Ciclo con %d candidatas · mejor %s (coste %.2f R) · peor %s (%.2f R)",
+                 len(candidatas), candidatas[0][0]["symbol"], _coste_r(candidatas[0]),
+                 candidatas[-1][0]["symbol"], _coste_r(candidatas[-1]))
+    for alert, sig in candidatas:
+        antes = state.open_count()
+        try:
+            main_module._handle_entry(alert)
+        except Exception:
+            log.exception("Error ejecutando %s", alert.get("symbol"))
+        ejecutada = state.open_count() > antes
+        registrar_senal(alert, sig, ejecutada,
+                        "" if ejecutada else "sin hueco o rechazada en _handle_entry")
 
     # Si TODAS las de un lado salen invertidas, esto no es un caso raro: es
     # que compute_signal está mal para ese lado y hay que arreglarlo ya.
