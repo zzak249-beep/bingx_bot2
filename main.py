@@ -345,6 +345,10 @@ def _handle_entry(alert: dict):
     if not _ok:
         log.error("%s NO ejecutada — %s | correcto sería sl=%.10g tp=%.10g",
                   symbol, _motivo, _sl_bueno, _tp_bueno)
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error=f"orientación de SL/TP: {_motivo}")
+        )
         if gd.debe_avisar(f"orient:{symbol}", getattr(config, "GUARD_AVISO_MIN", 30)):
             telegram_notifier.send(
                 f"🚫 *{symbol}* — entrada NO ejecutada\n{_motivo}\n"
@@ -442,6 +446,12 @@ def _handle_entry(alert: dict):
             telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo leer balance: {e}")
         )
         return
+    if equity is None:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error="el balance vino vacío (None)")
+        )
+        return
 
     # EQUITY 0 NO ES "RIESGO CERO": es que no se pudo leer la cuenta. Con
     # equity 0 el sizing por riesgo da qty 0 y la señal muere con un
@@ -449,11 +459,22 @@ def _handle_entry(alert: dict):
     # es. Peor: check_circuit_breaker(0) no puede medir drawdown y el
     # límite diario queda desactivado sin avisar.
     if equity < config.EQUITY_MINIMO:
+        # LA SEÑAL SIEMPRE SE MANDA. Que no haya fondos es motivo para no
+        # EJECUTAR, no para dejar de avisar: sin fondos la señal sigue
+        # siendo información —para operarla a mano, o para el registro que
+        # mide si la estrategia vale— y silenciarla es perder el dato.
+        # El enfriamiento tapa solo la nota explicativa, que sí se repite.
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=f"sin fondos: patrimonio {equity:.2f} USDT (mínimo {config.EQUITY_MINIMO})",
+            )
+        )
         if gd.debe_avisar("cuenta:equity", getattr(config, "GUARD_AVISO_MIN", 30)):
             telegram_notifier.send(
-                f"🛑 *Patrimonio {equity:.2f} USDT* (mínimo {config.EQUITY_MINIMO}). "
-                f"No se opera.\n_Con este número el dimensionado por riesgo da "
-                f"cantidad 0 y el circuit breaker no puede medir caídas. "
+                f"🛑 *Patrimonio {equity:.2f} USDT* — no se ejecuta nada, pero las "
+                f"señales siguen llegando.\n_Con este número el dimensionado por "
+                f"riesgo da cantidad 0 y el circuit breaker no puede medir caídas. "
                 f"Si el saldo real no es ese, revisa BINGX_DEMO y las claves._"
             )
         log.error("%s sin abrir: equity %.4f por debajo del mínimo %.2f",
@@ -462,7 +483,12 @@ def _handle_entry(alert: dict):
 
     allowed, reason = state.check_circuit_breaker(equity)
     if not allowed:
-        telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error=f"circuit breaker: {reason}")
+        )
+        if gd.debe_avisar("cuenta:breaker", getattr(config, "GUARD_AVISO_MIN", 30)):
+            telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
         return
 
     # Sizing. Dos modos:
