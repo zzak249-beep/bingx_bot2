@@ -132,6 +132,17 @@ EXCLUDE_PREFIXES = tuple(
     p.strip().upper() for p in _str("EXCLUDE_PREFIXES", "").split(",") if p.strip()
 )
 
+# Coste de ida y vuelta de una operación, en % del nocional (comisión de
+# entrada + salida). NO decide nada por sí solo: se usa para expresar el
+# coste en R —(coste% x precio) / distancia_al_stop— que es el único
+# término CIERTO de la ecuación: la ventaja es una estimación, la
+# comisión no. Sale en el mensaje de Telegram y ordena el ranking de
+# candidatas del poller.
+#
+# 0.25 = maker+taker típico de BingX. Si operas siempre con limitadas
+# post-only, bájalo; si cruzas el spread, súbelo.
+COST_ROUNDTRIP_PCT = float(_str("COST_ROUNDTRIP_PCT", "0.25"))
+
 # --- Circuit breaker ---
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))

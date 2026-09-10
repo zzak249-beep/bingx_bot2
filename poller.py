@@ -150,7 +150,7 @@ def _coste_r_alerta(alert: dict) -> float:
     try:
         px = float(alert["price"])
         dist = abs(px - float(alert["sl"]))
-        return (config.COST_ROUNDTRIP_PCT / 100.0 * px) / dist if dist > 0 else 99.0
+        return (getattr(config, "COST_ROUNDTRIP_PCT", 0.25) / 100.0 * px) / dist if dist > 0 else 99.0
     except (KeyError, TypeError, ValueError):
         return 99.0
 
@@ -363,7 +363,7 @@ def job_generate_signals(main_module, bx, state):
             dist = abs(px - float(al["sl"]))
             if dist <= 0:
                 return 99.0
-            return (config.COST_ROUNDTRIP_PCT / 100.0 * px) / dist
+            return (getattr(config, "COST_ROUNDTRIP_PCT", 0.25) / 100.0 * px) / dist
         except (KeyError, TypeError, ValueError):
             return 99.0
 
