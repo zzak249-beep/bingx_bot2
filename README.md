@@ -1,42 +1,35 @@
-# Crowding + CISD Bot
+# Crowding bot v2.2 — solo señales
 
-Bot de señales que combina **Crowding** (posicionamiento amontonado) + **CISD** (Change in State of Delivery).
+Bot de señales del posicionamiento amontonado en perpetuos de BingX.
 
-**NO OPERA. NO PIDE CLAVES DE API.** Solo usa endpoints públicos de BingX.
+**NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos.
 
-## Qué hace
-
-1. Detecta crowding (basis extremo + Open Interest subiendo + precio en extremo)
-2. Espera la primera vela en contra de la multitud
-3. Confirma con **CISD + Retest + Volumen**
-4. Abre operación **virtual** con stop y take profit
-5. Registra el resultado en R
-
-## Estructura de archivos
-
-```
-├── crowding_bot.py     # Bot principal (con filtro CISD integrado)
-├── cisd.py             # Módulo CISD + OB + FVG + Volumen
-├── confirm.py          # Filtro de régimen (Variance Ratio)
-├── requirements.txt
-├── Procfile
-├── .gitignore
-└── README.md
-```
+## Novedades v2.2
+- **Progreso de calentamiento** en cada ciclo:
+  `calentando 287/300 (media 12.4 h, 84 muestras)`
+- **Heartbeat cada hora** por Telegram + log (listos, media de horas, virtuales abiertas)
+- Pool de conexiones ampliado (v2.1)
+- premiumIndex global + ThreadPoolExecutor (v2)
 
 ## Despliegue en Railway
 
-1. Crea un proyecto nuevo desde este repo
-2. **Monta un Volume en `/data`** (importante para no perder historial)
-3. Configura las variables de entorno
+### Start Command
+```
+python crowding_bot.py
+```
+(NO pongas `worker: ...`)
 
-## Variables importantes
+### Volume
+Monta un Volume en `/data`.
 
+### Variables recomendadas
 ```
 TIMEFRAME=15m
-SCAN_SEC=300
+SCAN_SEC=120
 MIN_VOL_24H=2000000
 MAX_SYMBOLS=300
+MAX_WORKERS=20
+KLINES_LIMIT=120
 HIST_HORAS=168
 MIN_HORAS=30
 MIN_MUESTRAS=200
@@ -58,23 +51,24 @@ TG_CHAT=
 TG_SIGNALS=false
 TG_CLOSES=false
 REPORT_HOUR=7
+PACING=0
 ```
 
+Servicio tipo **Worker**.
+
 ## Calentamiento
+Hasta 30 h + 200 muestras por símbolo → 0 señales (normal).
+Con cadencia ~2 min son aproximadamente **30-35 horas de reloj**.
 
-El bot necesita ~30 horas + 200 muestras por símbolo antes de emitir señales (BingX no da histórico de Open Interest).
+El heartbeat te dirá el progreso cada hora.
 
-## Lógica de entrada (Crowding + CISD)
-
-| Capa | Función |
-|------|---------|
-| **Crowding** | Detecta gente atrapada (basis + OI + extremo) |
-| **Vela en contra** | Primer signo de debilidad de la multitud |
-| **CISD** | Confirma cambio de delivery (score ≥ 4) |
-| **Retest + Volumen** | Entrada precisa |
-
-## Notas
-
-- El módulo `confirm.py` solo registra el régimen (no bloquea).
-- `CONFIRM_BLOQUEAR` está en `False` a propósito.
-- Todo queda en el CSV para análisis posterior.
+## Archivos
+```
+crowding_bot.py
+confirm.py
+requirements.txt
+Procfile
+railway.toml
+README.md
+.gitignore
+```
