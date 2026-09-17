@@ -137,6 +137,25 @@ CFG = {
     "MIN_ATR_PCT": env("MIN_ATR_PCT", 1.0),
     "COST_PCT": env("COST_PCT", 0.25),
     "MAX_COST_R": env("MAX_COST_R", 0.20),
+    # ── LA CORRECCIÓN DEL DISPARO ──────────────────────────────────────
+    # El bot mira cada 2,2 min pero las velas son de 15m: evaluaba la vela EN
+    # CURSO unas 7 veces antes de que cerrara. Basta con que UNO de esos
+    # vistazos pille un retroceso para disparar el corto, aunque la vela
+    # acabe VERDE. Medido por simulación con la cerilla de este bot:
+    #
+    #   vela alcista fuerte -> dispara intravela 68,7% · ya cerrada 33,4%
+    #   vela neutra         -> dispara intravela 79,4% · ya cerrada 50,8%
+    #
+    # El doble de disparos, y los de más están casi todos dentro de velas
+    # que terminan subiendo. Eso es literalmente "cortos que resultan ser
+    # subidas explosivas".
+    "SOLO_VELA_CERRADA": env("SOLO_VELA_CERRADA", True),
+    # Un corto no se abre contra un símbolo que sigue marcando máximos. La
+    # vela de la cerilla no puede hacer nuevo extremo de las últimas N.
+    "NO_NUEVO_EXTREMO": env("NO_NUEVO_EXTREMO", 6),
+    # SKYAI disparó dos veces el mismo día. Sin enfriamiento, un símbolo en
+    # rally reparte señales durante horas y todas son la misma apuesta.
+    "ENFRIA_BARRAS": env("ENFRIA_BARRAS", 8),
     "STATE": env("STATE", "/data/crowding_state.json"),
     "CSV": env("CSV", "/data/crowding_ops.csv"),
     "TG_TOKEN": env("TG_TOKEN", ""),
@@ -462,6 +481,10 @@ def tg(texto: str, tipo: str = "informe"):
         log.exception("Telegram falló")
 
 
+# Última barra en la que cada símbolo emitió señal, para el enfriamiento.
+ULTIMA_SENAL: dict[str, int] = {}
+
+
 # ─────────────────────────────────────────────────────── lógica
 def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado):
     """
@@ -470,6 +493,12 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado):
     p = dict de premium (mark/index/basis/funding)
     oi = open interest actual
     """
+    # La vela EN CURSO no decide nada: solo aporta el precio de referencia.
+    # Todo el criterio se calcula sobre velas ya cerradas.
+    if bool(CFG["SOLO_VELA_CERRADA"]) and velas:
+        if velas[-1]["t"] + BAR_SEC * 1000 > time.time() * 1000:
+            velas = velas[:-1]
+
     if len(velas) < 60:
         return None, "pocas velas"
     if p is None:
@@ -529,6 +558,25 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado):
         return None, f"coste {coste_r:.2f}R"
 
     ult, ant = velas[-1], velas[-2]
+
+    # Enfriamiento por símbolo: una misma explosión no debe generar varios
+    # cortos distintos que en realidad son la misma apuesta repetida.
+    nb = int(CFG["ENFRIA_BARRAS"])
+    if nb > 0 and (ult["t"] - ULTIMA_SENAL.get(symbol, -10**15)) < nb * BAR_SEC * 1000:
+        return None, "enfriamiento"
+
+    # AGOTAMIENTO. No se vende un símbolo que acaba de marcar máximo ni se
+    # compra uno que acaba de marcar mínimo. Es lo que separa "la multitud
+    # empieza a soltar" de "la multitud sigue empujando con todo".
+    ne = int(CFG["NO_NUEVO_EXTREMO"])
+    if ne > 0 and len(velas) > ne + 1:
+        maxN = max(v["h"] for v in velas[-ne - 1:-1])
+        minN = min(v["l"] for v in velas[-ne - 1:-1])
+        if largos_amont and ult["h"] >= maxN:
+            return None, "sigue haciendo máximos"
+        if cortos_amont and ult["l"] <= minN:
+            return None, "sigue haciendo mínimos"
+
     lado = None
     if largos_amont and ult["c"] < ant["l"] and ult["c"] < ult["o"]:
         lado = "SHORT"
@@ -536,6 +584,8 @@ def evaluar(symbol: str, velas: list, p: dict, oi: float, st: Estado):
         lado = "LONG"
     if lado is None:
         return None, "esperando vela en contra"
+
+    ULTIMA_SENAL[symbol] = ult["t"]
 
     reg = cf.calcular(_CFG_OBJ, cierres)
     return (lado, {"px": px, "riesgo": riesgo, "coste_r": coste_r, "zb": zb,
